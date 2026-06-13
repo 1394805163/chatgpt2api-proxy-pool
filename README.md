@@ -1,7 +1,18 @@
-<h1 align="center">ChatGPT2API</h1>
+<h1 align="center">ChatGPT2API Proxy Pool</h1>
 
+<p align="center">基于 <a href="https://github.com/basketikun/chatgpt2api">basketikun/chatgpt2api</a> v1.5.0 的二开分支，保留原版图片 API、在线画图、号池管理和自托管能力，并增强注册页代理池：支持单代理、代理列表 URL、手动粘贴代理列表三种代理来源。</p>
 
-<p align="center">ChatGPT2API 主要是对 ChatGPT 官网相关能力进行逆向整理与封装，提供面向 ChatGPT 图片生成、图片编辑、多图组图编辑场景的 OpenAI 兼容图片 API / 代理，并集成在线画图、号池管理、多种账号导入方式与 Docker 自托管部署能力。</p>
+> 本分支适合需要在注册流程中轮换代理的人。每个注册 worker 启动时会从代理池取一个代理，并在本次注册流程内固定使用；下一个 worker 再轮询使用下一个代理。
+
+## 分支说明
+
+- 原项目：`basketikun/chatgpt2api`
+- 本项目：`strongshuai/chatgpt2api-proxy-pool`
+- 当前基线：`chatgpt2api` v1.5.0
+- 推荐部署分支：`feature/register-proxy-source-modes`
+- 给原项目提交的 PR：<https://github.com/basketikun/chatgpt2api/pull/273>
+
+本 README 保留原版主要说明，并补充本分支的代理池能力、部署方式和使用注意事项。
 
 > [!WARNING]
 > 免责声明：
@@ -15,23 +26,117 @@
 > - 使用本项目即视为你已充分理解并同意本免责声明全部内容；如因滥用、违规或违法使用造成任何后果，均由使用者自行承担。
 > - 本项目基于对 ChatGPT 官网相关能力的逆向研究实现，存在账号受限、临时封禁或永久封禁的风险。请勿使用你自己的重要账号、常用账号或高价值账号进行测试。
 
-## 快速开始
+## 本分支新增能力
 
-### Docker 运行
+### 注册代理来源
 
-```bash
-git clone git@github.com:basketikun/chatgpt2api.git
-cd chatgpt2api
-docker compose up -d
+注册页新增“代理来源”选择，支持三种模式：
+
+| 模式 | 说明 | 适合场景 |
+|:---|:---|:---|
+| 单代理 | 保持原版行为，只填写一个代理 | 少量测试或固定出口 |
+| 代理列表 URL | 填写一个一行一个代理的文本链接 | 使用代理检测工具生成的仓库链接 |
+| 粘贴代理列表 | 在 textarea 中直接粘贴代理，一行一个 | 手里已有代理列表，不想搭建额外仓库 |
+
+支持的代理格式：
+
+```text
+http://1.2.3.4:8080
+https://1.2.3.4:8443
+socks5://1.2.3.4:1080
+socks5h://1.2.3.4:1080
+1.2.3.4:8080
 ```
 
-启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
+裸 `ip:port` 会按 HTTP 代理处理。`socks5://` 会规范化为 `socks5h://`，让 DNS 解析也走代理。
 
-- Web 面板：`http://localhost:3000`
-- API 地址：`http://localhost:3000/v1`
+### 轮询策略
+
+- 每个注册 worker 启动时从代理池取一个代理。
+- 同一个 worker 的注册流程内固定使用该代理。
+- 多个 worker 会按代理列表顺序轮询。
+- URL 模式会按刷新间隔懒刷新代理列表，默认 `120` 秒，最低 `10` 秒。
+- URL 后续刷新失败时，如果旧池仍有代理，会继续使用旧池并在状态中展示最后错误。
+- 首次拉取为空或失败时，注册任务会明确失败，不会静默直连。
+
+### 页面状态
+
+注册页运行状态中会显示：
+
+- 当前代理来源
+- 当前代理池数量
+- 当前 worker 使用的代理
+- 代理池最后错误
+
+### 代理有效性说明
+
+代理是否可用取决于“运行注册任务的服务器”能否连通该代理。其他机器检测有效，不代表你的注册服务器同样有效。
+
+如果你使用代理检测工具生成“我的仓库”链接，最好把检测服务部署在和注册服务相同的服务器，或至少部署在相同网络出口环境中。这样筛出的有效代理才更接近真实注册环境。
+
+## 快速开始
+
+### 部署本分支
+
+```bash
+git clone -b feature/register-proxy-source-modes https://github.com/strongshuai/chatgpt2api-proxy-pool.git
+cd chatgpt2api-proxy-pool
+```
+
+启动前建议先修改 `config.json`：
+
+```json
+{
+  "auth-key": "your_secret_key_here"
+}
+```
+
+然后使用本地构建 compose 启动：
+
+```bash
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+默认地址：
+
+- Web 面板：`http://localhost:8000`
+- API 地址：`http://localhost:8000/v1`
 - 数据目录：`./data`
+- 配置文件：`./config.json`
 
-### WARP / FlareSolverr 稳定代理部署
+> 不要直接用 `docker-compose.yml` 部署本分支。该文件默认使用官方镜像 `ghcr.io/basketikun/chatgpt2api:latest`，不会包含本分支的注册代理池改动。
+
+### 更新本分支
+
+```bash
+git pull
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+如需备份，重点保留：
+
+```text
+config.json
+data/
+```
+
+### 使用注册代理池
+
+打开 Web 面板后进入：
+
+```text
+注册页 -> 注册代理 -> 代理来源
+```
+
+选择：
+
+- `单代理`：填写一个代理。
+- `代理列表 URL`：填写一行一个代理的 `.txt` 链接，例如代理检测工具生成的“我的仓库”链接。
+- `粘贴代理列表`：直接粘贴代理列表，一行一个。
+
+保存后启动注册任务即可。旧版只配置 `proxy_url` 的场景会自动兼容为 URL 模式。
+
+### WARP / FlareSolverr 稳定代理部署（可选）
 
 如果注册或图片链路经常遇到 Cloudflare 拦截，可以启用附带的 WARP + Privoxy + FlareSolverr 方案：
 
@@ -57,8 +162,8 @@ docker compose -f docker-compose.warp.yml up -d --build
 启动后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
-cd chatgpt2api
+git clone -b feature/register-proxy-source-modes https://github.com/strongshuai/chatgpt2api-proxy-pool.git
+cd chatgpt2api-proxy-pool
 uv sync
 uv run main.py
 ```
@@ -66,18 +171,9 @@ uv run main.py
 启动前端：
 
 ```bash
-cd chatgpt2api/web
+cd web
 bun install
 bun run dev
-```
-
-后续更新新版本：
-
-```bash
-docker pull ghcr.io/basketikun/chatgpt2api:latest
-docker-compose down
-docker-compose up -d
-
 ```
 
 ### 存储后端配置
