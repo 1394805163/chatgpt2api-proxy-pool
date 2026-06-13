@@ -3,6 +3,18 @@
 <p align="center">基于 <a href="https://github.com/basketikun/chatgpt2api">basketikun/chatgpt2api</a> v1.5.0 的二开分支，保留原版图片 API、在线画图、号池管理和自托管能力，并增强注册页代理池：支持单代理、代理列表 URL、手动粘贴代理列表三种代理来源。</p>
 
 > 本分支适合需要在注册流程中轮换代理的人。每个注册 worker 启动时会从代理池取一个代理，并在本次注册流程内固定使用；下一个 worker 再轮询使用下一个代理。
+>
+默认单代理
+<img width="1980" height="579" alt="1781394711392_d" src="https://github.com/user-attachments/assets/0ec519da-db30-4604-a201-b5c6640137c4" />
+
+
+代理列表链接，一行一个
+<img width="1977" height="642" alt="1781394718555_d" src="https://github.com/user-attachments/assets/68a7611e-f192-4dc4-9026-42ef163ca551" />
+
+
+代理列表表单，一行一个
+<img width="1965" height="573" alt="1781394725477_d" src="https://github.com/user-attachments/assets/3fea4c68-eb90-4f01-ad09-1623b518f09a" />
+
 
 ## 分支说明
 
