@@ -35,6 +35,10 @@ class FakeSession:
         self.closed = True
 
 
+class FakeProxyProfile:
+    clearance_enabled = True
+
+
 class FakeProxySettings:
     def __init__(self, bundle=None):
         self.bundle = bundle
@@ -53,6 +57,9 @@ class FakeProxySettings:
         if self.refreshed and self.bundle and self.bundle.cookies:
             merged["Cookie"] = "; ".join(f"{key}={value}" for key, value in self.bundle.cookies.items())
         return merged
+
+    def get_profile(self, **kwargs):
+        return FakeProxyProfile()
 
     def refresh_clearance(self, target_url="", proxy="", force=False, upstream=True, **kwargs):
         self.refresh_calls.append({"target_url": target_url, "proxy": proxy, "force": force, "upstream": upstream})

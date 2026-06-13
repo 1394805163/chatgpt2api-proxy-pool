@@ -35,6 +35,7 @@ import {
   type ProxyRuntimeEgressMode,
   type ProxyRuntimeSettings,
   type RegisterConfig,
+  type RegisterProxyInputMode,
   type SettingsConfig,
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
@@ -117,7 +118,7 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
 
 function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
   const source = typeof value === "object" && value !== null ? value as Partial<ThirdPartyAppsSettings> : {};
-  const canvas = typeof source.infinite_canvas === "object" && source.infinite_canvas
+  const canvas: Partial<ThirdPartyAppsSettings["infinite_canvas"]> = typeof source.infinite_canvas === "object" && source.infinite_canvas
     ? source.infinite_canvas
     : {};
   return {
@@ -251,6 +252,23 @@ function normalizeFiles(items: CPARemoteFile[]) {
   return files;
 }
 
+function buildRegisterConfigUpdate(registerConfig: RegisterConfig): Partial<RegisterConfig> {
+  return {
+    mail: registerConfig.mail,
+    proxy: registerConfig.proxy.trim(),
+    proxy_input_mode: registerConfig.proxy_input_mode || "single",
+    proxy_url: String(registerConfig.proxy_url || "").trim(),
+    proxy_list_text: String(registerConfig.proxy_list_text || ""),
+    proxy_refresh_interval: Math.max(10, Number(registerConfig.proxy_refresh_interval) || 120),
+    total: Math.max(1, Number(registerConfig.total) || 1),
+    threads: Math.max(1, Number(registerConfig.threads) || 1),
+    mode: registerConfig.mode,
+    target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
+    target_available: Math.max(1, Number(registerConfig.target_available) || 1),
+    check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
+  };
+}
+
 type SettingsStore = {
   config: SettingsConfig | null;
   isLoadingConfig: boolean;
@@ -327,6 +345,10 @@ type SettingsStore = {
   loadRegister: (silent?: boolean) => Promise<void>;
   setRegisterConfig: (config: RegisterConfig) => void;
   setRegisterProxy: (value: string) => void;
+  setRegisterProxyInputMode: (value: RegisterProxyInputMode) => void;
+  setRegisterProxyUrl: (value: string) => void;
+  setRegisterProxyListText: (value: string) => void;
+  setRegisterProxyRefreshInterval: (value: string) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
   setRegisterMode: (value: "total" | "quota" | "available") => void;
@@ -898,6 +920,22 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {});
   },
 
+  setRegisterProxyInputMode: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_input_mode: value } } : {});
+  },
+
+  setRegisterProxyUrl: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_url: value } } : {});
+  },
+
+  setRegisterProxyListText: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_list_text: value } } : {});
+  },
+
+  setRegisterProxyRefreshInterval: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_refresh_interval: Number(value) || 0 } } : {});
+  },
+
   setRegisterTotal: (value) => {
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, total: Number(value) || 0 } } : {});
   },
@@ -972,16 +1010,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!registerConfig) return;
     try {
       set({ isSavingRegister: true });
-      const data = await updateRegisterConfig({
-        mail: registerConfig.mail,
-        proxy: registerConfig.proxy.trim(),
-        total: Math.max(1, Number(registerConfig.total) || 1),
-        threads: Math.max(1, Number(registerConfig.threads) || 1),
-        mode: registerConfig.mode,
-        target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
-        target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-        check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
-      });
+      const data = await updateRegisterConfig(buildRegisterConfigUpdate(registerConfig));
       set({ registerConfig: data.register });
       toast.success("注册配置已保存");
     } catch (error) {
@@ -997,16 +1026,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       if (!registerConfig.enabled) {
-        await updateRegisterConfig({
-          mail: registerConfig.mail,
-          proxy: registerConfig.proxy.trim(),
-          total: Math.max(1, Number(registerConfig.total) || 1),
-          threads: Math.max(1, Number(registerConfig.threads) || 1),
-          mode: registerConfig.mode,
-          target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
-          target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-          check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
-        });
+        await updateRegisterConfig(buildRegisterConfigUpdate(registerConfig));
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();
       set({ registerConfig: data.register });

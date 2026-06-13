@@ -8,6 +8,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import type { RegisterProxyInputMode } from "@/lib/api";
 
 import { useSettingsStore } from "../../settings/store";
 
@@ -16,6 +17,10 @@ export function RegisterCard() {
   const isLoading = useSettingsStore((state) => state.isLoadingRegister);
   const isSaving = useSettingsStore((state) => state.isSavingRegister);
   const setProxy = useSettingsStore((state) => state.setRegisterProxy);
+  const setProxyInputMode = useSettingsStore((state) => state.setRegisterProxyInputMode);
+  const setProxyUrl = useSettingsStore((state) => state.setRegisterProxyUrl);
+  const setProxyListText = useSettingsStore((state) => state.setRegisterProxyListText);
+  const setProxyRefreshInterval = useSettingsStore((state) => state.setRegisterProxyRefreshInterval);
   const setTotal = useSettingsStore((state) => state.setRegisterTotal);
   const setThreads = useSettingsStore((state) => state.setRegisterThreads);
   const setMode = useSettingsStore((state) => state.setRegisterMode);
@@ -44,6 +49,9 @@ export function RegisterCard() {
   const stats = config.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads };
   const providers = config.mail.providers || [];
   const logs = config.logs || [];
+  const proxyMode = config.proxy_input_mode || "single";
+  const proxySourceLabel = proxyMode === "url" ? "URL 列表" : proxyMode === "text" ? "手动列表" : "单代理";
+  const currentProxy = String(stats.current_proxy || (proxyMode === "single" ? config.proxy : "") || "").trim();
   const updateProviderType = (index: number, type: string) => {
     updateProvider(index, {
       type,
@@ -107,9 +115,42 @@ export function RegisterCard() {
               <Input value={String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
             </div>
             <div className="space-y-2">
-              <label className="text-sm text-stone-700">注册代理</label>
-              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+              <label className="text-sm text-stone-700">代理来源</label>
+              <Select value={proxyMode} onValueChange={(value) => setProxyInputMode(value as RegisterProxyInputMode)} disabled={config.enabled}>
+                <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="single">单代理</SelectItem>
+                  <SelectItem value="url">代理列表 URL</SelectItem>
+                  <SelectItem value="text">手动代理列表</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
+            {proxyMode === "single" ? (
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">注册代理</label>
+                <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+              </div>
+            ) : null}
+            {proxyMode === "url" ? (
+              <>
+                <div className="space-y-2 md:col-span-2">
+                  <label className="text-sm text-stone-700">代理列表 URL</label>
+                  <Input value={config.proxy_url || ""} onChange={(event) => setProxyUrl(event.target.value)} placeholder="https://example.com/proxies.txt" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-stone-700">刷新秒数</label>
+                  <Input value={String(config.proxy_refresh_interval || "")} onChange={(event) => setProxyRefreshInterval(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                </div>
+              </>
+            ) : null}
+            {proxyMode === "text" ? (
+              <div className="space-y-2 md:col-span-2">
+                <label className="text-sm text-stone-700">代理列表</label>
+                <Textarea value={config.proxy_list_text || ""} onChange={(event) => setProxyListText(event.target.value)} placeholder="每行一个代理，支持 http://、socks5:// 或 ip:port" className="min-h-24 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
+              </div>
+            ) : null}
             <div className="space-y-2">
               <label className="text-sm text-stone-700">目标剩余额度</label>
               <Input value={String(config.target_quota || "")} onChange={(event) => setTargetQuota(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled || config.mode !== "quota"} />
@@ -377,6 +418,27 @@ export function RegisterCard() {
                 </div>
               ))}
             </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="border border-stone-200 bg-white/70 px-3 py-2">
+                <div className="text-xs text-stone-400">代理来源</div>
+                <div className="mt-1 text-sm font-semibold text-stone-800">{proxySourceLabel}</div>
+              </div>
+              <div className="border border-stone-200 bg-white/70 px-3 py-2">
+                <div className="text-xs text-stone-400">代理池数量</div>
+                <div className="mt-1 text-sm font-semibold text-stone-800">{stats.proxy_pool_count ?? (proxyMode === "single" && config.proxy.trim() ? 1 : 0)}</div>
+              </div>
+            </div>
+            <div className="border border-stone-200 bg-white/70 px-3 py-2">
+              <div className="text-xs text-stone-400">当前代理</div>
+              <div className="mt-1 truncate font-mono text-sm font-semibold text-stone-800" title={currentProxy || "默认出站"}>
+                {currentProxy || "默认出站"}
+              </div>
+            </div>
+            {stats.proxy_pool_last_error ? (
+              <div className="border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                {stats.proxy_pool_last_error}
+              </div>
+            ) : null}
             <div className="grid grid-cols-3 gap-2">
               <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={isSaving}>
                 {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : config.enabled ? <Square className="size-4" /> : <Play className="size-4" />}

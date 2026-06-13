@@ -14,6 +14,16 @@ from services.register import mail_provider, openai_register
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
+REGISTER_RUNTIME_KEYS = (
+    "mail",
+    "proxy",
+    "proxy_input_mode",
+    "proxy_url",
+    "proxy_list_text",
+    "proxy_refresh_interval",
+    "total",
+    "threads",
+)
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -37,7 +47,14 @@ def _now() -> str:
 
 
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0, "current_proxy": "", "proxy_pool_count": 0, "proxy_source": "single", "proxy_pool_last_error": "", "proxy_pool_last_fetch": 0}}
+
+
+def _safe_int(value: object, fallback: int) -> int:
+    try:
+        return int(value or fallback)
+    except (OverflowError, TypeError, ValueError):
+        return fallback
 
 
 def _normalize(raw: dict) -> dict:
@@ -50,6 +67,20 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    cfg["proxy_url"] = str(cfg.get("proxy_url") or "").strip()
+    cfg["proxy_list_text"] = str(cfg.get("proxy_list_text") or "").strip()
+    cfg["proxy_refresh_interval"] = max(10, _safe_int(cfg.get("proxy_refresh_interval"), 120))
+    proxy_input_mode = str(cfg.get("proxy_input_mode") or "").strip().lower()
+    if proxy_input_mode not in {"single", "url", "text"}:
+        if cfg["proxy_url"]:
+            proxy_input_mode = "url"
+        elif "\n" in cfg["proxy"] or "\r" in cfg["proxy"]:
+            proxy_input_mode = "text"
+            cfg["proxy_list_text"] = cfg["proxy"]
+            cfg["proxy"] = ""
+        else:
+            proxy_input_mode = "single"
+    cfg["proxy_input_mode"] = proxy_input_mode
     if isinstance(cfg.get("mail"), dict):
         cfg["mail"].pop("proxy", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
@@ -67,8 +98,15 @@ class RegisterService:
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
+        openai_register.config.update({k: self._config[k] for k in REGISTER_RUNTIME_KEYS})
+        openai_register.configure_proxy_pool(fetch_now=False)
         if self._config["enabled"]:
-            self.start()
+            try:
+                self.start()
+            except Exception as error:
+                self._config["enabled"] = False
+                self._append_log(f"注册任务自动恢复失败: {error}", "red")
+                self._save()
 
     def _load(self) -> dict:
         try:
@@ -83,6 +121,10 @@ class RegisterService:
     def get(self) -> dict:
         with self._lock:
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
+            running_stats = openai_register.stats
+            for key in ("current_proxy", "proxy_pool_count", "proxy_source", "proxy_pool_last_error", "proxy_pool_last_fetch"):
+                if key in running_stats:
+                    snapshot["stats"][key] = running_stats[key]
         self._redact_outlook_pools(snapshot)
         return snapshot
 
@@ -164,7 +206,8 @@ class RegisterService:
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update({k: self._config[k] for k in REGISTER_RUNTIME_KEYS})
+            openai_register.configure_proxy_pool(fetch_now=False)
             self._save()
             return self.get()
 
@@ -178,10 +221,19 @@ class RegisterService:
             self._drop_mail_proxy()
             self._logs = []
             metrics = self._pool_metrics()
-            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update({k: self._config[k] for k in REGISTER_RUNTIME_KEYS})
+            try:
+                proxy_metrics = openai_register.prepare_proxy_pool()
+            except Exception as error:
+                message = f"注册代理不可用: {error}"
+                self._config["enabled"] = False
+                self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "proxy_pool_last_error": str(error), "updated_at": _now()}
+                self._save()
+                self._append_log(message, "red")
+                raise RuntimeError(message) from error
+            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, **proxy_metrics, "current_proxy": "", "started_at": _now(), "updated_at": _now()}
             with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
+                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time(), "current_proxy": "", **proxy_metrics})
             self._save()
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
@@ -199,9 +251,10 @@ class RegisterService:
     def reset(self) -> dict:
         with self._lock:
             self._logs = []
-            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
+            proxy_metrics = openai_register.configure_proxy_pool(fetch_now=False)
+            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), **proxy_metrics, "current_proxy": "", "updated_at": _now()}
             with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
+                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0, "current_proxy": "", **proxy_metrics})
             self._save()
             return self.get()
 
@@ -210,7 +263,7 @@ class RegisterService:
         if scope == "unused":
             with self._lock:
                 removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+                openai_register.config.update({k: self._config[k] for k in REGISTER_RUNTIME_KEYS})
                 self._save()
                 self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()
