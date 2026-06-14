@@ -333,6 +333,7 @@ export type RegisterConfig = {
     request_timeout: number;
     wait_timeout: number;
     wait_interval: number;
+    api_use_register_proxy: boolean;
     providers: Array<Record<string, unknown>>;
   };
   proxy: string;

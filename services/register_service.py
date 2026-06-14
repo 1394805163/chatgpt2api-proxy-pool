@@ -57,6 +57,19 @@ def _safe_int(value: object, fallback: int) -> int:
         return fallback
 
 
+def _safe_bool(value: object, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return fallback
+
+
 def _normalize(raw: dict) -> dict:
     cfg = _default_config()
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
@@ -81,8 +94,11 @@ def _normalize(raw: dict) -> dict:
         else:
             proxy_input_mode = "single"
     cfg["proxy_input_mode"] = proxy_input_mode
-    if isinstance(cfg.get("mail"), dict):
-        cfg["mail"].pop("proxy", None)
+    default_mail = _default_config()["mail"] if isinstance(_default_config().get("mail"), dict) else {}
+    mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
+    cfg["mail"] = {**default_mail, **mail}
+    cfg["mail"]["api_use_register_proxy"] = _safe_bool(cfg["mail"].get("api_use_register_proxy"), True)
+    cfg["mail"].pop("proxy", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}

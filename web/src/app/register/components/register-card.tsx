@@ -28,6 +28,7 @@ export function RegisterCard() {
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
   const setCheckInterval = useSettingsStore((state) => state.setRegisterCheckInterval);
   const setMailField = useSettingsStore((state) => state.setRegisterMailField);
+  const setMailApiUseRegisterProxy = useSettingsStore((state) => state.setRegisterMailApiUseRegisterProxy);
   const addProvider = useSettingsStore((state) => state.addRegisterProvider);
   const updateProvider = useSettingsStore((state) => state.updateRegisterProvider);
   const deleteProvider = useSettingsStore((state) => state.deleteRegisterProvider);
@@ -191,6 +192,14 @@ export function RegisterCard() {
                 <Input value={String(config.mail.wait_interval || "")} onChange={(event) => setMailField("wait_interval", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
               </div>
             </div>
+
+            <label className="flex items-start gap-3 rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-700">
+              <Checkbox checked={config.mail.api_use_register_proxy !== false} onCheckedChange={(checked) => setMailApiUseRegisterProxy(Boolean(checked))} disabled={config.enabled} />
+              <span className="space-y-1">
+                <span className="block font-medium text-stone-800">邮箱服务后台 API 使用注册代理</span>
+                <span className="block text-xs leading-5 text-stone-500">关闭后邮箱平台 API 直连，注册 OpenAI/Auth0 请求仍使用注册代理。</span>
+              </span>
+            </label>
 
             <div className="space-y-3">
               {providers.map((provider, index) => {
