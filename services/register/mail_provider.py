@@ -595,6 +595,10 @@ class CloudMailGenProvider(BaseMailProvider):
         self.email_prefix = str(entry.get("email_prefix") or "").strip()
         self.session = _create_session(conf)
 
+    def _clear_token_cache(self) -> None:
+        with cloudmail_token_lock:
+            cloudmail_token_cache.pop(self._cache_key(), None)
+
     @staticmethod
     def _is_retryable_status(status_code: int) -> bool:
         return status_code == 429 or status_code >= 500
@@ -642,6 +646,21 @@ class CloudMailGenProvider(BaseMailProvider):
     def _cache_key(self) -> str:
         return f"{self.api_base}|{self.admin_email}"
 
+    @staticmethod
+    def _is_success_payload(data: Any) -> bool:
+        return isinstance(data, dict) and data.get("code") == 200
+
+    def _fetch_email_list(self, token: str, address: str) -> dict:
+        data = self._request(
+            "POST",
+            "/api/public/emailList",
+            headers={"Authorization": token},
+            payload={"toEmail": address, "size": 20, "timeSort": "desc"},
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"CloudMailGen emailList 返回异常: {data}")
+        return data
+
     def _get_token(self) -> str:
         if not self.admin_email or not self.admin_password:
             raise RuntimeError("CloudMailGen 缺少 admin_email 或 admin_password")
@@ -688,13 +707,14 @@ class CloudMailGenProvider(BaseMailProvider):
         if not address:
             raise RuntimeError("CloudMailGen 缺少 address")
         token = self._get_token()
-        data = self._request(
-            "POST",
-            "/api/public/emailList",
-            headers={"Authorization": token},
-            payload={"toEmail": address, "size": 20, "timeSort": "desc"},
-        )
-        items = (data.get("data") or []) if isinstance(data, dict) and data.get("code") == 200 else []
+        data = self._fetch_email_list(token, address)
+        if not self._is_success_payload(data):
+            self._clear_token_cache()
+            token = self._get_token()
+            data = self._fetch_email_list(token, address)
+        if not self._is_success_payload(data):
+            raise RuntimeError(f"CloudMailGen emailList 返回异常: {data}")
+        items = data.get("data") or []
         messages = [item for item in items if isinstance(item, dict) and _message_matches_email(item, address)]
         if not messages:
             return None

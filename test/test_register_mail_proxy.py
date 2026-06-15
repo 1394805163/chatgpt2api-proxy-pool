@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import copy
+import time
 from datetime import datetime
 from unittest.mock import patch
 
@@ -131,6 +132,41 @@ class RegisterMailProxyTests(unittest.TestCase):
         self.assertEqual(message["text_content"], "Verification code: 123456")
         self.assertIsInstance(message["received_at"], datetime)
         self.assertEqual(len(session.calls), 4)
+
+    def test_cloudmail_gen_refreshes_cached_token_when_email_list_rejects_it(self) -> None:
+        entry = cloudmail_entry()
+        cache_key = f"{entry['api_base']}|{entry['admin_email']}"
+        mail_provider.cloudmail_token_cache[cache_key] = ("stale-token", time.time() + 3600)
+        responses = [
+            FakeResponse({"code": 401, "message": "invalid token"}),
+            FakeResponse({"code": 200, "data": {"token": "fresh-token"}}),
+            FakeResponse(
+                {
+                    "code": 200,
+                    "data": [
+                        {
+                            "emailId": "mail-2",
+                            "toEmail": "user@example.com",
+                            "subject": "OpenAI verification",
+                            "text": "Verification code: 654321",
+                        }
+                    ],
+                }
+            ),
+        ]
+        session = FakeSession(responses=responses)
+
+        with patch.object(mail_provider, "_create_session", return_value=session), patch.object(mail_provider.time, "sleep", return_value=None):
+            provider = mail_provider.CloudMailGenProvider(entry, mail_provider._config({"proxy": ""}))
+            message = provider.fetch_latest_message({"address": "user@example.com"})
+
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertEqual(message["message_id"], "mail-2")
+        self.assertEqual(mail_provider._extract_code(message), "654321")
+        self.assertEqual(len(session.calls), 3)
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "stale-token")
+        self.assertEqual(session.calls[2]["headers"]["Authorization"], "fresh-token")
 
 
 if __name__ == "__main__":
