@@ -26,9 +26,25 @@
 - 本项目：`strongshuai/chatgpt2api-proxy-pool`
 - 当前基线：`chatgpt2api` v1.5.0
 - 推荐部署分支：`feature/register-proxy-source-modes`
-- 给原项目提交的 PR：<https://github.com/basketikun/chatgpt2api/pull/273>
+- 给原项目提交的 PR：<https://github.com/basketikun/chatgpt2api/pull/277>
 
 本 README 保留原版主要说明，并补充本分支的代理池能力、部署方式和使用注意事项。
+
+## 相对原版改动日志
+
+本分支基于原版 v1.5.0，主要改动集中在注册页代理池和邮箱验证码稳定性：
+
+- 注册代理来源从原版单个代理扩展为 `单代理`、`代理列表 URL`、`粘贴代理列表` 三种模式。
+- URL 和 textarea 代理列表支持一行一个代理，兼容 `http://`、`https://`、`socks5://`、`socks5h://` 和裸 `ip:port`。
+- 每个注册 worker 启动时从代理池线程安全轮询一个代理，并在本次注册流程内固定使用。
+- URL 模式支持懒刷新代理池，后续刷新失败时继续使用旧池并在页面状态里显示最后错误；首次拉取失败或为空会明确失败。
+- 注册页运行状态新增当前代理来源、代理池数量、worker 当前代理、代理池最后错误。
+- 邮箱配置新增 `邮箱服务后台 API 使用注册代理` 开关，默认保持原版行为；关闭后邮箱平台后台 API 直连，OpenAI/Auth0 注册请求仍使用注册代理。
+- `cloudmail_gen` 兼容当前返回字段：`toEmail`、`emailId`、`createTime`、`sendEmail`。
+- `cloudmail_gen` 对临时网络异常、`429`、`5xx` 增加短重试。
+- `cloudmail_gen` 发现 `emailList` 业务返回异常时会清理缓存 token、重新 `genToken` 并重试一次，避免长时间运行后缓存 token 失效导致“邮箱已收到验证码，但页面等待验证码超时”。
+- README 增加本分支部署方式和代理有效性说明，强调代理检测服务最好部署在实际跑注册任务的同一台服务器或同一网络出口。
+- 本分支部署应使用 `docker-compose.local.yml` 本地构建；原版 `docker-compose.yml` 默认拉取官方镜像，不包含本分支改动。
 
 > [!WARNING]
 > 免责声明：
@@ -96,6 +112,7 @@ socks5h://1.2.3.4:1080
 
 - 兼容 `toEmail`、`emailId`、`createTime`、`sendEmail` 等当前返回字段。
 - 对临时网络异常、`429`、`5xx` 增加短重试，降低偶发等待验证码超时。
+- 当长时间运行进程里的 `cloudmail_gen` 缓存 token 失效时，会自动清理旧 token、重新生成 token 并重试 `emailList`，避免把“业务鉴权失败”误判成“邮箱为空”。
 
 ### 代理有效性说明
 
