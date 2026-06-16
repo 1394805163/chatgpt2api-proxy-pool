@@ -18,6 +18,8 @@
 ## 增加"邮箱服务后台 API 使用注册代理"开关，避免有些邮箱使用代理无法收到验证码
 <img width="1074" height="330" alt="1781485158732_d" src="https://github.com/user-attachments/assets/4c192693-f885-4f80-8acb-d0bd4a4ef8ae" />
 
+## 增加了智能黑名单代理机制，大幅稳定提升成功率。
+<img width="1022" height="363" alt="image" src="https://github.com/user-attachments/assets/db4a79ae-1a95-4703-914a-92397ca0b34b" />
 
 
 ## 分支说明
