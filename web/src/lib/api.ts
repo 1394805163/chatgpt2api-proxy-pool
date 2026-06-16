@@ -364,6 +364,8 @@ export type RegisterConfig = {
     proxy_source?: string;
     proxy_pool_last_error?: string;
     proxy_pool_last_fetch?: number;
+    proxy_state_count?: number;
+    proxy_blacklist_count?: number;
     started_at?: string;
     updated_at?: string;
     finished_at?: string;
@@ -781,6 +783,10 @@ export async function resetOutlookPool(scope: "all" | "failed" | "unused" = "all
     method: "POST",
     body: { scope },
   });
+}
+
+export async function resetProxyBlacklist() {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/proxy-blacklist/reset", { method: "POST" });
 }
 
 // ── CPA (CLIProxyAPI) ──────────────────────────────────────────────
