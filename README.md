@@ -26,7 +26,7 @@
 - 本项目：`strongshuai/chatgpt2api-proxy-pool`
 - 当前基线：`chatgpt2api` v1.5.0
 - 推荐部署分支：`feature/register-proxy-source-modes`
-- 给原项目提交的 PR：<https://github.com/basketikun/chatgpt2api/pull/273>
+- 给原项目提交的 PR：<https://github.com/basketikun/chatgpt2api/pull/273> <https://github.com/basketikun/chatgpt2api/pull/277>
 
 本 README 保留原版主要说明，并补充本分支的代理池能力、部署方式和使用注意事项。
 
