@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from services.account_service import account_service
-from services.config import DATA_DIR
+from services.config import DATA_DIR, config
 from services.register import mail_provider, openai_register
 
 
@@ -112,10 +112,10 @@ class RegisterService:
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
+        self._last_free_pool_precheck_at = 0.0
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
-        openai_register.config.update({k: self._config[k] for k in REGISTER_RUNTIME_KEYS})
-        openai_register.configure_proxy_pool(fetch_now=False)
+        self._sync_register_runtime(fetch_proxy_now=False)
         if self._config["enabled"]:
             try:
                 self.start()
@@ -177,6 +177,10 @@ class RegisterService:
         if isinstance(self._config.get("mail"), dict):
             self._config["mail"].pop("proxy", None)
 
+    def _sync_register_runtime(self, *, fetch_proxy_now: bool) -> dict[str, object]:
+        openai_register.config.update({k: self._config[k] for k in REGISTER_RUNTIME_KEYS})
+        return openai_register.configure_proxy_pool(fetch_now=fetch_proxy_now)
+
     def _merge_outlook_pools(self, updates: dict) -> None:
         """对 outlook_token provider：把前端新导入的 mailboxes 与已存池按邮箱合并去重。
 
@@ -223,8 +227,9 @@ class RegisterService:
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
-            openai_register.config.update({k: self._config[k] for k in REGISTER_RUNTIME_KEYS})
-            openai_register.configure_proxy_pool(fetch_now=False)
+            proxy_metrics = self._sync_register_runtime(fetch_proxy_now=False)
+            if isinstance(self._config.get("stats"), dict):
+                self._config["stats"].update(proxy_metrics)
             self._save()
             return self.get()
 
@@ -237,8 +242,9 @@ class RegisterService:
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
+            self._last_free_pool_precheck_at = 0.0
             metrics = self._pool_metrics()
-            openai_register.config.update({k: self._config[k] for k in REGISTER_RUNTIME_KEYS})
+            self._sync_register_runtime(fetch_proxy_now=False)
             try:
                 proxy_metrics = openai_register.prepare_proxy_pool()
             except Exception as error:
@@ -268,7 +274,7 @@ class RegisterService:
     def reset(self) -> dict:
         with self._lock:
             self._logs = []
-            proxy_metrics = openai_register.configure_proxy_pool(fetch_now=False)
+            proxy_metrics = self._sync_register_runtime(fetch_proxy_now=False)
             self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), **proxy_metrics, **openai_register.proxy_pool.proxy_state_metrics(), "current_proxy": "", "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0, "current_proxy": "", **proxy_metrics})
@@ -291,7 +297,7 @@ class RegisterService:
         if scope == "unused":
             with self._lock:
                 removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in REGISTER_RUNTIME_KEYS})
+                self._sync_register_runtime(fetch_proxy_now=False)
                 self._save()
                 self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()
@@ -317,8 +323,29 @@ class RegisterService:
             "current_available": len(normal),
         }
 
+    def _maybe_precheck_free_pool(self, mode: str) -> None:
+        if mode not in {"quota", "available"}:
+            return
+        settings = config.get_free_account_cleanup_settings()
+        if not bool(settings.get("enabled")) or not bool(settings.get("register_precheck_enabled")):
+            return
+        interval_seconds = max(60, int(settings.get("interval_minutes") or 10) * 60)
+        now = time.monotonic()
+        if now - self._last_free_pool_precheck_at < interval_seconds:
+            return
+        self._last_free_pool_precheck_at = now
+        result = account_service.refresh_normal_free_accounts("register_precheck")
+        checked = int(result.get("checked") or 0)
+        if checked:
+            errors = len(result.get("errors") or [])
+            self._append_log(
+                f"Free 号池强校验：检查 {checked} 个正常 Free 账号，刷新成功 {result.get('refreshed', 0)}，异常 {errors}",
+                "yellow",
+            )
+
     def _target_reached(self, cfg: dict, submitted: int) -> bool:
         mode = str(cfg.get("mode") or "total")
+        self._maybe_precheck_free_pool(mode)
         metrics = self._pool_metrics()
         self._bump(**metrics)
         if mode == "quota":
