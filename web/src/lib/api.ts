@@ -41,6 +41,8 @@ export type Account = {
     reset_after?: string;
   }>;
   default_model_slug?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
   restore_at?: string | null;
   success: number;
   fail: number;
@@ -165,6 +167,7 @@ export type ThirdPartyAppsSettings = {
 export type SettingsConfig = {
   proxy: string;
   base_url?: string;
+  display_timezone?: string;
   global_system_prompt?: string;
   sensitive_words?: string[];
   ai_review?: {
@@ -587,6 +590,10 @@ export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
 
 export async function fetchSettingsConfig() {
   return httpRequest<{ config: SettingsConfig }>("/api/settings");
+}
+
+export async function fetchDisplaySettings() {
+  return httpRequest<{ display_timezone: string }>("/api/display-settings");
 }
 
 export async function updateSettingsConfig(settings: SettingsConfig) {
