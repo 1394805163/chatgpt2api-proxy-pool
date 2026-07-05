@@ -23,7 +23,7 @@ from services.image_service import (
 )
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
-from services.log_service import log_service
+from services.log_service import LOG_TYPE_CALL, log_service
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
 
 
@@ -135,7 +135,20 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/logs")
     async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
+        log_type = type.strip()
+        start = start_date.strip()
+        end = end_date.strip()
+        has_date_filter = bool(start or end)
+        return {
+            "items": log_service.list(
+                type=log_type,
+                start_date=start,
+                end_date=end,
+                limit=None if has_date_filter else 200,
+                collapse_image_failures=log_type == LOG_TYPE_CALL,
+                display_timezone=config.display_timezone,
+            )
+        }
 
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):

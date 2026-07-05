@@ -1,571 +1,67 @@
-<h1 align="center">ChatGPT2API Proxy Pool</h1>
+# ChatGPT2API Proxy Pool
 
-<p align="center">基于 <a href="https://github.com/basketikun/chatgpt2api">basketikun/chatgpt2api</a> v1.5.0 的二开分支，保留原版图片 API、在线画图、号池管理和自托管能力，并增强注册页代理池：支持单代理、代理列表 URL、手动粘贴代理列表三种代理来源。</p>
+这是一个基于 `basketikun/chatgpt2api` 的 Docker 可部署版本，默认从本仓库源码本地构建镜像。
 
-> 本分支适合需要在注册流程中轮换代理的人。每个注册 worker 启动时会从代理池取一个代理，并在本次注册流程内固定使用；下一个 worker 再轮询使用下一个代理。
->
-## 默认单代理
-<img width="1980" height="579" alt="1781394711392_d" src="https://github.com/user-attachments/assets/0ec519da-db30-4604-a201-b5c6640137c4" />
+## 快速启动
 
-
-## 代理列表链接，一行一个
-<img width="1977" height="642" alt="1781394718555_d" src="https://github.com/user-attachments/assets/68a7611e-f192-4dc4-9026-42ef163ca551" />
-
-
-## 代理列表表单，一行一个
-<img width="1965" height="573" alt="1781394725477_d" src="https://github.com/user-attachments/assets/3fea4c68-eb90-4f01-ad09-1623b518f09a" />
-
-## 增加"邮箱服务后台 API 使用注册代理"开关，避免有些邮箱使用代理无法收到验证码
-<img width="1074" height="330" alt="1781485158732_d" src="https://github.com/user-attachments/assets/4c192693-f885-4f80-8acb-d0bd4a4ef8ae" />
-
-## 增加了智能黑名单代理机制，大幅稳定提升成功率。
-<img width="1022" height="363" alt="image" src="https://github.com/user-attachments/assets/db4a79ae-1a95-4703-914a-92397ca0b34b" />
-
-
-## 分支说明
-
-- 原项目：`basketikun/chatgpt2api`
-- 本项目：`strongshuai/chatgpt2api-proxy-pool`
-- 当前基线：`chatgpt2api` v1.5.0
-- 推荐部署分支：`feature/register-proxy-source-modes`
-- 给原项目提交的 PR：<https://github.com/basketikun/chatgpt2api/pull/273> <https://github.com/basketikun/chatgpt2api/pull/277>
-
-本 README 保留原版主要说明，并补充本分支的代理池能力、部署方式和使用注意事项。
-
-## 相对原版改动日志
-
-本分支基于原版 v1.5.0，主要改动集中在注册页代理池和邮箱验证码稳定性：
-
-- 注册代理来源从原版单个代理扩展为 `单代理`、`代理列表 URL`、`粘贴代理列表` 三种模式。
-- URL 和 textarea 代理列表支持一行一个代理，兼容 `http://`、`https://`、`socks5://`、`socks5h://` 和裸 `ip:port`。
-- 每个注册 worker 启动时从代理池线程安全轮询一个代理，并在本次注册流程内固定使用。
-- URL 模式支持懒刷新代理池，后续刷新失败时继续使用旧池并在页面状态里显示最后错误；首次拉取失败或为空会明确失败。
-- 注册页运行状态新增当前代理来源、代理池数量、worker 当前代理、代理池最后错误。
-- 邮箱配置新增 `邮箱服务后台 API 使用注册代理` 开关，默认保持原版行为；关闭后邮箱平台后台 API 直连，OpenAI/Auth0 注册请求仍使用注册代理。
-- `cloudmail_gen` 兼容当前返回字段：`toEmail`、`emailId`、`createTime`、`sendEmail`。
-- `cloudmail_gen` 对临时网络异常、`429`、`5xx` 增加短重试。
-- `cloudmail_gen` 发现 `emailList` 业务返回异常时会清理缓存 token、重新 `genToken` 并重试一次，避免长时间运行后缓存 token 失效导致“邮箱已收到验证码，但页面等待验证码超时”。
-- 代理列表 URL / 粘贴代理列表模式新增注册代理状态文件 `data/register_proxy_state.json`，记录历史成功、失败分桶、冷却时间、租约和评分。
-- 代理池新增 120 秒租约机制，同一代理被 worker 取走后，其他 worker 会在租约期内跳过它，减少并发重复踩同一个坏代理。
-- 代理池新增偏激进的免费代理冷却策略：新代理首次 Cloudflare 拦截冷却 24 小时，新代理硬网络失败冷却 48 小时；历史成功代理采用更温和冷却，避免误杀偶发失败的可用代理。
-- 代理选择新增评分排序和新代理探索比例限制；有历史成功代理时优先复用高成功率代理，降低免费代理开荒拖累。
-- 注册页在代理列表 URL / 粘贴代理列表模式下提供“重置代理黑名单”按钮，点击前会提示当前黑名单记录数。
-- 额度守护模式暂停后再次恢复注册时，会重置代理选择周期到列表开头，但保留黑名单与评分状态。
-- 设置页新增 Free 号池死号清理，可按间隔强校验正常 Free 账号，并在生图连续失败后强验证该账号。
-- Free 号池死号清理支持“标记异常并额度归零”或“直接删除”，适合一次性 Free 号池更果断地清理死号。
-- 注册补号判断前可启用 Free 号池强校验，避免死号占着额度导致补号任务误判“当前额度已达标”。
-- 普通文本对话链路新增 `reasoning_effort` / `thinking_effort` 透传，兼容 `low`、`medium`、`high`、`xhigh` / `extended`。
-- Debug 对话页新增“思考强度”下拉和图片输入，方便直接测试文本思考强度与多模态对话请求。
-- README 增加本分支部署方式和代理有效性说明，强调代理检测服务最好部署在实际跑注册任务的同一台服务器或同一网络出口。
-- 本分支部署应使用 `docker-compose.local.yml` 本地构建；原版 `docker-compose.yml` 默认拉取官方镜像，不包含本分支改动。
-
-> [!WARNING]
-> 免责声明：
->
-> 本项目涉及对 ChatGPT 官网文本生成、图片生成与图片编辑等相关接口的逆向研究，仅供个人学习、技术研究与非商业性技术交流使用。
->
-> - 严禁将本项目用于任何商业用途、盈利性使用、批量操作、自动化滥用或规模化调用。
-> - 严禁将本项目用于破坏市场秩序、恶意竞争、套利倒卖、二次售卖相关服务，以及任何违反 OpenAI 服务条款或当地法律法规的行为。
-> - 严禁将本项目用于生成、传播或协助生成违法、暴力、色情、未成年人相关内容，或用于诈骗、欺诈、骚扰等非法或不当用途。
-> - 使用者应自行承担全部风险，包括但不限于账号被限制、临时封禁或永久封禁以及因违规使用等所导致的法律责任。
-> - 使用本项目即视为你已充分理解并同意本免责声明全部内容；如因滥用、违规或违法使用造成任何后果，均由使用者自行承担。
-> - 本项目基于对 ChatGPT 官网相关能力的逆向研究实现，存在账号受限、临时封禁或永久封禁的风险。请勿使用你自己的重要账号、常用账号或高价值账号进行测试。
-
-## 本分支新增能力
-
-### 注册代理来源
-
-注册页新增“代理来源”选择，支持三种模式：
-
-| 模式 | 说明 | 适合场景 |
-|:---|:---|:---|
-| 单代理 | 保持原版行为，只填写一个代理 | 少量测试或固定出口 |
-| 代理列表 URL | 填写一个一行一个代理的文本链接 | 使用代理检测工具生成的仓库链接 |
-| 粘贴代理列表 | 在 textarea 中直接粘贴代理，一行一个 | 手里已有代理列表，不想搭建额外仓库 |
-
-支持的代理格式：
+Windows 用户可以双击：
 
 ```text
-http://1.2.3.4:8080
-https://1.2.3.4:8443
-socks5://1.2.3.4:1080
-socks5h://1.2.3.4:1080
-1.2.3.4:8080
+start-docker.bat
 ```
 
-裸 `ip:port` 会按 HTTP 代理处理。`socks5://` 会规范化为 `socks5h://`，让 DNS 解析也走代理。
-
-### 轮询策略
-
-- 每个注册 worker 启动时从代理池取一个代理。
-- 同一个 worker 的注册流程内固定使用该代理。
-- 多个 worker 会按代理列表顺序轮询。
-- 代理被 worker 取走后会获得 120 秒租约，租约期间其他 worker 会优先跳过该代理。
-- 代理成功、失败、Cloudflare 拦截、网络超时等结果会写入 `data/register_proxy_state.json`。
-- URL / 粘贴代理列表模式会启用更激进的免费代理冷却：新代理首次 Cloudflare 拦截冷却 24 小时，首次硬网络失败冷却 48 小时；历史成功代理失败时冷却更温和。
-- 有历史成功代理后，代理池会优先复用历史成功且响应更快的代理，并限制新代理探索比例，减少免费代理批量开荒导致的成功率波动。
-- URL 模式会按刷新间隔懒刷新代理列表，默认 `120` 秒，最低 `10` 秒。
-- URL 后续刷新失败时，如果旧池仍有代理，会继续使用旧池并在状态中展示最后错误。
-- 首次拉取为空或失败时，注册任务会明确失败，不会静默直连。
-- 额度守护模式达到目标后会暂停注册；后续额度低于目标重新开跑时，代理选择会从列表开头重新开始，但保留已有黑名单和评分。
-
-### 页面状态
-
-注册页运行状态中会显示：
-
-- 当前代理来源
-- 当前代理池数量
-- 当前 worker 使用的代理
-- 代理池最后错误
-- 代理黑名单记录数
-
-当代理来源为 `代理列表 URL` 或 `粘贴代理列表`，并且存在黑名单记录时，页面会显示“重置代理黑名单”按钮。点击后会弹窗提示当前记录数，确认后清空 `data/register_proxy_state.json` 中的代理状态。
-
-### Free 号池死号清理
-
-设置页新增 `启用 Free 号池死号清理`：
-
-- 只处理 `type=free` 的账号，不影响 Plus / Team / Pro 等账号。
-- 后台 watcher 会按 `定期强校验间隔` 刷新正常 Free 账号，及时发现已经失效的号。
-- 生图链路会记录连续失败次数，达到 `生图失败阈值` 后会强验证该账号。
-- 注册补号判断前可启用强校验，避免死号长期占用“正常账号”和“剩余额度”统计，导致补号任务误判不需要注册。
-- 清理方式支持 `标记异常并额度归零` 和 `直接删除`；一次性 Free 号池更适合直接删除。
-
-这个功能适合 Free 号池长时间挂机场景。它的目的不是替代账号刷新，而是让“已经实际不可用但还留在正常池里的账号”更快被踢出，减少生图时才暴露死号的问题。
-
-### 邮箱后台 API 代理
-
-注册页「邮箱配置」新增 `邮箱服务后台 API 使用注册代理` 开关：
-
-- 默认开启，保持原版行为：邮箱平台后台 API 请求复用当前注册 worker 的代理。
-- 关闭后，邮箱平台后台 API 走服务器直连；OpenAI/Auth0 注册请求仍继续使用注册代理。
-- 适合“注册代理能访问 OpenAI，但访问邮箱平台不稳定”的场景。
-
-同时增强 `cloudmail_gen` 兼容性：
-
-- 兼容 `toEmail`、`emailId`、`createTime`、`sendEmail` 等当前返回字段。
-- 对临时网络异常、`429`、`5xx` 增加短重试，降低偶发等待验证码超时。
-- 当长时间运行进程里的 `cloudmail_gen` 缓存 token 失效时，会自动清理旧 token、重新生成 token 并重试 `emailList`，避免把“业务鉴权失败”误判成“邮箱为空”。
-
-### 文本思考强度与 Debug 多模态测试
-
-普通文本对话链路支持客户端显式传入思考强度，不会影响图片生成、图生图、PPT / PSD 文件任务逻辑。
-
-支持字段：
-
-```json
-{
-  "reasoning_effort": "high"
-}
-```
-
-也兼容：
-
-```json
-{
-  "thinking_effort": "high",
-  "reasoning": {
-    "effort": "xhigh"
-  }
-}
-```
-
-值映射：
-
-| 输入 | 透传到 ChatGPT Web |
-|:---|:---|
-| `none` / 空字符串 | 不传 |
-| `low` | `low` |
-| `medium` | `medium` |
-| `high` | `high` |
-| `xhigh` / `extended` | `extended` |
-
-非法值会被忽略，不会报错。Debug 对话页新增“思考强度”下拉和图片选择，可直接测试 `/v1/chat/completions` 的 reasoning effort 与图片输入。
-
-### 代理有效性说明
-
-代理是否可用取决于“运行注册任务的服务器”能否连通该代理。其他机器检测有效，不代表你的注册服务器同样有效。
-
-如果你使用代理检测工具生成“我的仓库”链接，最好把检测服务部署在和注册服务相同的服务器，或至少部署在相同网络出口环境中。这样筛出的有效代理才更接近真实注册环境。
-
-## 快速开始
-
-### 部署本分支
+也可以手动运行：
 
 ```bash
-git clone -b feature/register-proxy-source-modes https://github.com/strongshuai/chatgpt2api-proxy-pool.git
-cd chatgpt2api-proxy-pool
+docker compose up -d --build
 ```
 
-启动前建议先修改 `config.json`：
+启动后访问：
 
-```json
-{
-  "auth-key": "your_secret_key_here"
-}
+```text
+Web 面板：http://localhost:3000
+API 地址：http://localhost:3000/v1
+默认 API Key：12345678
 ```
 
-然后使用本地构建 compose 启动：
+## 修改 API Key
 
-```bash
-docker compose -f docker-compose.local.yml up -d --build
+推荐复制 `.env.example` 为 `.env`，然后修改：
+
+```env
+CHATGPT2API_AUTH_KEY=你的新 key
+CHATGPT2API_PORT=3000
+STORAGE_BACKEND=json
 ```
 
-默认地址：
+`.env` 不要提交到公开仓库。仓库默认值保持为 `12345678`，方便新手直接启动。
 
-- Web 面板：`http://localhost:8000`
-- API 地址：`http://localhost:8000/v1`
-- 数据目录：`./data`
-- 配置文件：`./config.json`
+## 更新项目
 
-> 不要直接用 `docker-compose.yml` 部署本分支。该文件默认使用官方镜像 `ghcr.io/basketikun/chatgpt2api:latest`，不会包含本分支的注册代理池改动。
+Windows 用户可以双击：
 
-### 更新本分支
+```text
+update-docker.bat
+```
+
+也可以手动运行：
 
 ```bash
 git pull
-docker compose -f docker-compose.local.yml up -d --build
+docker compose up -d --build
 ```
 
-如需备份，重点保留：
+一般不需要手动删除旧容器，Compose 会按新镜像和配置自动重建并替换服务。
+
+## 数据位置
+
+运行数据保存在：
 
 ```text
-config.json
-data/
+./data
+./config.json
 ```
 
-### 使用注册代理池
+公开上传前请确认不要提交真实账号、Token、日志、私有 `.env` 或本机真实配置。
 
-打开 Web 面板后进入：
-
-```text
-注册页 -> 注册代理 -> 代理来源
-```
-
-选择：
-
-- `单代理`：填写一个代理。
-- `代理列表 URL`：填写一行一个代理的 `.txt` 链接，例如代理检测工具生成的“我的仓库”链接。
-- `粘贴代理列表`：直接粘贴代理列表，一行一个。
-
-保存后启动注册任务即可。旧版只配置 `proxy_url` 的场景会自动兼容为 URL 模式。
-
-### WARP / FlareSolverr 稳定代理部署（可选）
-
-如果注册或图片链路经常遇到 Cloudflare 拦截，可以启用附带的 WARP + Privoxy + FlareSolverr 方案：
-
-```bash
-cp .env.example .env
-docker compose -f docker-compose.warp.yml up -d --build
-```
-
-该 compose 会启动：
-
-- `warp-proxy`：提供 WARP SOCKS5 出口。
-- `privoxy`：把 WARP SOCKS5 转成 HTTP 代理。
-- `flaresolverr`：刷新 Cloudflare clearance。
-- `init-config`：幂等写入 `proxy_runtime` 默认配置。
-- `app`：启动 ChatGPT2API 主服务。
-
-默认只让上游 OpenAI / ChatGPT 请求走稳定代理，账号邮箱、CPA 等辅助链路不会被强制接管。账号自身配置的代理优先级最高，其次是稳定代理运行时，再其次是显式代理和旧版全局代理。
-
-可在 `.env` 中调整端口和代理运行时参数，也可在后台设置页的「稳定代理运行时」面板手动保存、测试代理和测试 clearance。
-
-### 本地开发
-
-启动后端：
-
-```bash
-git clone -b feature/register-proxy-source-modes https://github.com/strongshuai/chatgpt2api-proxy-pool.git
-cd chatgpt2api-proxy-pool
-uv sync
-uv run main.py
-```
-
-启动前端：
-
-```bash
-cd web
-bun install
-bun run dev
-```
-
-### 存储后端配置
-
-支持通过环境变量 `STORAGE_BACKEND` 切换存储方式：
-
-- `json` - 本地 JSON 文件（默认）
-- `sqlite` - 本地 SQLite 数据库
-- `postgres` - 外部 PostgreSQL（需配置 `DATABASE_URL`）
-- `git` - Git 私有仓库（需配置 `GIT_REPO_URL` 和 `GIT_TOKEN`）
-
-示例：使用 PostgreSQL
-
-```yaml
-environment:
-  - STORAGE_BACKEND=postgres
-  - DATABASE_URL=postgresql://user:password@host:5432/dbname
-```
-
-## 功能
-
-### API 兼容能力
-
-- 兼容 `POST /v1/images/generations` 图片生成接口
-- 兼容 `POST /v1/images/edits` 图片编辑接口
-- 兼容面向图片场景的 `POST /v1/chat/completions`
-- 兼容面向图片场景的 `POST /v1/responses`
-- `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
-  `gpt-5-mini`
-- 支持通过 `n` 返回多张生成结果
-- 支持生成可编辑 PPT 文件
-- 支持生成可编辑 PSD 文件
-- 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回
-  `gpt-image-2`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
-
-### 在线画图功能
-
-- 内置在线画图工作台，支持生成、图片编辑与多图组图编辑
-- 支持 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` 模型选择
-- 编辑模式支持参考图上传
-- 前端支持多图生成交互
-- 本地保存图片会话历史，支持回看、删除和清空
-- 支持服务端缓存图片URL
-- 图片生成进度追踪，超时后可继续等待
-- 图片懒加载与滚动位置记忆，优化大量图片场景性能
-
-### 号池管理功能
-
-- 自动刷新账号邮箱、类型、额度和恢复时间（异步进度追踪）
-- 轮询可用账号执行图片生成与图片编辑
-- 遇到 Token 失效类错误时自动剔除无效 Token
-- 定时检查限流账号并自动刷新
-- 支持密码重新登录恢复异常账号，刷新后可自动重登
-- 支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理
-- 支持 WARP / FlareSolverr 稳定代理运行时
-- 支持搜索、筛选、批量刷新、导出、手动编辑和清理账号
-- 支持四种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、`access_token` 导入
-- 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
-
-### 实验性 / 规划中
-
-- 详细状态说明见：[功能清单](./docs/feature-status.en.md)
-
-## 效果展示
-
-<table width="100%">
-  <tr>
-    <td width="50%"><img src="https://i.ibb.co/Jj8nfwwP/image.png" alt="image" border="0"></td>
-    <td width="50%"><img src="https://i.ibb.co/pqf235v/image-edit.png" alt="image edit" border="0"></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="https://i.ibb.co/tPcqtVfd/chery-studio.png" alt="chery studio" border="0"></td>
-    <td width="50%"><img src="https://i.ibb.co/PsT9YHBV/account-pool.png" alt="account pool" border="0"></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="https://i.ibb.co/rRWLG08q/new-api.png" alt="new api" border="0"></td>
-  </tr>
-</table>
-
-## API
-
-所有 AI 接口都需要请求头：
-
-```http
-Authorization: Bearer <auth-key>
-```
-
-<details>
-<summary><code>GET /v1/models</code></summary>
-<br>
-
-返回当前暴露的图片模型列表。
-
-```bash
-curl http://localhost:8000/v1/models \
-  -H "Authorization: Bearer <auth-key>"
-```
-
-<details>
-<summary>说明</summary>
-<br>
-
-| 字段   | 说明                                                                                                         |
-|:-----|:-----------------------------------------------------------------------------------------------------------|
-| 返回模型 | `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` |
-| 接入场景 | 可接入 Cherry Studio、New API 等上游或客户端                                                                          |
-
-<br>
-</details>
-</details>
-
-<details>
-<summary><code>POST /v1/images/generations</code></summary>
-<br>
-
-OpenAI 兼容图片生成接口，用于文生图。
-
-```bash
-curl http://localhost:8000/v1/images/generations \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <auth-key>" \
-  -d '{
-    "model": "gpt-image-2",
-    "prompt": "一只漂浮在太空里的猫",
-    "n": 1,
-    "response_format": "b64_json"
-  }'
-```
-
-<details>
-<summary>字段说明</summary>
-<br>
-
-| 字段                | 说明                                                 |
-|:------------------|:---------------------------------------------------|
-| `model`           | 图片模型，当前可用值以 `/v1/models` 返回结果为准，推荐使用 `gpt-image-2` |
-| `prompt`          | 图片生成提示词                                            |
-| `n`               | 生成数量，当前后端限制为 `1-4`                                 |
-| `response_format` | 当前请求模型中包含该字段，默认值为 `b64_json`                       |
-
-<br>
-</details>
-</details>
-
-<details>
-<summary><code>POST /v1/images/edits</code></summary>
-<br>
-
-OpenAI 兼容图片编辑接口，可上传图片文件，也可按官方 JSON 格式传入图片链接并生成编辑结果。
-
-```bash
-curl http://localhost:8000/v1/images/edits \
-  -H "Authorization: Bearer <auth-key>" \
-  -F "model=gpt-image-2" \
-  -F "prompt=把这张图改成赛博朋克夜景风格" \
-  -F "n=1" \
-  -F "image=@./input.png"
-```
-
-也可以直接传图片 URL：
-
-```bash
-curl http://localhost:8000/v1/images/edits \
-  -H "Authorization: Bearer <auth-key>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-image-2",
-    "prompt": "把这张图改成赛博朋克夜景风格",
-    "images": [
-      {"image_url": "https://example.com/input.png"}
-    ]
-  }'
-```
-
-<details>
-<summary>字段说明</summary>
-<br>
-
-| 字段          | 说明                                            |
-|:------------|:----------------------------------------------|
-| `model`     | 图片模型， `gpt-image-2`                           |
-| `prompt`    | 图片编辑提示词                                       |
-| `n`         | 生成数量，当前后端限制为 `1-4`                            |
-| `image`     | 需要编辑的图片文件，使用 multipart/form-data 上传           |
-| `images`    | JSON 图片引用数组，支持 `{"image_url": "https://..."}` |
-| `image_url` | 表单模式下也可直接传图片链接，支持重复字段传多张图                     |
-
-<br>
-</details>
-</details>
-
-<details>
-<summary><code>POST /v1/chat/completions</code></summary>
-<br>
-
-面向文本、网页搜索与图片场景的 Chat Completions 兼容接口，不是完整通用聊天代理。
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <auth-key>" \
-  -d '{
-    "model": "gpt-image-2",
-    "messages": [
-      {
-        "role": "user",
-        "content": "生成一张雨夜东京街头的赛博朋克猫"
-      }
-    ],
-    "n": 1
-  }'
-```
-
-<details>
-<summary>字段说明</summary>
-<br>
-
-| 字段                   | 说明                                                                           |
-|:---------------------|:-----------------------------------------------------------------------------|
-| `model`              | 文本、搜索或图片模型；搜索模型会触发网页搜索兼容逻辑                                                   |
-| `messages`           | 消息数组，支持文本、搜索和图片请求内容                                                          |
-| `n`                  | 图片生成数量，按当前实现解析为图片数量                                                          |
-| `stream`             | 文本、搜索和图片场景均支持，仍在测试                                                           |
-| `tools`              | 文本场景支持 `web_search` / `web_search_preview` / `web_search_preview_2025_03_11` |
-| `web_search_options` | 传入时会触发网页搜索兼容逻辑                                                               |
-
-<br>
-</details>
-</details>
-
-<details>
-<summary><code>POST /v1/responses</code></summary>
-<br>
-
-面向文本、网页搜索和图片生成工具调用的 Responses API 兼容接口，不是完整通用 Responses API 代理。
-
-```bash
-curl http://localhost:8000/v1/responses \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <auth-key>" \
-  -d '{
-    "model": "gpt-5",
-    "input": "生成一张未来感城市天际线图片",
-    "tools": [
-      {
-        "type": "image_generation"
-      }
-    ]
-  }'
-```
-
-<details>
-<summary>字段说明</summary>
-<br>
-
-| 字段       | 说明                                                                                      |
-|:---------|:----------------------------------------------------------------------------------------|
-| `model`  | 响应中会回显该模型字段，搜索和图片生成会走对应兼容逻辑                                                             |
-| `input`  | 输入内容；搜索使用最后一条用户文本，图片生成需能解析出提示词                                                          |
-| `tools`  | 支持 `image_generation`、`web_search`、`web_search_preview`、`web_search_preview_2025_03_11` |
-| `stream` | 已实现，但仍在测试                                                                               |
-
-<br>
-</details>
-</details>
-
-## 社区支持
-
-学 AI , 上 L 站：[LinuxDO](https://linux.do)
-
-## Contributors
-
-感谢所有为本项目做出贡献的开发者：
-
-<a href="https://github.com/basketikun/chatgpt2api/graphs/contributors">
-  <img alt="Contributors" src="https://contrib.rocks/image?repo=basketikun/chatgpt2api" />
-</a>
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/chart?repos=basketikun/chatgpt2api&type=date&legend=top-left)](https://www.star-history.com/?repos=basketikun%2Fchatgpt2api&type=date&legend=top-left)
+旧版完整说明已归档到 [docs/legacy-readme.md](./docs/legacy-readme.md)。

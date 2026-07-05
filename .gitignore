@@ -16,6 +16,7 @@ edit
 docker-compose-local.yml
 
 .claude/settings.local.json
+.learnings/
 
 # Environment variables
 .env

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from threading import Lock
+from time import monotonic
 from typing import Any
 
 from services.account_service import account_service
@@ -7,8 +10,34 @@ from services.openai_backend_api import OpenAIBackendAPI
 from utils.helper import CODEX_IMAGE_MODEL
 
 
-def list_models() -> dict[str, Any]:
+MODEL_CACHE_TTL_SECONDS = 60.0
+_model_cache_lock = Lock()
+_model_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def clear_model_cache() -> None:
+    global _model_cache
+    with _model_cache_lock:
+        _model_cache = None
+
+
+def _backend_models() -> dict[str, Any]:
+    global _model_cache
+    now = monotonic()
+    with _model_cache_lock:
+        if _model_cache is not None:
+            cached_at, cached_result = _model_cache
+            if now - cached_at < MODEL_CACHE_TTL_SECONDS:
+                return deepcopy(cached_result)
+
     result = OpenAIBackendAPI().list_models()
+    with _model_cache_lock:
+        _model_cache = (monotonic(), deepcopy(result))
+    return result
+
+
+def list_models() -> dict[str, Any]:
+    result = _backend_models()
     data = result.get("data")
     if not isinstance(data, list):
         return result

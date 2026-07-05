@@ -51,6 +51,20 @@ function getStatus(item: SystemLog) {
   return "-";
 }
 
+function getFailureCount(item: SystemLog) {
+  const value = item.detail?.failure_count;
+  return typeof value === "number" && Number.isFinite(value) && value > 1 ? value : 1;
+}
+
+function getLogDeleteIds(item: SystemLog) {
+  const groupedIds = item.detail?.grouped_log_ids;
+  if (Array.isArray(groupedIds)) {
+    const ids = groupedIds.filter((id): id is string => typeof id === "string" && id.length > 0);
+    if (ids.length > 0) return ids;
+  }
+  return [item.id];
+}
+
 function formatDetailValue(key: string, value: unknown, timezone: string) {
   if (key === "time" || key.endsWith("_at")) {
     return formatDisplayDateTime(value, timezone, String(value));
@@ -119,15 +133,16 @@ function LogsContent() {
   };
 
   const confirmDelete = async () => {
-    const ids = deletingItems.map((item) => item.id);
+    const ids = Array.from(new Set(deletingItems.flatMap(getLogDeleteIds)));
+    const rowIds = deletingItems.map((item) => item.id);
     if (ids.length === 0) return;
     setIsDeleting(true);
     try {
       const data = await deleteSystemLogs(ids);
       toast.success(`已删除 ${data.removed} 条日志`);
       setDeletingItems([]);
-      setSelectedIds((current) => current.filter((id) => !ids.includes(id)));
-      if (detailLog && ids.includes(detailLog.id)) {
+      setSelectedIds((current) => current.filter((id) => !ids.includes(id) && !rowIds.includes(id)));
+      if (detailLog && (ids.includes(detailLog.id) || rowIds.includes(detailLog.id))) {
         setDetailOpen(false);
         setDetailLog(null);
       }
@@ -229,6 +244,7 @@ function LogsContent() {
                         <TableCell>
                           <Badge variant={item.detail?.status === "failed" ? "danger" : "success"} className="rounded-md">
                             {getStatus(item)}
+                            {getFailureCount(item) > 1 ? <span className="ml-1 tabular-nums">×{getFailureCount(item)}</span> : null}
                           </Badge>
                         </TableCell>
                       ) : null}

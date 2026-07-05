@@ -6,7 +6,7 @@ from unittest import mock
 
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ImageOutput, extract_conversation_ids
+from services.protocol.conversation import ConversationRequest, ImageOutput, extract_conversation_ids, stream_image_outputs
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -153,6 +153,36 @@ class MultiImageResultTests(unittest.TestCase):
             urls = backend.resolve_conversation_image_urls("conv-1", ["file-one"], [], poll=True)
 
         self.assertEqual(urls, ["https://files.test/one.png"])
+
+    def test_text_reply_poll_uses_configured_timeout(self) -> None:
+        backend = FakeBackend()
+        backend.resolve_conversation_image_urls = mock.Mock(return_value=["https://files.test/one.png"])
+        backend.download_image_bytes = mock.Mock(return_value=[b"image-bytes"])
+        events = [
+            {
+                "type": "conversation.completed",
+                "conversation_id": "conv-1",
+                "file_ids": [],
+                "sediment_ids": [],
+                "text": '{"size":"1024x1024","n":1}',
+                "turn_use_case": "image gen",
+            }
+        ]
+
+        with (
+            mock.patch.dict(config.data, {"image_poll_timeout_secs": 70}),
+            mock.patch("services.protocol.conversation.conversation_events", return_value=iter(events)),
+            mock.patch("services.protocol.conversation._get_detailed_error_from_tasks", return_value=""),
+            mock.patch("services.protocol.conversation.save_image_bytes", return_value="http://local.test/one.png"),
+        ):
+            outputs = list(stream_image_outputs(
+                backend,
+                ConversationRequest(model="gpt-image-2", prompt="draw a cat", response_format="b64_json"),
+            ))
+
+        backend.resolve_conversation_image_urls.assert_called_once()
+        self.assertEqual(backend.resolve_conversation_image_urls.call_args.kwargs["poll_timeout_secs"], 70)
+        self.assertTrue(any(output.kind == "result" for output in outputs))
 
     def test_responses_stream_emits_all_image_output_items(self) -> None:
         first = base64.b64encode(b"first").decode("ascii")

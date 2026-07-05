@@ -1,9 +1,9 @@
 {
-  "auth-key": "chatgpt2api",
+  "auth-key": "12345678",
   "refresh_account_interval_minute": 5,
   "image_retention_days": 15,
-  "image_poll_timeout_secs": 120,
-  "auto_remove_rate_limited_accounts": false,
+  "image_poll_timeout_secs": 70,
+  "auto_remove_rate_limited_accounts": true,
   "auto_remove_invalid_accounts": true,
   "log_levels": [
     "debug",
@@ -68,7 +68,7 @@
       "images": false
     }
   },
-  "image_account_concurrency": 3,
+  "image_account_concurrency": 2,
   "image_parallel_generation": true,
   "image_poll_interval_secs": 10,
   "image_poll_initial_wait_secs": 10,
@@ -92,15 +92,23 @@
     "drop_adjacent_duplicates": true,
     "drop_assistant_history": false
   },
-  "image_settle_enabled": false,
-  "image_check_before_hit_enabled": false,
+  "image_settle_enabled": true,
+  "image_check_before_hit_enabled": true,
   "image_settle_secs": 2,
   "auto_relogin_after_refresh": false,
-  "image_timeout_retry_secs": 30,
+  "image_timeout_retry_secs": 20,
   "third_party_apps": {
     "infinite_canvas": {
       "enabled": true,
       "url": "https://canvas.best"
     }
+  },
+  "display_timezone": "Asia/Shanghai",
+  "free_account_cleanup": {
+    "enabled": true,
+    "interval_minutes": 3,
+    "failure_threshold": 2,
+    "register_precheck_enabled": true,
+    "action": "delete"
   }
 }

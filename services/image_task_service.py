@@ -114,11 +114,13 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
+        stale_task_timeout_getter: Callable[[], float] | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
+        self.stale_task_timeout_getter = stale_task_timeout_getter or self._default_stale_task_timeout
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,7 +183,9 @@ class ImageTaskService:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
         with self._lock:
-            if self._cleanup_locked():
+            changed = self._mark_stale_unfinished_locked()
+            changed = self._cleanup_locked() or changed
+            if changed:
                 self._save_locked()
             items = []
             missing_ids = []
@@ -217,7 +221,8 @@ class ImageTaskService:
         now = _now_iso()
         should_start = False
         with self._lock:
-            cleaned = self._cleanup_locked()
+            cleaned = self._mark_stale_unfinished_locked()
+            cleaned = self._cleanup_locked() or cleaned
             task = self._tasks.get(key)
             if task is not None:
                 if cleaned:
@@ -283,6 +288,8 @@ class ImageTaskService:
                 if account_email:
                     setattr(error, "account_email", account_email)
                 raise error
+            if not self._task_can_finish(key):
+                return
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
@@ -297,6 +304,8 @@ class ImageTaskService:
                 account_email=account_email,
             )
         except Exception as exc:
+            if not self._task_can_finish(key):
+                return
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
@@ -315,6 +324,11 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
             )
+
+    def _task_can_finish(self, key: str) -> bool:
+        with self._lock:
+            task = self._tasks.get(key)
+            return bool(task and task.get("status") == TASK_STATUS_RUNNING)
 
     def _log_call(
         self,
@@ -419,6 +433,47 @@ class ImageTaskService:
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp_path.replace(self.path)
+
+    def _default_stale_task_timeout(self) -> float:
+        try:
+            return max(
+                30.0,
+                float(config.image_poll_timeout_secs)
+                + float(config.image_poll_interval_secs)
+                + float(config.image_timeout_retry_secs),
+            )
+        except Exception:
+            return 180.0
+
+    def _stale_task_timeout(self) -> float:
+        try:
+            return max(0.0, float(self.stale_task_timeout_getter()))
+        except Exception:
+            return 600.0
+
+    def _mark_stale_unfinished_locked(self) -> bool:
+        timeout = self._stale_task_timeout()
+        if timeout <= 0:
+            return False
+        now = time.time()
+        changed = False
+        for task in self._tasks.values():
+            if task.get("status") not in UNFINISHED_STATUSES:
+                continue
+            base_ts = task.get("updated_ts") or task.get("started_ts") or task.get("created_ts")
+            try:
+                base = float(base_ts)
+            except (TypeError, ValueError):
+                base = 0.0
+            if base and now - base <= timeout:
+                continue
+            task["status"] = TASK_STATUS_ERROR
+            task["error"] = "图片任务超时，后台生成线程可能已卡住；请重新提交或换账号重试"
+            task["duration_ms"] = int(max(0.0, now - float(task.get("created_ts") or base or now)) * 1000)
+            task["updated_at"] = _now_iso()
+            task["updated_ts"] = now
+            changed = True
+        return changed
 
     def _recover_unfinished_locked(self) -> bool:
         changed = False

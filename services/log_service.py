@@ -5,15 +5,17 @@ import json
 import itertools
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from services.config import DATA_DIR
+from services.config import DATA_DIR, DEFAULT_DISPLAY_TIMEZONE
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from services.time_utils import utc_now_iso, utc_timestamp_iso
 from utils.helper import anthropic_sse_stream, sse_json_stream
@@ -49,9 +51,33 @@ class LogService:
         return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
-    def _matches_filters(item: dict[str, Any], *, type: str = "", start_date: str = "", end_date: str = "") -> bool:
-        t = str(item.get("time") or "")
-        day = t[:10]
+    @staticmethod
+    def _display_day(item: dict[str, Any], display_timezone: str = DEFAULT_DISPLAY_TIMEZONE) -> str:
+        raw = str(item.get("time") or "").strip()
+        if not raw:
+            return ""
+        try:
+            timezone = ZoneInfo(str(display_timezone or DEFAULT_DISPLAY_TIMEZONE))
+        except ZoneInfoNotFoundError:
+            timezone = ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw[:10]
+        if parsed.tzinfo is None:
+            return raw[:10]
+        return parsed.astimezone(timezone).date().isoformat()
+
+    @staticmethod
+    def _matches_filters(
+        item: dict[str, Any],
+        *,
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        display_timezone: str = DEFAULT_DISPLAY_TIMEZONE,
+    ) -> bool:
+        day = LogService._display_day(item, display_timezone)
         if type and item.get("type") != type:
             return False
         if start_date and day < start_date:
@@ -59,6 +85,77 @@ class LogService:
         if end_date and day > end_date:
             return False
         return True
+
+    @staticmethod
+    def _failed_image_group_key(item: dict[str, Any]) -> tuple[str, str, str, str] | None:
+        if item.get("type") != LOG_TYPE_CALL:
+            return None
+        detail = item.get("detail")
+        if not isinstance(detail, dict):
+            return None
+        if detail.get("status") != "failed":
+            return None
+        endpoint = str(detail.get("endpoint") or "").strip()
+        if not endpoint.startswith("/v1/images"):
+            return None
+        request_text = " ".join(str(detail.get("request_text") or "").split())
+        if not request_text:
+            return None
+        model = str(detail.get("model") or "").strip()
+        return ("prompt", endpoint, model, request_text)
+
+    @staticmethod
+    def _collapse_failed_image_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+        ordered: list[dict[str, Any]] = []
+        for item in items:
+            key = LogService._failed_image_group_key(item)
+            if key is None:
+                ordered.append(item)
+                continue
+            group = groups.get(key)
+            if group is None:
+                group = {"key": key, "items": []}
+                groups[key] = group
+                ordered.append(group)
+            group["items"].append(item)
+
+        collapsed: list[dict[str, Any]] = []
+        for entry in ordered:
+            group_items = entry.get("items") if "items" in entry else None
+            if not isinstance(group_items, list):
+                collapsed.append(entry)
+                continue
+            if len(group_items) <= 1:
+                collapsed.append(group_items[0])
+                continue
+
+            representative = dict(group_items[0])
+            detail = dict(representative.get("detail") or {})
+            group_key = entry.get("key")
+            group_token = hashlib.sha1(
+                json.dumps(group_key, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:16]
+            ids = [str(item.get("id") or "") for item in group_items if item.get("id")]
+            errors = []
+            for item in group_items:
+                item_detail = item.get("detail")
+                error = str(item_detail.get("error") or "").strip() if isinstance(item_detail, dict) else ""
+                if error and error not in errors:
+                    errors.append(error)
+            detail.update({
+                "failure_count": len(group_items),
+                "grouped_log_ids": ids,
+                "grouped_latest_time": group_items[0].get("time"),
+                "grouped_earliest_time": group_items[-1].get("time"),
+            })
+            if errors:
+                detail["grouped_errors"] = errors
+            representative["id"] = f"group:{group_token}"
+            representative["summary"] = f"{representative.get('summary') or 'image generation failed'}（失败 {len(group_items)} 次）"
+            representative["detail"] = detail
+            collapsed.append(representative)
+        return collapsed
 
     def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
         item = {
@@ -71,7 +168,15 @@ class LogService:
         with self.path.open("a", encoding="utf-8") as file:
             file.write(self._serialize_item(item) + "\n")
 
-    def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
+    def list(
+        self,
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        limit: int | None = 200,
+        collapse_image_failures: bool = False,
+        display_timezone: str = DEFAULT_DISPLAY_TIMEZONE,
+    ) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         items: list[dict[str, Any]] = []
@@ -80,11 +185,19 @@ class LogService:
             item = self._parse_line(lines[line_number], line_number)
             if item is None:
                 continue
-            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
+            if not self._matches_filters(
+                item,
+                type=type,
+                start_date=start_date,
+                end_date=end_date,
+                display_timezone=display_timezone,
+            ):
                 continue
             items.append(item)
-            if len(items) >= limit:
+            if limit is not None and len(items) >= limit:
                 break
+        if collapse_image_failures:
+            return self._collapse_failed_image_items(items)
         return items
 
     def delete(self, ids: list[str]) -> dict[str, int]:
