@@ -92,6 +92,24 @@ class ModelListTests(unittest.TestCase):
         self.assertEqual(second["data"], [{"id": "auto", "object": "model"}])
         list_models.assert_called_once()
 
+    def test_list_models_falls_back_to_local_image_models_when_backend_fails(self):
+        with (
+            mock.patch.object(
+                openai_v1_models.OpenAIBackendAPI,
+                "list_models",
+                side_effect=RuntimeError("upstream unavailable"),
+            ),
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "list_accounts",
+                return_value=[{"access_token": "token-free", "type": "free"}],
+            ),
+        ):
+            result = openai_v1_models.list_models()
+
+        ids = {item["id"] for item in result["data"]}
+        self.assertIn("gpt-image-2", ids)
+
     @unittest.skipUnless(RUN_LIVE_MODEL_TEST, "live upstream model-list test disabled")
     def test_list_models_function(self):
         """测试直接调用服务层获取模型列表。"""

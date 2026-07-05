@@ -37,7 +37,10 @@ def _backend_models() -> dict[str, Any]:
 
 
 def list_models() -> dict[str, Any]:
-    result = _backend_models()
+    try:
+        result = _backend_models()
+    except Exception:
+        result = {"object": "list", "data": []}
     data = result.get("data")
     if not isinstance(data, list):
         return result
