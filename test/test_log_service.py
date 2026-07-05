@@ -147,6 +147,46 @@ class LogServiceTests(unittest.TestCase):
 
             self.assertEqual([item["id"] for item in items], ["failed-no-prompt-1", "failed-no-prompt-0"])
 
+    def test_delete_group_id_removes_all_collapsed_logs(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = LogService(Path(tmp_dir) / "logs.jsonl")
+            for index in range(3):
+                append_log(
+                    service,
+                    log_id=f"failed-image-{index}",
+                    time=f"2026-07-05T01:00:0{index}Z",
+                    summary="image generation failed",
+                    detail={
+                        "endpoint": "/v1/images/generations",
+                        "status": "failed",
+                        "request_text": "same prompt",
+                        "error": f"failed {index}",
+                    },
+                )
+            append_log(
+                service,
+                log_id="failed-other-prompt",
+                time="2026-07-05T01:00:05Z",
+                summary="image generation failed",
+                detail={
+                    "endpoint": "/v1/images/generations",
+                    "status": "failed",
+                    "request_text": "other prompt",
+                    "error": "failed other",
+                },
+            )
+
+            [grouped] = [
+                item
+                for item in service.list(type=LOG_TYPE_CALL, limit=None, collapse_image_failures=True)
+                if item["id"].startswith("group:")
+            ]
+            result = service.delete([grouped["id"]])
+            remaining = service.list(type=LOG_TYPE_CALL, limit=None)
+
+            self.assertEqual(result, {"removed": 3})
+            self.assertEqual([item["id"] for item in remaining], ["failed-other-prompt"])
+
 
 if __name__ == "__main__":
     unittest.main()

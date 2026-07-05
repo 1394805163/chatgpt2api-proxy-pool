@@ -51,7 +51,6 @@ class LogService:
         return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
-    @staticmethod
     def _display_day(item: dict[str, Any], display_timezone: str = DEFAULT_DISPLAY_TIMEZONE) -> str:
         raw = str(item.get("time") or "").strip()
         if not raw:
@@ -105,8 +104,15 @@ class LogService:
         return ("prompt", endpoint, model, request_text)
 
     @staticmethod
+    def _failed_image_group_id(group_key: tuple[str, str, str, str]) -> str:
+        group_token = hashlib.sha1(
+            json.dumps(group_key, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"group:{group_token}"
+
+    @staticmethod
     def _collapse_failed_image_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+        groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         ordered: list[dict[str, Any]] = []
         for item in items:
             key = LogService._failed_image_group_key(item)
@@ -133,9 +139,6 @@ class LogService:
             representative = dict(group_items[0])
             detail = dict(representative.get("detail") or {})
             group_key = entry.get("key")
-            group_token = hashlib.sha1(
-                json.dumps(group_key, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()[:16]
             ids = [str(item.get("id") or "") for item in group_items if item.get("id")]
             errors = []
             for item in group_items:
@@ -151,11 +154,32 @@ class LogService:
             })
             if errors:
                 detail["grouped_errors"] = errors
-            representative["id"] = f"group:{group_token}"
+            representative["id"] = LogService._failed_image_group_id(group_key)
             representative["summary"] = f"{representative.get('summary') or 'image generation failed'}（失败 {len(group_items)} 次）"
             representative["detail"] = detail
             collapsed.append(representative)
         return collapsed
+
+    @staticmethod
+    def _expand_group_delete_ids(items: list[dict[str, Any]], target_ids: set[str]) -> set[str]:
+        if not any(target_id.startswith("group:") for target_id in target_ids):
+            return target_ids
+        expanded = set(target_ids)
+        groups: dict[tuple[str, str, str, str], list[str]] = {}
+        for item in items:
+            key = LogService._failed_image_group_key(item)
+            if key is None:
+                continue
+            item_id = str(item.get("id") or "").strip()
+            if not item_id:
+                continue
+            groups.setdefault(key, []).append(item_id)
+        for group_key, group_item_ids in groups.items():
+            if len(group_item_ids) <= 1:
+                continue
+            if LogService._failed_image_group_id(group_key) in target_ids:
+                expanded.update(group_item_ids)
+        return expanded
 
     def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
         item = {
@@ -205,10 +229,12 @@ class LogService:
         if not self.path.exists() or not target_ids:
             return {"removed": 0}
         lines = self.path.read_text(encoding="utf-8").splitlines()
+        parsed_lines = [(raw_line, self._parse_line(raw_line, line_number)) for line_number, raw_line in enumerate(lines)]
+        parsed_items = [item for _, item in parsed_lines if item is not None]
+        target_ids = self._expand_group_delete_ids(parsed_items, target_ids)
         kept_lines: list[str] = []
         removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
+        for raw_line, item in parsed_lines:
             if item is None:
                 kept_lines.append(raw_line)
                 continue
