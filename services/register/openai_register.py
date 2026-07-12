@@ -284,6 +284,18 @@ def _authorize_landed_page(resp) -> str:
     return ""
 
 
+def _authorize_already_at_password_step(resp) -> bool:
+    if resp is None:
+        return False
+    final_url = str(getattr(resp, "url", "") or "").lower()
+    if "/create-account/password" in final_url:
+        return True
+    data = _response_json(resp)
+    page = data.get("page") if isinstance(data, dict) else None
+    page_type = str(page.get("type") or "").lower() if isinstance(page, dict) else ""
+    return page_type in {"create_account_password", "create-account-password"}
+
+
 def create_mailbox(username: str | None = None, register_proxy: str = "") -> dict:
     return mail_provider.create_mailbox(_mail_config(register_proxy), username)
 
@@ -560,6 +572,10 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
         landed = _authorize_landed_page(resp)
         step(index, f"platform authorize 完成[{landed or '?'}] url={str(getattr(resp, 'url', '') or '')[:160]}")
+
+        if _authorize_already_at_password_step(resp):
+            step(index, "authorize 已进入密码步骤，跳过重复 continue")
+            return
 
         continue_url = f"{auth_base}/api/accounts/authorize/continue"
         continue_referer = str(getattr(resp, "url", "") or f"{auth_base}/create-account")

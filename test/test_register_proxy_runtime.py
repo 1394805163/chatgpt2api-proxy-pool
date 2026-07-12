@@ -263,6 +263,33 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertNotIn("openai-sentinel-so-token", continue_headers)
         self.assertEqual(sentinel.calls, [("authorize_continue", False)])
 
+    def test_platform_authorize_skips_duplicate_continue_after_password_landing(self):
+        fake_proxy = FakeProxySettings()
+        sentinel = FakeSentinelSDKClient()
+        response = FakeResponse(
+            status_code=200,
+            text="<html>Create a password</html>",
+            headers={"content-type": "text/html"},
+            url="https://auth.openai.com/create-account/password",
+        )
+        request_calls = []
+
+        def fake_request(session, method, url, retry_attempts=3, **kwargs):
+            request_calls.append({"method": method, "url": url, **kwargs})
+            return response, ""
+
+        with patch.object(openai_register, "proxy_settings", fake_proxy), patch.object(
+            openai_register,
+            "create_session",
+            return_value=FakeSession(),
+        ), patch.object(openai_register, "request_with_local_retry", side_effect=fake_request):
+            registrar = openai_register.PlatformRegistrar(proxy="")
+            registrar.sentinel_sdk = sentinel
+            registrar._platform_authorize("user@example.com", 1)
+
+        self.assertEqual(len(request_calls), 1)
+        self.assertEqual(sentinel.calls, [])
+
     def test_create_account_uses_sdk_sentinel_and_so_tokens_without_logging_values(self):
         fake_proxy = FakeProxySettings()
         sentinel = FakeSentinelSDKClient()
