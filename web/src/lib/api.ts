@@ -341,6 +341,22 @@ export type OutlookPoolStats = {
 
 export type RegisterProxyInputMode = "single" | "url" | "text";
 
+export type RegisterMailHealth = {
+  provider: string;
+  provider_ref: string;
+  domain: string;
+  attempts: number;
+  success: number;
+  fail: number;
+  registration_disallowed: number;
+  risk_attempts: number;
+  risk_success_rate: number;
+  last_error_category: string;
+  disabled: boolean;
+  disabled_until: number;
+  updated_at: number;
+};
+
 export type RegisterConfig = {
   enabled: boolean;
   mail: {
@@ -380,6 +396,7 @@ export type RegisterConfig = {
     proxy_pool_last_fetch?: number;
     proxy_state_count?: number;
     proxy_blacklist_count?: number;
+    mail_health?: RegisterMailHealth[];
     started_at?: string;
     updated_at?: string;
     finished_at?: string;

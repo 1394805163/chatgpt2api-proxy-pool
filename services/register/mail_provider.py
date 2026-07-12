@@ -18,6 +18,7 @@ from curl_cffi import requests
 
 
 from services.config import DATA_DIR
+from services.register.mail_health import MailHealthTracker
 
 DDG_ALIASES_FILE = DATA_DIR / "ddg_aliases.json"
 _ddg_aliases_lock = Lock()
@@ -28,6 +29,8 @@ _outlook_token_state_lock = Lock()
 OUTLOOK_IN_USE_STALE_SECONDS = 3600
 OUTLOOK_RECORDED_STATES = {"used", "in_use", "token_invalid", "failed"}
 OUTLOOK_UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
+MAIL_HEALTH_FILE = DATA_DIR / "register_mail_health.json"
+mail_health_tracker = MailHealthTracker(MAIL_HEALTH_FILE)
 
 
 def _load_ddg_aliases() -> set[str]:
@@ -230,11 +233,17 @@ def _random_subdomain_label() -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(4, 10)))
 
 
-def _next_domain(domains: list[str]) -> str:
+def _next_domain(domains: list[str], provider_ref: str = "") -> str:
     global domain_index
     domains = [str(item).strip() for item in domains if str(item).strip()]
+    if provider_ref:
+        domains = [
+            domain
+            for domain in domains
+            if not mail_health_tracker.is_disabled(provider_ref, domain)
+        ]
     if not domains:
-        raise RuntimeError("mail.domain 不能为空")
+        raise RuntimeError("mail.domain 为空或域名已因低成功率被临时停用")
     if len(domains) == 1:
         return domains[0]
     with domain_lock:
@@ -423,7 +432,7 @@ class CloudflareTempMailProvider(BaseMailProvider):
         return {} if resp.status_code == 204 else resp.json()
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        data = self._request("POST", "/admin/new_address", headers={"x-admin-auth": self.admin_password}, payload={"enablePrefix": True, "name": username or _random_mailbox_name(), "domain": _next_domain(self.domain)})
+        data = self._request("POST", "/admin/new_address", headers={"x-admin-auth": self.admin_password}, payload={"enablePrefix": True, "name": username or _random_mailbox_name(), "domain": _next_domain(self.domain, self.provider_ref)})
         address = str(data.get("address") or "").strip()
         token = str(data.get("jwt") or "").strip()
         if not address or not token:
@@ -685,7 +694,7 @@ class CloudMailGenProvider(BaseMailProvider):
         return token
 
     def _resolve_address(self, username: str | None = None) -> str:
-        domain = _next_domain(self.domain)
+        domain = _next_domain(self.domain, self.provider_ref)
         if self.subdomain:
             domain = f"{random.choice(self.subdomain)}.{domain}"
         if username:
@@ -909,7 +918,7 @@ class MoEmailProvider(BaseMailProvider):
         return data
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        data = self._request("POST", "/api/emails/generate", payload={"name": username or _random_mailbox_name(), "expiryTime": self.expiry_time, "domain": _next_domain(self.domain)}, expected=(200, 201))
+        data = self._request("POST", "/api/emails/generate", payload={"name": username or _random_mailbox_name(), "expiryTime": self.expiry_time, "domain": _next_domain(self.domain, self.provider_ref)}, expected=(200, 201))
         address = str(data.get("email") or "").strip()
         email_id = str(data.get("id") or data.get("email_id") or "").strip()
         if not address or not email_id:
@@ -975,7 +984,7 @@ class InbucketMailProvider(BaseMailProvider):
 
     def _resolve_domain(self) -> str:
         if self.domain:
-            return _next_domain(self.domain)
+            return _next_domain(self.domain, self.provider_ref)
         raise RuntimeError("Inbucket 需要至少配置一个 domain")
 
     def _mailbox_name(self, address: str) -> str:
@@ -1073,7 +1082,7 @@ class YydsMailProvider(BaseMailProvider):
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         payload = {"localPart": username or _random_mailbox_name()}
         if self.domain:
-            payload["domain"] = _next_domain(self.domain)
+            payload["domain"] = _next_domain(self.domain, self.provider_ref)
         if self.subdomain:
             payload["subdomain"] = self.subdomain
         data = self._request("POST", "/accounts/wildcard" if self.wildcard else "/accounts", payload=payload)
@@ -1477,6 +1486,12 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
                 continue
             tried.add(provider_key)
             mailbox = provider.create_mailbox(username)
+            address = str(mailbox.get("address") or "").strip().lower()
+            domain = address.rpartition("@")[2]
+            if domain and mail_health_tracker.is_disabled(provider.provider_ref, domain):
+                release_mailbox(mailbox)
+                last_error = f"邮箱域名 {domain} 因低成功率被临时停用"
+                continue
             return mailbox
         except RuntimeError as error:
             last_error = str(error)
@@ -1501,6 +1516,7 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     仅对 outlook_token 邮箱生效：成功标记 used；失败时若是 token 失效标记 token_invalid，
     其余失败标记 failed（保留邮箱占用以便排查，可通过重置释放）。
     """
+    mail_health_tracker.record(mailbox, success=success, error=error)
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         return
     address = str(mailbox.get("address") or "").strip()
@@ -1514,6 +1530,10 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
         _set_outlook_token_state(address, "token_invalid", reason[:300])
     else:
         _set_outlook_token_state(address, "failed", reason[:300])
+
+
+def mail_health_snapshot() -> list[dict[str, Any]]:
+    return mail_health_tracker.snapshot()
 
 
 def release_mailbox(mailbox: dict) -> None:

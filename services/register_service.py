@@ -142,6 +142,7 @@ class RegisterService:
                 if key in running_stats:
                     snapshot["stats"][key] = running_stats[key]
             snapshot["stats"].update(openai_register.proxy_pool.proxy_state_metrics())
+            snapshot["stats"]["mail_health"] = mail_provider.mail_health_snapshot()
         self._redact_outlook_pools(snapshot)
         return snapshot
 

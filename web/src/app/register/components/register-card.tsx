@@ -62,6 +62,7 @@ export function RegisterCard() {
   const proxySourceLabel = proxyMode === "url" ? "URL 列表" : proxyMode === "text" ? "手动列表" : "单代理";
   const currentProxy = String(stats.current_proxy || (proxyMode === "single" ? config.proxy : "") || "").trim();
   const proxyBlacklistCount = Math.max(0, Number(stats.proxy_blacklist_count || 0));
+  const mailHealth = Array.isArray(stats.mail_health) ? stats.mail_health : [];
   const canResetProxyBlacklist = !config.enabled && proxyBlacklistCount > 0 && (proxyMode === "url" || proxyMode === "text");
   const updateProviderType = (index: number, type: string) => {
     updateProvider(index, {
@@ -495,6 +496,36 @@ export function RegisterCard() {
             {stats.proxy_pool_last_error ? (
               <div className="border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
                 {stats.proxy_pool_last_error}
+              </div>
+            ) : null}
+            {mailHealth.length > 0 ? (
+              <div className="max-h-40 overflow-auto border border-stone-200 bg-white/70">
+                <table className="w-full min-w-[560px] text-left text-xs">
+                  <thead className="sticky top-0 bg-stone-100 text-stone-500">
+                    <tr>
+                      <th className="px-3 py-2 font-medium">邮箱来源</th>
+                      <th className="px-3 py-2 font-medium">域名</th>
+                      <th className="px-3 py-2 text-right font-medium">成功</th>
+                      <th className="px-3 py-2 text-right font-medium">最终拒绝</th>
+                      <th className="px-3 py-2 text-right font-medium">风控成功率</th>
+                      <th className="px-3 py-2 font-medium">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-stone-100">
+                    {mailHealth.map((item) => (
+                      <tr key={`${item.provider_ref}-${item.domain}`} className="text-stone-700">
+                        <td className="px-3 py-2">{item.provider_ref || item.provider}</td>
+                        <td className="px-3 py-2 font-mono">{item.domain}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{item.success}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{item.registration_disallowed}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{item.risk_success_rate}%</td>
+                        <td className={`px-3 py-2 font-medium ${item.disabled ? "text-rose-600" : "text-emerald-700"}`}>
+                          {item.disabled ? "已冷却" : "可用"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             ) : null}
             <div className="grid grid-cols-3 gap-2">
