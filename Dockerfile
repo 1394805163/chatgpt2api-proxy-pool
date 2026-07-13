@@ -42,7 +42,7 @@ RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-RUN uv run playwright install --with-deps chromium \
+RUN uv run playwright install --with-deps chromium-headless-shell \
     && rm -rf /var/lib/apt/lists/*
 
 COPY main.py ./
