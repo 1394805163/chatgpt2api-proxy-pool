@@ -123,6 +123,7 @@ class ImageTaskService:
         self.stale_task_timeout_getter = stale_task_timeout_getter or self._default_stale_task_timeout
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._threads: dict[str, threading.Thread] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
@@ -245,14 +246,41 @@ class ImageTaskService:
             should_start = True
 
         if should_start:
-            thread = threading.Thread(
-                target=self._run_task,
+            self._start_tracked_thread(
+                key,
+                self._run_task,
                 args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
                 name=f"image-task-{task_id[:16]}",
-                daemon=True,
             )
-            thread.start()
         return _public_task(task)
+
+    def _start_tracked_thread(
+        self,
+        key: str,
+        target: Callable[..., None],
+        *,
+        args: tuple[Any, ...],
+        name: str,
+    ) -> None:
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                current = threading.current_thread()
+                with self._lock:
+                    if self._threads.get(key) is current:
+                        self._threads.pop(key, None)
+
+        thread = threading.Thread(target=run, name=name, daemon=True)
+        with self._lock:
+            self._threads[key] = thread
+        try:
+            thread.start()
+        except BaseException:
+            with self._lock:
+                if self._threads.get(key) is thread:
+                    self._threads.pop(key, None)
+            raise
 
     def _run_task(
         self,
@@ -457,8 +485,11 @@ class ImageTaskService:
             return False
         now = time.time()
         changed = False
-        for task in self._tasks.values():
+        for key, task in self._tasks.items():
             if task.get("status") not in UNFINISHED_STATUSES:
+                continue
+            thread = self._threads.get(key)
+            if thread is not None and thread.is_alive():
                 continue
             base_ts = task.get("updated_ts") or task.get("started_ts") or task.get("created_ts")
             try:
@@ -527,13 +558,12 @@ class ImageTaskService:
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
         # 启动新线程继续轮询
-        thread = threading.Thread(
-            target=self._run_resume_poll,
+        self._start_tracked_thread(
+            key,
+            self._run_resume_poll,
             args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
             name=f"image-resume-{_clean(task_id)[:16]}",
-            daemon=True,
         )
-        thread.start()
         return _public_task(task)
 
     def _run_resume_poll(

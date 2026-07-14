@@ -37,7 +37,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             retention_days_getter=lambda: 30,
         )
 
-    def test_list_tasks_marks_stale_running_task_as_error(self):
+    def test_list_tasks_keeps_live_running_task_until_handler_finishes(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
             block = threading.Event()
@@ -65,6 +65,37 @@ class ImageTaskServiceTests(unittest.TestCase):
             wait_for_task(service, OWNER, "stale-running-task", "running")
             time.sleep(0.08)
             result = service.list_tasks(OWNER, ["stale-running-task"])
+
+            self.assertEqual(result["items"][0]["status"], "running")
+            self.assertNotIn("error", result["items"][0])
+
+            block.set()
+            task = wait_for_task(service, OWNER, "stale-running-task", "success")
+            self.assertEqual(task["data"][0]["url"], "http://example.test/late.png")
+
+    def test_list_tasks_marks_orphaned_running_task_as_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                retention_days_getter=lambda: 30,
+                stale_task_timeout_getter=lambda: 0.05,
+            )
+            now = time.time()
+            with service._lock:
+                service._tasks["owner-1:orphaned-running-task"] = {
+                    "id": "orphaned-running-task",
+                    "owner_id": "owner-1",
+                    "status": "running",
+                    "mode": "generate",
+                    "model": "gpt-image-2",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "created_ts": now - 1,
+                    "updated_ts": now - 1,
+                    "started_ts": now - 1,
+                }
+
+            result = service.list_tasks(OWNER, ["orphaned-running-task"])
 
             self.assertEqual(result["items"][0]["status"], "error")
             self.assertIn("超时", result["items"][0]["error"])
