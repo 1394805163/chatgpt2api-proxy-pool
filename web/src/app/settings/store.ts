@@ -343,7 +343,7 @@ type SettingsStore = {
   setRefreshAccountIntervalMinute: (value: string) => void;
   setDisplayTimezone: (value: string) => void;
   setImageRetentionDays: (value: string) => void;
-  setImagePollTimeoutSecs: (value: string) => void;
+  setImageTaskTimeoutSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
   setImageSettleEnabled: (value: boolean) => void;
   setImageCheckBeforeHitEnabled: (value: boolean) => void;
@@ -606,8 +606,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.config ? { config: { ...state.config, image_retention_days: value } } : {});
   },
 
-  setImagePollTimeoutSecs: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_poll_timeout_secs: value } } : {});
+  setImageTaskTimeoutSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_task_timeout_secs: value } } : {});
   },
 
   setImageAccountConcurrency: (value) => {
