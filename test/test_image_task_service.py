@@ -73,6 +73,45 @@ class ImageTaskServiceTests(unittest.TestCase):
             task = wait_for_task(service, OWNER, "stale-running-task", "success")
             self.assertEqual(task["data"][0]["url"], "http://example.test/late.png")
 
+    def test_live_task_stops_at_total_duration_limit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            release = threading.Event()
+            cancel_seen = threading.Event()
+
+            def handler(payload):
+                cancel_event = payload["cancel_event"]
+                if cancel_event.wait(1):
+                    cancel_seen.set()
+                release.wait(1)
+                return {"data": [{"url": "http://example.test/too-late.png"}]}
+
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=handler,
+                edit_handler=handler,
+                retention_days_getter=lambda: 30,
+                stale_task_timeout_getter=lambda: 5,
+                max_task_duration_getter=lambda: 0.05,
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="deadline-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            task = wait_for_task(service, OWNER, "deadline-task", "error")
+            self.assertIn("总时限", task["error"])
+            self.assertTrue(cancel_seen.wait(0.5))
+
+            release.set()
+            time.sleep(0.05)
+            task = service.list_tasks(OWNER, ["deadline-task"])["items"][0]
+            self.assertEqual(task["status"], "error")
+            self.assertEqual(task["data"], [])
+
     def test_list_tasks_marks_orphaned_running_task_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = ImageTaskService(

@@ -115,12 +115,14 @@ class ImageTaskService:
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
         stale_task_timeout_getter: Callable[[], float] | None = None,
+        max_task_duration_getter: Callable[[], float] | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self.stale_task_timeout_getter = stale_task_timeout_getter or self._default_stale_task_timeout
+        self.max_task_duration_getter = max_task_duration_getter or (lambda: config.image_task_timeout_secs)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -291,14 +293,30 @@ class ImageTaskService:
         model: str,
     ) -> None:
         started = time.time()
+        max_duration = self._max_task_duration()
+        cancel_event = threading.Event()
+        deadline_timer = threading.Timer(
+            max_duration,
+            self._expire_task,
+            args=(key, identity, mode, model, started, payload, cancel_event, max_duration),
+        )
+        deadline_timer.daemon = True
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        deadline_timer.start()
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
+            if not self._task_can_finish(key):
+                return
             if step == "image_stream_resolve_start":
                 self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
-        payload_with_progress = {**payload, "progress_callback": progress_callback}
+        payload_with_progress = {
+            **payload,
+            "progress_callback": progress_callback,
+            "task_deadline_ts": started + max_duration,
+            "cancel_event": cancel_event,
+        }
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
@@ -352,11 +370,58 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
             )
+        finally:
+            deadline_timer.cancel()
+            cancel_event.set()
 
     def _task_can_finish(self, key: str) -> bool:
         with self._lock:
             task = self._tasks.get(key)
             return bool(task and task.get("status") == TASK_STATUS_RUNNING)
+
+    def _max_task_duration(self) -> float:
+        try:
+            return max(0.01, float(self.max_task_duration_getter()))
+        except Exception:
+            return 150.0
+
+    def _expire_task(
+        self,
+        key: str,
+        identity: dict[str, object],
+        mode: str,
+        model: str,
+        started: float,
+        payload: dict[str, Any],
+        cancel_event: threading.Event,
+        max_duration: float,
+    ) -> None:
+        cancel_event.set()
+        now = time.time()
+        timeout_label = f"{max_duration:g}"
+        error_message = f"图片任务已达到 {timeout_label} 秒总时限；已停止等待，请重新提交"
+        with self._lock:
+            task = self._tasks.get(key)
+            if not task or task.get("status") not in UNFINISHED_STATUSES:
+                return
+            task["status"] = TASK_STATUS_ERROR
+            task["error"] = error_message
+            task["data"] = []
+            task.pop("progress", None)
+            task["duration_ms"] = int(max(0.0, now - started) * 1000)
+            task["updated_at"] = _now_iso()
+            task["updated_ts"] = now
+            self._save_locked()
+        self._log_call(
+            identity,
+            mode,
+            model,
+            started,
+            "调用失败",
+            request_preview=request_text(payload.get("prompt")),
+            status="failed",
+            error=error_message,
+        )
 
     def _log_call(
         self,

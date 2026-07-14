@@ -60,6 +60,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
+    task_deadline_ts = body.get("task_deadline_ts")
+    cancel_event = body.get("cancel_event")
     encoded_images = encode_images(images)
     if not encoded_images:
         raise ImageGenerationError("image is required")
@@ -74,6 +76,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         images=encoded_images,
         message_as_error=True,
         progress_callback=progress_callback,
+        task_deadline_ts=float(task_deadline_ts) if task_deadline_ts is not None else None,
+        cancel_event=cancel_event,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

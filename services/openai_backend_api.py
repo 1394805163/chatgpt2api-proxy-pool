@@ -4,6 +4,7 @@ import mimetypes
 import os
 import random
 import re
+import threading
 import time
 
 import urllib.error
@@ -33,6 +34,10 @@ class InvalidAccessTokenError(RuntimeError):
 
 
 class ImagePollTimeoutError(RuntimeError):
+    pass
+
+
+class ImageTaskDeadlineError(RuntimeError):
     pass
 
 
@@ -167,6 +172,8 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
+        self.image_deadline_ts: float | None = None
+        self.image_cancel_event: Any = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
@@ -200,6 +207,29 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+
+    def _ensure_image_task_active(self) -> None:
+        cancel_event = getattr(self, "image_cancel_event", None)
+        is_cancelled = getattr(cancel_event, "is_set", None)
+        if callable(is_cancelled) and is_cancelled():
+            raise ImageTaskDeadlineError(
+                f"图片任务已达到 {config.image_task_timeout_secs:g} 秒总时限；已停止等待，请重新提交"
+            )
+        deadline_ts = getattr(self, "image_deadline_ts", None)
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            raise ImageTaskDeadlineError(
+                f"图片任务已达到 {config.image_task_timeout_secs:g} 秒总时限；已停止等待，请重新提交"
+            )
+
+    def _image_request_timeout(self, default: float) -> float:
+        self._ensure_image_task_active()
+        deadline_ts = getattr(self, "image_deadline_ts", None)
+        if deadline_ts is None:
+            return default
+        remaining = deadline_ts - time.time()
+        if remaining <= 0:
+            self._ensure_image_task_active()
+        return max(0.1, min(float(default), remaining))
 
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
@@ -772,11 +802,12 @@ class OpenAIBackendAPI:
         auth_claim = token_payload.get("https://api.openai.com/auth")
         auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
         tool = payload["tools"][0]
+        request_timeout = self._image_request_timeout(1200)
         logger.info({
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
             "transport": "urllib.request",
-            "timeout_secs": 1200,
+            "timeout_secs": request_timeout,
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
             "account_type": str(account.get("type") or "").strip(),
@@ -809,7 +840,7 @@ class OpenAIBackendAPI:
             },
         })
         try:
-            with urllib.request.urlopen(request, timeout=1200) as raw:
+            with urllib.request.urlopen(request, timeout=request_timeout) as raw:
                 yield from self._iter_codex_response_events(raw)
         except urllib.error.HTTPError as error:
             body_text = error.read().decode("utf-8", "replace")
@@ -849,7 +880,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements),
             json=payload,
-            timeout=60,
+            timeout=self._image_request_timeout(60),
         )
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
@@ -891,7 +922,7 @@ class OpenAIBackendAPI:
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
                   "height": height},
-            timeout=60,
+            timeout=self._image_request_timeout(60),
         )
         ensure_ok(response, path)
         upload_meta = response.json()
@@ -908,7 +939,7 @@ class OpenAIBackendAPI:
                 "Accept-Language": "en-US,en;q=0.8",
             },
             data=data,
-            timeout=120,
+            timeout=self._image_request_timeout(120),
         )
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
@@ -916,7 +947,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             data="{}",
-            timeout=60,
+            timeout=self._image_request_timeout(60),
         )
         ensure_ok(response, path)
         return {
@@ -995,7 +1026,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
-            timeout=300,
+            timeout=self._image_request_timeout(300),
             stream=True,
         )
         ensure_ok(response, path)
@@ -1005,7 +1036,7 @@ class OpenAIBackendAPI:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._image_request_timeout(60))
         ensure_ok(response, path)
         return response.json()
 
@@ -2104,7 +2135,12 @@ class OpenAIBackendAPI:
         })
 
         def _remaining() -> float:
-            return timeout_secs - (time.time() - start)
+            self._ensure_image_task_active()
+            remaining = timeout_secs - (time.time() - start)
+            deadline_ts = getattr(self, "image_deadline_ts", None)
+            if deadline_ts is not None:
+                remaining = min(remaining, deadline_ts - time.time())
+            return max(0.0, remaining)
 
         if has_initial_ids and config.image_settle_enabled:
             settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
@@ -2258,7 +2294,7 @@ class OpenAIBackendAPI:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._image_request_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2267,7 +2303,7 @@ class OpenAIBackendAPI:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._image_request_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2292,7 +2328,7 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + path,
             headers=self._headers(path, {"Accept": "application/json"}),
-            timeout=timeout_secs,
+            timeout=self._image_request_timeout(timeout_secs),
         )
         ensure_ok(response, path)
         data = response.json()
@@ -2359,6 +2395,8 @@ class OpenAIBackendAPI:
                 continue
             try:
                 url = self._get_file_download_url(file_id)
+            except ImageTaskDeadlineError:
+                raise
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2390,6 +2428,8 @@ class OpenAIBackendAPI:
         for sediment_id in sediment_ids:
             try:
                 url = self._get_attachment_download_url(conversation_id, sediment_id)
+            except ImageTaskDeadlineError:
+                raise
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2429,6 +2469,7 @@ class OpenAIBackendAPI:
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
         timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
+        timeout = self._image_request_timeout(float(timeout))
         # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
         # 跳过轮询直接解析 URL，省去 initial_wait + 轮询耗时。
         if poll and conversation_id and (file_ids or sediment_ids):
@@ -2487,7 +2528,7 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
+            response = self.session.get(url, timeout=self._image_request_timeout(120))
             ensure_ok(response, "image_download")
             if response.content not in images:
                 images.append(response.content)
@@ -2501,10 +2542,18 @@ class OpenAIBackendAPI:
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
             thinking_effort: str = "",
+            task_deadline_ts: float | None = None,
+            cancel_event: Any = None,
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
-            yield from self._stream_picture_conversation(prompt, model, images or [])
+            yield from self._stream_picture_conversation(
+                prompt,
+                model,
+                images or [],
+                task_deadline_ts=task_deadline_ts,
+                cancel_event=cancel_event,
+            )
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
@@ -2538,9 +2587,15 @@ class OpenAIBackendAPI:
             prompt: str,
             model: str,
             images: list[str],
+            *,
+            task_deadline_ts: float | None = None,
+            cancel_event: Any = None,
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
+        self.image_deadline_ts = task_deadline_ts
+        self.image_cancel_event = cancel_event
+        self._ensure_image_task_active()
         self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")
@@ -2552,9 +2607,26 @@ class OpenAIBackendAPI:
         self._report_progress("starting_generation")
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
+        stop_closer = threading.Event()
+
+        def close_on_deadline() -> None:
+            while not stop_closer.wait(0.25):
+                try:
+                    self._ensure_image_task_active()
+                except ImageTaskDeadlineError:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    return
+
+        closer = threading.Thread(target=close_on_deadline, name="image-stream-deadline", daemon=True)
+        closer.start()
         try:
-            yield from iter_sse_payloads(response)
+            yield from iter_sse_payloads(response, abort_check=self._ensure_image_task_active)
+            self._ensure_image_task_active()
         finally:
+            stop_closer.set()
             response.close()
 
     def _bootstrap(self) -> None:
@@ -2562,7 +2634,7 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
-            timeout=30,
+            timeout=self._image_request_timeout(30),
         )
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
@@ -2579,7 +2651,7 @@ class OpenAIBackendAPI:
             self.base_url + prepare_path,
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
-            timeout=30,
+            timeout=self._image_request_timeout(30),
         )
         ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
@@ -2612,7 +2684,7 @@ class OpenAIBackendAPI:
                 "proof_token": proof_token,
                 "turnstile_token": turnstile_token,
             },
-            timeout=30,
+            timeout=self._image_request_timeout(30),
         )
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()

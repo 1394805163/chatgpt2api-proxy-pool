@@ -4,9 +4,17 @@ import base64
 import unittest
 from unittest import mock
 
+from services.account_service import account_service
 from services.config import config
-from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ConversationRequest, ImageOutput, extract_conversation_ids, stream_image_outputs
+from services.openai_backend_api import ImageTaskDeadlineError, OpenAIBackendAPI
+from services.protocol.conversation import (
+    ConversationRequest,
+    ImageGenerationError,
+    ImageOutput,
+    _generate_single_image,
+    extract_conversation_ids,
+    stream_image_outputs,
+)
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -50,6 +58,23 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_task_deadline_releases_account_slot_without_marking_failure(self) -> None:
+        with (
+            mock.patch.object(account_service, "get_available_access_token", return_value="token-1"),
+            mock.patch.object(account_service, "get_account", return_value={"email": "test@example.com"}),
+            mock.patch.object(account_service, "release_image_slot") as release_slot,
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+            mock.patch(
+                "services.protocol.conversation.stream_image_outputs",
+                side_effect=ImageTaskDeadlineError("deadline reached"),
+            ),
+        ):
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
+
+        self.assertEqual(raised.exception.code, "image_task_timeout")
+        release_slot.assert_called_once_with("token-1")
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '

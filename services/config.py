@@ -447,6 +447,13 @@ class ConfigStore:
             return 120
 
     @property
+    def image_task_timeout_secs(self) -> float:
+        try:
+            return max(1.0, float(self.data.get("image_task_timeout_secs", 150.0)))
+        except (TypeError, ValueError):
+            return 150.0
+
+    @property
     def image_poll_interval_secs(self) -> float:
         try:
             return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
@@ -599,6 +606,7 @@ class ConfigStore:
         data["display_timezone"] = self.display_timezone
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
+        data["image_task_timeout_secs"] = self.image_task_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_timeout_retry_secs"] = self.image_timeout_retry_secs

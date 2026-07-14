@@ -89,8 +89,13 @@ function parseImageSize(size: string) {
   return match ? { width: match[1], height: match[2] } : { width: "1024", height: "1024" };
 }
 
-const activeConversationQueueIds = new Set<string>();
+const MAX_ACTIVE_IMAGE_TURNS = 2;
+const activeImageTurnKeys = new Set<string>();
 let pollAbortController: AbortController | null = null;
+
+function imageTurnKey(conversationId: string, turnId: string) {
+  return `${conversationId}:${turnId}`;
+}
 
 function getResultsDistanceFromBottom(element: HTMLElement) {
   return element.scrollHeight - element.scrollTop - element.clientHeight;
@@ -657,7 +662,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         scrollPositionsRef.current.set(convId, element.scrollTop);
         saveScrollPositions(scrollPositionsRef.current);
       }
-      activeConversationQueueIds.clear();
+      activeImageTurnKeys.clear();
       if (pollAbortController) {
         pollAbortController.abort();
         pollAbortController = null;
@@ -1154,14 +1159,16 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   /* eslint-disable react-hooks/preserve-manual-memoization */
   const runConversationQueue = useCallback(
-    async (conversationId: string) => {
-      if (activeConversationQueueIds.has(conversationId)) {
+    async (conversationId: string, turnId: string) => {
+      const queueKey = imageTurnKey(conversationId, turnId);
+      if (activeImageTurnKeys.has(queueKey) || activeImageTurnKeys.size >= MAX_ACTIVE_IMAGE_TURNS) {
         return;
       }
 
       const snapshot = conversationsRef.current.find((conversation) => conversation.id === conversationId);
       const activeTurn = snapshot?.turns.find(
         (turn) =>
+          turn.id === turnId &&
           (turn.status === "queued" || turn.status === "generating") &&
           turn.images.some((image) => image.status === "loading"),
       );
@@ -1169,7 +1176,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         return;
       }
 
-      activeConversationQueueIds.add(conversationId);
+      activeImageTurnKeys.add(queueKey);
       const applyTasks = async (tasks: ImageTask[]) => {
         const taskMap = new Map(tasks.map((task) => [task.id, task]));
         await updateConversation(conversationId, (current) => {
@@ -1304,17 +1311,20 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         });
         toast.error(message);
       } finally {
-        activeConversationQueueIds.delete(conversationId);
-        for (const conversation of conversationsRef.current) {
-          if (
-            !activeConversationQueueIds.has(conversation.id) &&
-            conversation.turns.some(
-              (turn) =>
-                (turn.status === "queued" || turn.status === "generating") &&
-                turn.images.some((image) => image.status === "loading"),
-            )
-          ) {
-            void runConversationQueue(conversation.id);
+        activeImageTurnKeys.delete(queueKey);
+        outer: for (const conversation of conversationsRef.current) {
+          for (const turn of conversation.turns) {
+            if (activeImageTurnKeys.size >= MAX_ACTIVE_IMAGE_TURNS) {
+              break outer;
+            }
+            const nextKey = imageTurnKey(conversation.id, turn.id);
+            if (
+              !activeImageTurnKeys.has(nextKey) &&
+              (turn.status === "queued" || turn.status === "generating") &&
+              turn.images.some((image) => image.status === "loading")
+            ) {
+              void runConversationQueue(conversation.id, turn.id);
+            }
           }
         }
       }
@@ -1357,8 +1367,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
       setSelectedConversationId(conversationId);
       await persistConversation(nextConversation);
-      void runConversationQueue(conversationId);
-      toast.success("已加入重新生成队列");
+      void runConversationQueue(conversationId, nextTurnId);
+      toast.success("已提交重新生成任务");
     },
     [runConversationQueue],
   );
@@ -1403,7 +1413,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
       setSelectedConversationId(conversationId);
       await persistConversation(nextConversation);
-      void runConversationQueue(conversationId);
+      void runConversationQueue(conversationId, turnId);
     },
     [runConversationQueue],
   );
@@ -1500,17 +1510,20 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   );
 
   useEffect(() => {
-    for (const conversation of conversations) {
-      if (
-        !activeConversationQueueIds.has(conversation.id) &&
-        conversation.turns.some(
-          (turn) =>
-            !turn.resultsDeleted &&
-            (turn.status === "queued" || turn.status === "generating") &&
-            turn.images.some((image) => image.status === "loading"),
-        )
-      ) {
-        void runConversationQueue(conversation.id);
+    outer: for (const conversation of conversations) {
+      for (const turn of conversation.turns) {
+        if (activeImageTurnKeys.size >= MAX_ACTIVE_IMAGE_TURNS) {
+          break outer;
+        }
+        const queueKey = imageTurnKey(conversation.id, turn.id);
+        if (
+          !activeImageTurnKeys.has(queueKey) &&
+          !turn.resultsDeleted &&
+          (turn.status === "queued" || turn.status === "generating") &&
+          turn.images.some((image) => image.status === "loading")
+        ) {
+          void runConversationQueue(conversation.id, turn.id);
+        }
       }
     }
   }, [conversations, runConversationQueue]);
@@ -1568,11 +1581,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     clearComposerInputs();
 
     await persistConversation(baseConversation);
-    void runConversationQueue(conversationId);
+    void runConversationQueue(conversationId, turnId);
 
     const targetStats = getImageConversationStats(baseConversation);
     if (targetStats.running > 0 || targetStats.queued > 1) {
-      toast.success("已加入当前对话队列");
+      toast.success("已提交，新任务将并行处理");
     } else if (!targetConversation) {
       toast.success("已创建新对话并开始处理");
     } else {

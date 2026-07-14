@@ -13,7 +13,12 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    ImageContentPolicyError,
+    ImagePollTimeoutError,
+    ImageTaskDeadlineError,
+    OpenAIBackendAPI,
+)
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -333,6 +338,8 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    task_deadline_ts: float | None = None
+    cancel_event: Any = None  # threading.Event | None
 
 
 @dataclass
@@ -684,6 +691,8 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    task_deadline_ts: float | None = None,
+    cancel_event: Any = None,
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -697,6 +706,8 @@ def conversation_events(
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
+        task_deadline_ts=task_deadline_ts,
+        cancel_event=cancel_event,
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
@@ -812,6 +823,8 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            task_deadline_ts=request.task_deadline_ts,
+            cancel_event=request.cancel_event,
     ):
         last = event
         if event.get("type") == "conversation.delta":
@@ -1299,6 +1312,8 @@ def _generate_single_image(
         })
         try:
             backend = OpenAIBackendAPI(access_token=token)
+            backend.image_deadline_ts = request.task_deadline_ts
+            backend.image_cancel_event = request.cancel_event
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1337,6 +1352,15 @@ def _generate_single_image(
                 return outputs
             account_service.mark_image_result(token, True)
             return outputs
+        except ImageTaskDeadlineError as exc:
+            account_service.release_image_slot(token)
+            raise ImageGenerationError(
+                str(exc),
+                status_code=504,
+                error_type="server_error",
+                code="image_task_timeout",
+                account_email=account_email,
+            ) from exc
         except ImagePollTimeoutError as exc:
             record_image_failure(token, str(exc), "image_poll_timeout")
             if account_email:
