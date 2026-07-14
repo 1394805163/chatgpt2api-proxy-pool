@@ -139,7 +139,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(result["items"][0]["status"], "error")
             self.assertIn("超时", result["items"][0]["error"])
 
-    def test_default_stale_timeout_tracks_poll_timeout_config(self):
+    def test_default_stale_timeout_tracks_total_task_timeout_config(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = self.make_service(Path(tmp_dir) / "image_tasks.json")
             now = time.time()
@@ -152,15 +152,16 @@ class ImageTaskServiceTests(unittest.TestCase):
                     "model": "gpt-image-2",
                     "created_at": "2026-01-01T00:00:00Z",
                     "updated_at": "2026-01-01T00:00:30Z",
-                    "created_ts": now - 140,
-                    "updated_ts": now - 130,
-                    "started_ts": now - 130,
+                    "created_ts": now - 200,
+                    "updated_ts": now - 190,
+                    "started_ts": now - 190,
                 }
 
             with mock.patch.dict(
                 config.data,
                 {
                     "image_poll_timeout_secs": 70,
+                    "image_task_timeout_secs": 150,
                     "image_poll_initial_wait_secs": 10,
                     "image_poll_interval_secs": 10,
                 },

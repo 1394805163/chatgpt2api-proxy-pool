@@ -2281,9 +2281,8 @@ class OpenAIBackendAPI:
             "last_task_error": last_task_error if last_task_error else None,
         })
         exc = ImagePollTimeoutError(
-            f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
-            f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
-            f"也可能是账号被限流或生图队列拥堵导致。"
+            f"上游图片结果在 {timeout_secs:g} 秒总时限内未返回。"
+            f"可能是账号被限流或生图队列拥堵导致。"
         )
         if last_task_error:
             setattr(exc, "task_error", last_task_error)
@@ -2468,7 +2467,7 @@ class OpenAIBackendAPI:
     ) -> list[str]:
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
-        timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
+        timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_task_timeout_secs
         timeout = self._image_request_timeout(float(timeout))
         # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
         # 跳过轮询直接解析 URL，省去 initial_wait + 轮询耗时。

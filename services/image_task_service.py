@@ -531,7 +531,7 @@ class ImageTaskService:
         try:
             return max(
                 30.0,
-                float(config.image_poll_timeout_secs)
+                float(config.image_task_timeout_secs)
                 + float(config.image_poll_interval_secs)
                 + float(config.image_timeout_retry_secs),
             )

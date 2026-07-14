@@ -6,7 +6,7 @@ from unittest import mock
 
 from services.account_service import account_service
 from services.config import config
-from services.openai_backend_api import ImageTaskDeadlineError, OpenAIBackendAPI
+from services.openai_backend_api import ImagePollTimeoutError, ImageTaskDeadlineError, OpenAIBackendAPI
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -179,7 +179,7 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual(urls, ["https://files.test/one.png"])
 
-    def test_text_reply_poll_uses_configured_timeout(self) -> None:
+    def test_text_reply_poll_uses_total_task_timeout(self) -> None:
         backend = FakeBackend()
         backend.resolve_conversation_image_urls = mock.Mock(return_value=["https://files.test/one.png"])
         backend.download_image_bytes = mock.Mock(return_value=[b"image-bytes"])
@@ -195,7 +195,7 @@ class MultiImageResultTests(unittest.TestCase):
         ]
 
         with (
-            mock.patch.dict(config.data, {"image_poll_timeout_secs": 70}),
+            mock.patch.dict(config.data, {"image_poll_timeout_secs": 70, "image_task_timeout_secs": 150}),
             mock.patch("services.protocol.conversation.conversation_events", return_value=iter(events)),
             mock.patch("services.protocol.conversation._get_detailed_error_from_tasks", return_value=""),
             mock.patch("services.protocol.conversation.save_image_bytes", return_value="http://local.test/one.png"),
@@ -206,7 +206,37 @@ class MultiImageResultTests(unittest.TestCase):
             ))
 
         backend.resolve_conversation_image_urls.assert_called_once()
-        self.assertEqual(backend.resolve_conversation_image_urls.call_args.kwargs["poll_timeout_secs"], 70)
+        self.assertEqual(backend.resolve_conversation_image_urls.call_args.kwargs["poll_timeout_secs"], 150)
+        self.assertTrue(any(output.kind == "result" for output in outputs))
+
+    def test_progress_event_does_not_block_poll_timeout_retry(self) -> None:
+        attempts = 0
+
+        def stream_outputs(_backend, _request, index, total):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                yield ImageOutput(kind="progress", model="gpt-image-2", index=index, total=total)
+                raise ImagePollTimeoutError("poll timed out")
+            yield ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=index,
+                total=total,
+                data=[{"url": "http://example.test/image.png"}],
+            )
+
+        with (
+            mock.patch.object(account_service, "get_available_access_token", side_effect=["token-1", "token-2"]),
+            mock.patch.object(account_service, "get_account", return_value={"email": "test@example.com"}),
+            mock.patch.object(account_service, "mark_image_result"),
+            mock.patch("services.protocol.conversation.record_image_failure"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream_outputs),
+        ):
+            outputs = _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
+
+        self.assertEqual(attempts, 2)
         self.assertTrue(any(output.kind == "result" for output in outputs))
 
     def test_responses_stream_emits_all_image_output_items(self) -> None:

@@ -933,7 +933,7 @@ def stream_image_outputs(
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
     # 导致对话文档中尚未写入图片工具的响应记录。
-    poll_timeout = config.image_poll_timeout_secs
+    poll_timeout = config.image_task_timeout_secs
     if is_text_reply and conversation_id:
         # 文本回复场景也使用配置的轮询超时，避免设置页的值被隐藏放大。
         logger.info({
@@ -1019,7 +1019,7 @@ def stream_image_outputs(
                 "message_preview": message[:200],
             })
             # 文本回复场景下仍按配置轮询，并允许短暂重试来处理临时网络问题。
-            retry_poll_timeout = config.image_poll_timeout_secs
+            retry_poll_timeout = config.image_task_timeout_secs
             MAX_POLL_RETRIES = 3
             for poll_attempt in range(1, MAX_POLL_RETRIES + 1):
                 try:
@@ -1123,7 +1123,7 @@ def stream_image_outputs(
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
         # 按配置轮询，并允许短暂重试来处理临时网络问题或图片尚未提交的情况。
-        retry_poll_timeout = config.image_poll_timeout_secs
+        retry_poll_timeout = config.image_task_timeout_secs
         MAX_FALLBACK_POLL_RETRIES = 3
         for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
             retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
@@ -1330,8 +1330,8 @@ def _generate_single_image(
                         account_email=account_email,
                         conversation_id=output.conversation_id,
                     )
-                emitted_for_token = True
-                returned_message = output.kind == "message"
+                emitted_for_token = emitted_for_token or output.kind in {"message", "result"}
+                returned_message = returned_message or output.kind == "message"
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
@@ -1516,6 +1516,9 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
+
+    if request.task_deadline_ts is None:
+        request.task_deadline_ts = time.time() + config.image_task_timeout_secs
 
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）

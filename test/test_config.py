@@ -87,6 +87,26 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertFalse(cleanup["register_precheck_enabled"])
             self.assertEqual(cleanup["action"], "mark_abnormal")
 
+    def test_image_timeout_uses_single_total_task_setting(self) -> None:
+        module = self.config_module
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(
+                json.dumps({"auth-key": "test-auth", "image_poll_timeout_secs": 70}),
+                encoding="utf-8",
+            )
+
+            store = module.ConfigStore(path)
+            self.assertEqual(store.image_task_timeout_secs, 70)
+
+            updated = store.update({"image_task_timeout_secs": 150, "image_poll_timeout_secs": 70})
+
+            self.assertEqual(updated["image_task_timeout_secs"], 150)
+            self.assertEqual(updated["image_poll_timeout_secs"], 150)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["image_task_timeout_secs"], 150)
+            self.assertEqual(persisted["image_poll_timeout_secs"], 150)
+
 
 if __name__ == "__main__":
     unittest.main()
