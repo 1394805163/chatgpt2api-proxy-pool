@@ -1365,12 +1365,18 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         turns: [...conversation.turns, nextTurn],
       };
 
+      shouldStickToBottomRef.current = true;
+      const scrollButton = scrollToLatestBtnRef.current;
+      if (scrollButton) {
+        scrollButton.style.display = "none";
+      }
       setSelectedConversationId(conversationId);
       await persistConversation(nextConversation);
+      requestAnimationFrame(() => scrollResultsToLatest("smooth"));
       void runConversationQueue(conversationId, nextTurnId);
       toast.success("已提交重新生成任务");
     },
-    [runConversationQueue],
+    [runConversationQueue, scrollResultsToLatest],
   );
 
   const handleRetryImage = useCallback(
