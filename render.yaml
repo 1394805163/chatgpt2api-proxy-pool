@@ -13,6 +13,8 @@ services:
       - key: PORT
         value: "80"
       - key: STORAGE_BACKEND
-        value: json
+        value: postgres
+      - key: DATABASE_URL
+        sync: false
       - key: CHATGPT2API_AUTH_KEY
         sync: false

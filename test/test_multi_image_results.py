@@ -57,7 +57,51 @@ class FakeBackend(OpenAIBackendAPI):
         return self.sediment_urls.get(attachment_id, "")
 
 
+class FakeStreamingResponse:
+    def __init__(self, close_error: Exception | None = None) -> None:
+        self.close_error = close_error
+        self.close_calls = 0
+
+    def iter_lines(self):
+        yield b"data: [DONE]\n"
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
 class MultiImageResultTests(unittest.TestCase):
+    def _picture_stream_backend(self, response: FakeStreamingResponse) -> OpenAIBackendAPI:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "token-1"
+        backend.progress_callback = None
+        backend._ensure_image_task_active = mock.Mock()
+        backend._upload_image = mock.Mock(return_value={})
+        backend._bootstrap = mock.Mock()
+        backend._get_chat_requirements = mock.Mock(return_value=mock.Mock())
+        backend._prepare_image_conversation = mock.Mock(return_value="conduit-token")
+        backend._start_image_generation = mock.Mock(return_value=response)
+        return backend
+
+    def test_picture_stream_suppresses_curl_write_error_caused_by_close(self) -> None:
+        response = FakeStreamingResponse(RuntimeError(
+            "Failed to perform, curl: (23) client returned ERROR on write of 45 bytes."
+        ))
+        backend = self._picture_stream_backend(response)
+
+        payloads = list(backend._stream_picture_conversation("cat", "gpt-image-2", []))
+
+        self.assertEqual(payloads, ["[DONE]"])
+        self.assertEqual(response.close_calls, 1)
+
+    def test_picture_stream_keeps_unexpected_close_errors(self) -> None:
+        response = FakeStreamingResponse(RuntimeError("unexpected close failure"))
+        backend = self._picture_stream_backend(response)
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected close failure"):
+            list(backend._stream_picture_conversation("cat", "gpt-image-2", []))
+
     def test_task_deadline_releases_account_slot_without_marking_failure(self) -> None:
         with (
             mock.patch.object(account_service, "get_available_access_token", return_value="token-1"),

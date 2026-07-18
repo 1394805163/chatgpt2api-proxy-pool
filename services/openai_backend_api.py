@@ -46,6 +46,21 @@ class ImageContentPolicyError(RuntimeError):
     pass
 
 
+def _close_stream_response(response: requests.Response, context: str) -> None:
+    """Close a curl_cffi stream without surfacing its intentional abort error."""
+    try:
+        response.close()
+    except Exception as exc:
+        error = str(exc).lower()
+        if "curl: (23)" not in error or "error on write" not in error:
+            raise
+        logger.debug({
+            "event": "stream_close_write_error_suppressed",
+            "context": context,
+            "error": str(exc)[:300],
+        })
+
+
 @dataclass
 class ChatRequirements:
     """保存一次对话请求所需的 sentinel token。"""
@@ -1412,7 +1427,7 @@ class OpenAIBackendAPI:
                     break
                 conversation_id = conversation_id or self._find_editable_value(payload, "conversation_id")
         finally:
-            response.close()
+            _close_stream_response(response, "editable_file_start")
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
         return conversation_id
@@ -1875,7 +1890,7 @@ class OpenAIBackendAPI:
                 if payload == "[DONE]":
                     break
         finally:
-            response.close()
+            _close_stream_response(response, "search_start")
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
         return conversation_id
@@ -2571,7 +2586,7 @@ class OpenAIBackendAPI:
         try:
             yield from iter_sse_payloads(response)
         finally:
-            response.close()
+            _close_stream_response(response, "conversation")
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
@@ -2626,7 +2641,7 @@ class OpenAIBackendAPI:
             self._ensure_image_task_active()
         finally:
             stop_closer.set()
-            response.close()
+            _close_stream_response(response, "image_generation")
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
