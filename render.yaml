@@ -4,7 +4,7 @@ services:
     runtime: docker
     plan: free
     region: singapore
-    branch: codex/render-free-test
+    branch: dev
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /health?format=json

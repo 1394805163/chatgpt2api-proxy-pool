@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -17,18 +18,105 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR, DEFAULT_DISPLAY_TIMEZONE
 from services.protocol.error_response import anthropic_error_response, openai_error_response
+from services.storage.base import DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_LOG_ITEMS
 from services.time_utils import utc_now_iso, utc_timestamp_iso
 from utils.helper import anthropic_sse_stream, sse_json_stream
+from utils.log import logger
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+LOG_FILE_PRUNE_INTERVAL = 100
 
 
 class LogService:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, storage_backend: object | None = None, use_config_storage: bool = False):
         self.path = path
+        self.storage_backend = storage_backend
+        self.use_config_storage = use_config_storage
+        self._lock = threading.RLock()
+        self._writes_since_file_prune = LOG_FILE_PRUNE_INTERVAL - 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _storage(self):
+        if self.storage_backend is not None:
+            return self.storage_backend
+        if not self.use_config_storage:
+            return None
+        try:
+            from services.config import config
+
+            return config.get_storage_backend()
+        except Exception:
+            return None
+
+    def _file_items(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        return [
+            item
+            for line_number, raw_line in enumerate(lines)
+            if (item := self._parse_line(raw_line, line_number)) is not None
+        ]
+
+    @staticmethod
+    def _item_timestamp(item: dict[str, Any]) -> float | None:
+        raw = str(item.get("time") or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.timestamp()
+
+    def _prune_file(
+        self,
+        *,
+        retention_days: int = DEFAULT_LOG_RETENTION_DAYS,
+        max_items: int = DEFAULT_MAX_LOG_ITEMS,
+    ) -> int:
+        with self._lock:
+            items = self._file_items()
+            original_count = len(items)
+            if retention_days >= 0:
+                cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).timestamp()
+                items = [
+                    item
+                    for item in items
+                    if (timestamp := self._item_timestamp(item)) is None or timestamp >= cutoff
+                ]
+            items = items[-max(0, max_items):] if max_items > 0 else []
+            content = "\n".join(self._serialize_item(item) for item in items)
+            self.path.write_text(f"{content}\n" if content else "", encoding="utf-8")
+            return original_count - len(items)
+
+    def _all_items(self, *, type: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            file_items = [
+                item
+                for item in reversed(self._file_items())
+                if not type or item.get("type") == type
+            ]
+            if limit is not None:
+                file_items = file_items[:limit]
+        storage = self._storage()
+        persistent_items: list[dict[str, Any]] = []
+        if storage is not None:
+            try:
+                persistent_items = storage.load_logs(limit=limit, type=type)
+            except Exception as exc:
+                logger.error(f"Failed to load logs from storage backend: {exc}")
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in [*file_items, *persistent_items]:
+            item_id = str(item.get("id") or "").strip()
+            if item_id and item_id not in deduped:
+                deduped[item_id] = item
+        items = list(deduped.values())
+        return items[:limit] if limit is not None else items
 
     @staticmethod
     def _legacy_id(raw_line: str, line_number: int) -> str:
@@ -189,8 +277,19 @@ class LogService:
             "summary": summary,
             "detail": detail or data,
         }
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(self._serialize_item(item) + "\n")
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(self._serialize_item(item) + "\n")
+            self._writes_since_file_prune += 1
+            if self._writes_since_file_prune >= LOG_FILE_PRUNE_INTERVAL:
+                self._writes_since_file_prune = 0
+                self._prune_file()
+        storage = self._storage()
+        if storage is not None:
+            try:
+                storage.save_log(item)
+            except Exception as exc:
+                logger.error(f"Failed to persist log {item['id']} to storage backend: {exc}")
 
     def list(
         self,
@@ -201,14 +300,8 @@ class LogService:
         collapse_image_failures: bool = False,
         display_timezone: str = DEFAULT_DISPLAY_TIMEZONE,
     ) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
         items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
-            if item is None:
-                continue
+        for item in self._all_items(type=type, limit=limit):
             if not self._matches_filters(
                 item,
                 type=type,
@@ -226,30 +319,38 @@ class LogService:
 
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
-        if not self.path.exists() or not target_ids:
+        if not target_ids:
             return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        parsed_lines = [(raw_line, self._parse_line(raw_line, line_number)) for line_number, raw_line in enumerate(lines)]
-        parsed_items = [item for _, item in parsed_lines if item is not None]
+        parsed_items = self._all_items()
         target_ids = self._expand_group_delete_ids(parsed_items, target_ids)
-        kept_lines: list[str] = []
-        removed = 0
-        for raw_line, item in parsed_lines:
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
-        return {"removed": removed}
+        file_removed = 0
+        with self._lock:
+            lines = self.path.read_text(encoding="utf-8").splitlines() if self.path.exists() else []
+            parsed_lines = [(raw_line, self._parse_line(raw_line, line_number)) for line_number, raw_line in enumerate(lines)]
+            kept_lines: list[str] = []
+            for raw_line, item in parsed_lines:
+                if item is None:
+                    kept_lines.append(raw_line)
+                    continue
+                if str(item.get("id") or "") in target_ids:
+                    file_removed += 1
+                    continue
+                kept_lines.append(self._serialize_item(item))
+            content = "\n".join(kept_lines)
+            if content:
+                content += "\n"
+            self.path.write_text(content, encoding="utf-8")
+        database_removed = 0
+        storage = self._storage()
+        if storage is not None:
+            try:
+                database_removed = int(storage.delete_logs(list(target_ids)) or 0)
+            except Exception as exc:
+                logger.error(f"Failed to delete logs from storage backend: {exc}")
+        return {"removed": max(file_removed, database_removed)}
 
 
-log_service = LogService(DATA_DIR / "logs.jsonl")
+log_service = LogService(DATA_DIR / "logs.jsonl", use_config_storage=True)
 
 
 def _collect_urls(value: object) -> list[str]:

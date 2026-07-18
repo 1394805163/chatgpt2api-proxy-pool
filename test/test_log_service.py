@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from services.log_service import LOG_TYPE_CALL, LogService
+from services.storage.database_storage import DatabaseStorageBackend, LogModel
 
 
 def append_log(service: LogService, *, log_id: str, time: str, summary: str, detail: dict):
@@ -20,6 +21,130 @@ def append_log(service: LogService, *, log_id: str, time: str, summary: str, det
 
 
 class LogServiceTests(unittest.TestCase):
+    def test_local_log_retention_applies_time_and_count_limits(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = LogService(Path(tmp_dir) / "logs.jsonl")
+            for index, timestamp in enumerate(
+                [
+                    "2026-07-15T00:00:00Z",
+                    "2099-07-17T00:00:00Z",
+                    "2099-07-18T00:00:00Z",
+                    "2099-07-19T00:00:00Z",
+                ]
+            ):
+                append_log(
+                    service,
+                    log_id=f"log-{index}",
+                    time=timestamp,
+                    summary=f"log {index}",
+                    detail={},
+                )
+
+            removed = service._prune_file(retention_days=3, max_items=2)
+
+            self.assertEqual(removed, 2)
+            self.assertEqual([item["id"] for item in service.list(limit=None)], ["log-3", "log-2"])
+
+    def test_database_log_retention_applies_time_and_count_limits(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            storage = DatabaseStorageBackend(f"sqlite:///{root / 'logs.db'}")
+            for index, timestamp in enumerate(
+                [
+                    "2026-07-15T00:00:00Z",
+                    "2099-07-17T00:00:00Z",
+                    "2099-07-18T00:00:00Z",
+                    "2099-07-19T00:00:00Z",
+                ]
+            ):
+                storage.save_log({
+                    "id": f"log-{index}",
+                    "time": timestamp,
+                    "type": LOG_TYPE_CALL,
+                    "summary": f"log {index}",
+                    "detail": {},
+                })
+
+            removed = storage.prune_logs(retention_days=3, max_items=2)
+            session = storage.Session()
+            try:
+                remaining = [row.id for row in session.query(LogModel).order_by(LogModel.time.desc()).all()]
+            finally:
+                session.close()
+                storage.engine.dispose()
+
+            self.assertEqual(removed, 2)
+            self.assertEqual(remaining, ["log-3", "log-2"])
+
+    def test_database_and_file_logs_are_merged_in_time_order(self):
+        class FakeStorage:
+            def load_logs(self, limit=None, type=""):
+                return [{
+                    "id": "database-old",
+                    "time": "2026-07-18T00:00:00Z",
+                    "type": LOG_TYPE_CALL,
+                    "summary": "database old",
+                    "detail": {},
+                }]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = LogService(Path(tmp_dir) / "logs.jsonl", storage_backend=FakeStorage())
+            append_log(
+                service,
+                log_id="file-new",
+                time="2026-07-19T00:00:00Z",
+                summary="file new",
+                detail={},
+            )
+
+            self.assertEqual([item["id"] for item in service.list(limit=None)], ["file-new", "database-old"])
+
+    def test_sqlite_backed_logs_survive_service_restart(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            storage = DatabaseStorageBackend(f"sqlite:///{root / 'logs.db'}")
+            service = LogService(root / "logs.jsonl", storage_backend=storage)
+            service.add(LOG_TYPE_CALL, "persisted", {"status": "success"})
+            (root / "logs.jsonl").unlink()
+
+            restarted = LogService(root / "new-logs.jsonl", storage_backend=storage)
+            items = restarted.list(limit=None)
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["summary"], "persisted")
+            storage.engine.dispose()
+
+    def test_database_backed_logs_survive_missing_local_file(self):
+        class FakeStorage:
+            def __init__(self):
+                self.items: list[dict] = []
+
+            def save_log(self, item):
+                self.items.append(dict(item))
+                return True
+
+            def load_logs(self, limit=None, type=""):
+                items = [item for item in reversed(self.items) if not type or item.get("type") == type]
+                return items if limit is None else items[:limit]
+
+            def delete_logs(self, ids):
+                target = set(ids)
+                before = len(self.items)
+                self.items = [item for item in self.items if item["id"] not in target]
+                return before - len(self.items)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "logs.jsonl"
+            storage = FakeStorage()
+            service = LogService(path, storage_backend=storage)
+            service.add(LOG_TYPE_CALL, "persisted", {"status": "success"})
+            path.unlink()
+
+            items = service.list(limit=None)
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["summary"], "persisted")
+
     def test_date_range_can_return_all_matching_logs_without_default_cap(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = LogService(Path(tmp_dir) / "logs.jsonl")

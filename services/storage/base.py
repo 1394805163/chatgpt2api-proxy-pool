@@ -3,6 +3,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+DEFAULT_LOG_RETENTION_DAYS = 10
+DEFAULT_MAX_LOG_ITEMS = 50_000
+
 
 class StorageBackend(ABC):
     """抽象存储后端基类"""
@@ -36,3 +39,12 @@ class StorageBackend(ABC):
     def get_backend_info(self) -> dict[str, Any]:
         """获取存储后端信息"""
         pass
+
+    def save_log(self, item: dict[str, Any]) -> bool:
+        return False
+
+    def load_logs(self, limit: int | None = None, type: str = "") -> list[dict[str, Any]]:
+        return []
+
+    def delete_logs(self, ids: list[str]) -> int:
+        return 0

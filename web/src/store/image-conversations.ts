@@ -26,6 +26,7 @@ export type StoredImage = {
   elapsedSecs?: number;
   elapsedUpdatedAt?: number;
   durationMs?: number;
+  browserCachedAt?: number;
 };
 
 export type ImageTurnStatus = "queued" | "generating" | "success" | "error";
@@ -81,6 +82,7 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
     elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
     elapsedUpdatedAt: typeof image.elapsedUpdatedAt === "number" ? image.elapsedUpdatedAt : undefined,
     durationMs: typeof image.durationMs === "number" ? image.durationMs : undefined,
+    browserCachedAt: typeof image.browserCachedAt === "number" ? image.browserCachedAt : undefined,
   };
   if (image.status === "loading" || image.status === "error" || image.status === "success") {
     return normalized;

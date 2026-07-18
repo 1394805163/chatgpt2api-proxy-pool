@@ -177,6 +177,45 @@ async function fetchImageAsFile(url: string, fileName: string) {
   return new File([blob], fileName, { type: blob.type || "image/png" });
 }
 
+const MAX_BROWSER_CACHED_IMAGE_BYTES = 12 * 1024 * 1024;
+
+async function blobToBase64(blob: Blob) {
+  const dataUrl = await readFileAsDataUrl(new File([blob], "generated-image.png", { type: blob.type || "image/png" }));
+  return dataUrl.split(",", 2)[1] || "";
+}
+
+async function cacheTaskImagesInBrowser(tasks: ImageTask[]): Promise<ImageTask[]> {
+  return Promise.all(
+    tasks.map(async (task) => {
+      if (task.status !== "success" || !task.data?.length) {
+        return task;
+      }
+      const data = await Promise.all(
+        task.data.map(async (image) => {
+          if (image.b64_json || !image.url) {
+            return image;
+          }
+          try {
+            const response = await fetch(image.url, { cache: "force-cache" });
+            if (!response.ok) {
+              return image;
+            }
+            const blob = await response.blob();
+            if (blob.size <= 0 || blob.size > MAX_BROWSER_CACHED_IMAGE_BYTES) {
+              return image;
+            }
+            const b64_json = await blobToBase64(blob);
+            return b64_json ? { ...image, b64_json } : image;
+          } catch {
+            return image;
+          }
+        }),
+      );
+      return { ...task, data };
+    }),
+  );
+}
+
 async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string) {
   const direct = buildReferenceImageFromResult(image, fileName);
   if (direct) {
@@ -224,6 +263,7 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       revised_prompt: first.revised_prompt,
       error: undefined,
       durationMs: task.duration_ms,
+      browserCachedAt: first.b64_json ? Date.now() : image.browserCachedAt,
     };
   }
 
@@ -324,7 +364,8 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
   } catch {
     return items;
   }
-  const taskMap = new Map(taskList.items.map((task) => [task.id, task]));
+  const browserCachedTasks = await cacheTaskImagesInBrowser(taskList.items);
+  const taskMap = new Map(browserCachedTasks.map((task) => [task.id, task]));
   let changed = false;
   const normalized = items.map((conversation) => {
     const turns = conversation.turns.map((turn) => {
@@ -1178,7 +1219,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
       activeImageTurnKeys.add(queueKey);
       const applyTasks = async (tasks: ImageTask[]) => {
-        const taskMap = new Map(tasks.map((task) => [task.id, task]));
+        const browserCachedTasks = await cacheTaskImagesInBrowser(tasks);
+        const taskMap = new Map(browserCachedTasks.map((task) => [task.id, task]));
         await updateConversation(conversationId, (current) => {
           const conversation = current ?? snapshot;
           const turns = conversation.turns.map((turn) => {
