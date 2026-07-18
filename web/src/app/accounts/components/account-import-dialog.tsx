@@ -42,7 +42,7 @@ type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "cpa" | "oauth
 
 type AccountImportDialogProps = {
   disabled?: boolean;
-  onImported: (items: Account[]) => void;
+  onImported: (items: Account[], refreshProgressId?: string, refreshing?: number) => void;
 };
 
 type PendingCpaImport = {
@@ -204,11 +204,15 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     setIsSubmitting(true);
     try {
       const data = await createAccounts(normalizedTokens, accountPayloads);
-      onImported(data.items);
+      onImported(data.items, data.refresh_progress_id, data.refreshing);
       setOpen(false);
       resetState();
 
-      if ((data.errors?.length ?? 0) > 0) {
+      if (data.refresh_progress_id) {
+        toast.success(
+          `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项，账号信息正在后台刷新`,
+        );
+      } else if ((data.errors?.length ?? 0) > 0) {
         const firstError = data.errors?.[0]?.error;
         toast.error(
           `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，已刷新 ${data.refreshed ?? 0} 个，失败 ${data.errors?.length ?? 0} 个${firstError ? `，首个错误：${firstError}` : ""}`,

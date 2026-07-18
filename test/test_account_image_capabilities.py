@@ -3,9 +3,11 @@ from __future__ import annotations
 import copy
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
@@ -159,6 +161,53 @@ class AccountCapabilityTests(unittest.TestCase):
                 config.data.pop("auto_remove_invalid_accounts", None)
             else:
                 config.data["auto_remove_invalid_accounts"] = original_value
+
+    def test_refresh_accounts_limits_concurrency_and_persists_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            storage = JSONStorageBackend(Path(tmp_dir) / "accounts.json")
+            service = AccountService(storage)
+            tokens = [f"token-{index}" for index in range(6)]
+            service.add_accounts(tokens)
+
+            active = 0
+            peak_active = 0
+            active_lock = threading.Lock()
+
+            def fetch_remote_info(token: str, *args, **kwargs):
+                nonlocal active, peak_active
+                with active_lock:
+                    active += 1
+                    peak_active = max(peak_active, active)
+                try:
+                    time.sleep(0.02)
+                    return service.update_account(token, {"quota": 5, "status": "姝ｅ父"})
+                finally:
+                    with active_lock:
+                        active -= 1
+
+            service.fetch_remote_info = fetch_remote_info
+            original_save = storage.save_accounts
+            storage.save_accounts = MagicMock(wraps=original_save)
+
+            result = service.refresh_accounts(tokens)
+
+            self.assertEqual(result["refreshed"], len(tokens))
+            self.assertLessEqual(peak_active, service._MAX_REFRESH_WORKERS)
+            self.assertEqual(storage.save_accounts.call_count, 1)
+
+    def test_fetch_remote_info_closes_temporary_backend_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_accounts(["token-1"])
+
+            with patch("services.openai_backend_api.OpenAIBackendAPI") as backend_class:
+                backend = backend_class.return_value
+                backend.get_user_info.return_value = {"status": "姝ｅ父", "quota": 5}
+
+                result = service.fetch_remote_info("token-1")
+
+            self.assertEqual(result["quota"], 5)
+            backend.session.close.assert_called_once_with()
 
     def test_free_cleanup_verifies_after_failure_threshold_and_marks_invalid_account(self) -> None:
         original_settings = copy.deepcopy(config.data.get("free_account_cleanup"))

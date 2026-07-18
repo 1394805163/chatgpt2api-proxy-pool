@@ -82,8 +82,9 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
 
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
-        last_refresh_at = 0.0
-        last_free_cleanup_at = 0.0
+        # Do not launch a full account refresh while the service is still cold-starting.
+        last_refresh_at = time.monotonic()
+        last_free_cleanup_at = last_refresh_at
         while not stop_event.is_set():
             refresh_interval_seconds = max(60, config.refresh_account_interval_minute * 60)
             free_cleanup_settings = config.get_free_account_cleanup_settings()

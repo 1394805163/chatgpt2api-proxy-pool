@@ -38,6 +38,7 @@ class AccountService:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/145.0.0.0 Safari/537.36"
     )
+    _MAX_REFRESH_WORKERS = 2
 
     # 刷新进度追踪
     _refresh_progress: dict[str, dict] = {}
@@ -53,6 +54,8 @@ class AccountService:
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
+        self._account_save_batch_depth = 0
+        self._account_save_pending = False
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
@@ -125,7 +128,21 @@ class AccountService:
         }
 
     def _save_accounts(self) -> None:
+        if self._account_save_batch_depth > 0:
+            self._account_save_pending = True
+            return
         self.storage.save_accounts(list(self._accounts.values()))
+
+    def _begin_account_save_batch(self) -> None:
+        with self._lock:
+            self._account_save_batch_depth += 1
+
+    def _end_account_save_batch(self) -> None:
+        with self._lock:
+            self._account_save_batch_depth = max(0, self._account_save_batch_depth - 1)
+            if self._account_save_batch_depth == 0 and self._account_save_pending:
+                self._account_save_pending = False
+                self.storage.save_accounts(list(self._accounts.values()))
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -1411,15 +1428,24 @@ class AccountService:
         if not access_token:
             raise ValueError("access_token is required")
 
+        def get_user_info(token: str) -> dict[str, Any]:
+            from services.openai_backend_api import OpenAIBackendAPI
+
+            client = OpenAIBackendAPI(token)
+            try:
+                return client.get_user_info()
+            finally:
+                client.session.close()
+
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         try:
-            from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            result = OpenAIBackendAPI(active_token).get_user_info()
+            from services.openai_backend_api import InvalidAccessTokenError
+            result = get_user_info(active_token)
         except InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    result = OpenAIBackendAPI(refreshed_token).get_user_info()
+                    result = get_user_info(refreshed_token)
                 except InvalidAccessTokenError as retry_exc:
                     if self._record_invalid_token_seen(
                         refreshed_token,
@@ -1638,11 +1664,12 @@ class AccountService:
 
         refreshed = 0
         errors = []
-        max_workers = min(10, len(access_tokens))
+        max_workers = min(self._MAX_REFRESH_WORKERS, len(access_tokens))
 
         if progress_id:
             self.init_refresh_progress(progress_id, len(access_tokens))
 
+        self._begin_account_save_batch()
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
             futures = {
@@ -1675,6 +1702,8 @@ class AccountService:
             raise
         else:
             executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            self._end_account_save_batch()
 
         # 自动重新登录异常账号（仅当配置开启时）
         relogined = 0

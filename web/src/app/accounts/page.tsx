@@ -537,12 +537,12 @@ function AccountsPageContent() {
       const timer = setInterval(async () => {
         try {
           const p = await fetchRefreshProgress(progressId);
+          onUpdate(p);
           if (p.done) {
             clearInterval(timer);
             if (p.error) {
               reject(new Error(p.error));
             } else {
-              onUpdate(p);
               resolve();
             }
           }
@@ -766,10 +766,43 @@ function AccountsPageContent() {
           </Button>
           <AccountImportDialog
             disabled={isLoading || isRefreshing || isDeleting}
-            onImported={(items) => {
+            onImported={(items, refreshProgressId, refreshing = 0) => {
               setAccounts(items);
               setSelectedIds([]);
               setPage(1);
+              if (!refreshProgressId) return;
+
+              setIsRefreshing(true);
+              setProgress({
+                visible: true,
+                current: 0,
+                total: refreshing,
+                message: "正在后台刷新导入账号...",
+                email: "",
+              });
+              void pollRefreshProgress(refreshProgressId, (refreshProgress) => {
+                setProgress((previous) => ({
+                  ...previous,
+                  current: refreshProgress.processed,
+                  total: refreshProgress.total,
+                }));
+                if (refreshProgress.done && refreshProgress.result) {
+                  setAccounts(refreshProgress.result.items);
+                  const failed = refreshProgress.result.errors?.length ?? 0;
+                  if (failed > 0) {
+                    toast.error(`导入账号刷新完成，成功 ${refreshProgress.result.refreshed} 个，失败 ${failed} 个`);
+                  } else {
+                    toast.success(`导入账号刷新完成，共刷新 ${refreshProgress.result.refreshed} 个`);
+                  }
+                }
+              })
+                .catch((error) => {
+                  toast.error(error instanceof Error ? error.message : "导入账号后台刷新失败");
+                })
+                .finally(() => {
+                  setIsRefreshing(false);
+                  setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
+                });
             }}
           />
           <Button
