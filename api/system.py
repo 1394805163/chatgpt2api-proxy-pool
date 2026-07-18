@@ -113,8 +113,16 @@ def create_router(app_version: str) -> APIRouter:
     async def get_image(image_path: str):
         return get_image_response(image_path)
 
+    @router.head("/images/{image_path:path}", include_in_schema=False)
+    async def head_image(image_path: str):
+        return get_image_response(image_path)
+
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
+        return get_thumbnail_response(image_path)
+
+    @router.head("/image-thumbnails/{image_path:path}", include_in_schema=False)
+    async def head_image_thumbnail(image_path: str):
         return get_thumbnail_response(image_path)
 
     @router.post("/api/images/delete")
