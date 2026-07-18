@@ -1433,7 +1433,7 @@ class AccountService:
 
             client = OpenAIBackendAPI(token)
             try:
-                return client.get_user_info()
+                return client.get_user_info(request_workers=1)
             finally:
                 client.session.close()
 

@@ -339,24 +339,30 @@ class OpenAIBackendAPI:
         })
         return default_account
 
-    def get_user_info(self) -> Dict[str, Any]:
+    def get_user_info(self, request_workers: int = 3) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        executor = ThreadPoolExecutor(max_workers=3)
-        try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
-        except (KeyboardInterrupt, SystemExit):
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
+        request_workers = max(1, min(3, int(request_workers or 1)))
+        if request_workers == 1:
+            me_payload = self._get_me()
+            init_payload = self._get_conversation_init()
+            default_account = self._get_default_account()
         else:
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor = ThreadPoolExecutor(max_workers=request_workers)
+            try:
+                me_future = executor.submit(self._get_me)
+                init_future = executor.submit(self._get_conversation_init)
+                account_future = executor.submit(self._get_default_account)
+                me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+            except (KeyboardInterrupt, SystemExit):
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            except BaseException:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True, cancel_futures=True)
 
         plan_type = str(default_account.get("plan_type") or "free")
 

@@ -207,6 +207,7 @@ class AccountCapabilityTests(unittest.TestCase):
                 result = service.fetch_remote_info("token-1")
 
             self.assertEqual(result["quota"], 5)
+            backend.get_user_info.assert_called_once_with(request_workers=1)
             backend.session.close.assert_called_once_with()
 
     def test_free_cleanup_verifies_after_failure_threshold_and_marks_invalid_account(self) -> None:

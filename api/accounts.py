@@ -235,6 +235,7 @@ def create_router() -> APIRouter:
 
         async def _do_refresh():
             try:
+                await asyncio.sleep(0.5)
                 await run_in_threadpool(account_service.refresh_accounts, tokens, progress_id, False)
             except Exception as exc:
                 account_service.finish_refresh_progress(progress_id, error=str(exc))
