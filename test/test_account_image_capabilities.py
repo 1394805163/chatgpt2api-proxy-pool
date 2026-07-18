@@ -14,7 +14,7 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 from services.account_service import AccountService
 from services.auth_service import AuthService, DailyRequestQuotaExceeded, ImageRequestLimitExceeded
 from services.config import config
-from services.openai_backend_api import InvalidAccessTokenError
+from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
@@ -195,6 +195,68 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertLessEqual(peak_active, service._MAX_REFRESH_WORKERS)
             self.assertEqual(storage.save_accounts.call_count, 1)
 
+    def test_refresh_accounts_batch_timeout_finishes_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            tokens = [f"token-{index}" for index in range(4)]
+            service.add_accounts(tokens)
+            service._MAX_REFRESH_BATCH_SECONDS = 0.05
+            release = threading.Event()
+
+            def blocked_refresh(token: str, *args, **kwargs):
+                release.wait(timeout=2)
+                return service.get_account(token)
+
+            service.fetch_remote_info = blocked_refresh
+            started = time.monotonic()
+            with patch("services.account_service.log_service.add"):
+                result = service.refresh_accounts(tokens, progress_id="batch-timeout")
+            elapsed = time.monotonic() - started
+            release.set()
+
+            progress = service.get_refresh_progress("batch-timeout")
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(len(result["errors"]), len(tokens))
+            self.assertIsNotNone(progress)
+            self.assertTrue(progress["done"])
+            self.assertEqual(progress["processed"], len(tokens))
+
+    def test_scheduled_free_pool_check_uses_bounded_shared_refresh(self) -> None:
+        original_settings = copy.deepcopy(config.data.get("free_account_cleanup"))
+        config.data["free_account_cleanup"] = {
+            "enabled": True,
+            "action": "mark_abnormal",
+            "failure_threshold": 2,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+                service.add_account_items([
+                    {"access_token": "free-token", "type": "free", "status": "正常", "quota": 1}
+                ])
+                expected = {
+                    "refreshed": 1,
+                    "errors": [],
+                    "items": service.list_accounts(),
+                    "relogined": 0,
+                }
+
+                with patch.object(service, "refresh_accounts", return_value=expected) as refresh:
+                    result = service.refresh_normal_free_accounts(event="scheduled-free-check")
+
+                refresh.assert_called_once_with(
+                    ["free-token"],
+                    defer_invalid_removal=False,
+                    cleanup_action="mark_abnormal",
+                    event="scheduled-free-check",
+                )
+                self.assertEqual(result["checked"], 1)
+        finally:
+            if original_settings is None:
+                config.data.pop("free_account_cleanup", None)
+            else:
+                config.data["free_account_cleanup"] = original_settings
+
     def test_fetch_remote_info_closes_temporary_backend_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
@@ -207,8 +269,23 @@ class AccountCapabilityTests(unittest.TestCase):
                 result = service.fetch_remote_info("token-1")
 
             self.assertEqual(result["quota"], 5)
-            backend.get_user_info.assert_called_once_with(request_workers=1)
+            backend.get_user_info.assert_called_once_with(request_workers=1, timeout_secs=20.0)
             backend.session.close.assert_called_once_with()
+
+    def test_get_user_info_uses_one_shared_deadline(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "token"
+        backend._get_me = MagicMock(return_value={"email": "user@example.com", "id": "user-1"})
+        backend._get_conversation_init = MagicMock(return_value={"limits_progress": []})
+        backend._get_default_account = MagicMock(return_value={"plan_type": "free"})
+
+        with patch("services.openai_backend_api.time.monotonic", side_effect=[0.0, 0.0, 30.0, 44.0]):
+            result = backend.get_user_info(request_workers=1, timeout_secs=45.0)
+
+        self.assertEqual(result["email"], "user@example.com")
+        backend._get_me.assert_called_once_with(20.0)
+        backend._get_conversation_init.assert_called_once_with(15.0)
+        backend._get_default_account.assert_called_once_with(1.0)
 
     def test_free_cleanup_verifies_after_failure_threshold_and_marks_invalid_account(self) -> None:
         original_settings = copy.deepcopy(config.data.get("free_account_cleanup"))

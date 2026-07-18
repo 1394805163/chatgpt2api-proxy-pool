@@ -95,6 +95,10 @@ const metricCards = [
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
+function isProgressUnavailable(error: unknown) {
+  return error instanceof Error && error.message.toLowerCase().includes("progress not found");
+}
+
 function isUnlimitedImageQuotaAccount(account: Account) {
   return account.type === "pro" || account.type === "prolite";
 }
@@ -365,6 +369,11 @@ function AccountsPageContent() {
           }
         });
       } catch (error) {
+        if (isProgressUnavailable(error)) {
+          await loadAccounts(true);
+          toast.info("服务重启导致刷新进度中断，已重新读取账号信息");
+          return;
+        }
         const message = error instanceof Error ? error.message : "刷新账户失败";
         toast.error(message);
       } finally {
@@ -522,6 +531,11 @@ function AccountsPageContent() {
     } catch (error) {
       setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
       setRefreshSummary(null);
+      if (isProgressUnavailable(error)) {
+        await loadAccounts(true);
+        toast.info("服务重启导致刷新进度中断，已重新读取账号信息");
+        return;
+      }
       const message = error instanceof Error ? error.message : "刷新账户失败";
       toast.error(message);
     } finally {
@@ -798,7 +812,7 @@ function AccountsPageContent() {
               })
                 .catch(async (error) => {
                   const message = error instanceof Error ? error.message : "导入账号后台刷新失败";
-                  if (message.toLowerCase().includes("progress not found")) {
+                  if (isProgressUnavailable(error)) {
                     await loadAccounts(true);
                     toast.info("账号已导入；服务重启导致刷新进度不可用，已重新读取号池");
                     return;

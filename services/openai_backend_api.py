@@ -298,14 +298,18 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
-    def _get_me(self) -> Dict[str, Any]:
+    def _get_me(self, timeout_secs: float = 20.0) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = self.session.get(
+            self.base_url + path,
+            headers=self._headers(path),
+            timeout=max(0.1, float(timeout_secs)),
+        )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_conversation_init(self) -> Dict[str, Any]:
+    def _get_conversation_init(self, timeout_secs: float = 20.0) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
         response = self.session.post(
             self.base_url + path,
@@ -316,16 +320,19 @@ class OpenAIBackendAPI:
                 "conversation_id": None,
                 "timezone_offset_min": -480,
             },
-            timeout=20,
+            timeout=max(0.1, float(timeout_secs)),
         )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_default_account(self) -> Dict[str, Any]:
+    def _get_default_account(self, timeout_secs: float = 20.0) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
+        response = self.session.get(
+            self.base_url + path + "?timezone_offset_min=-480",
+            headers=self._headers(path),
+            timeout=max(0.1, float(timeout_secs)),
+        )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -341,22 +348,33 @@ class OpenAIBackendAPI:
         })
         return default_account
 
-    def get_user_info(self, request_workers: int = 3) -> Dict[str, Any]:
+    def get_user_info(self, request_workers: int = 3, timeout_secs: float = 45.0) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
+        deadline = time.monotonic() + max(0.1, float(timeout_secs))
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError(f"account info request exceeded {timeout_secs:g} seconds")
+            return max(0.1, value)
+
         request_workers = max(1, min(3, int(request_workers or 1)))
         if request_workers == 1:
-            me_payload = self._get_me()
-            init_payload = self._get_conversation_init()
-            default_account = self._get_default_account()
+            me_payload = self._get_me(min(20.0, remaining()))
+            init_payload = self._get_conversation_init(min(20.0, remaining()))
+            default_account = self._get_default_account(min(20.0, remaining()))
         else:
             executor = ThreadPoolExecutor(max_workers=request_workers)
             try:
-                me_future = executor.submit(self._get_me)
-                init_future = executor.submit(self._get_conversation_init)
-                account_future = executor.submit(self._get_default_account)
-                me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+                request_timeout = min(20.0, remaining())
+                me_future = executor.submit(self._get_me, request_timeout)
+                init_future = executor.submit(self._get_conversation_init, request_timeout)
+                account_future = executor.submit(self._get_default_account, request_timeout)
+                me_payload = me_future.result(timeout=remaining())
+                init_payload = init_future.result(timeout=remaining())
+                default_account = account_future.result(timeout=remaining())
             except (KeyboardInterrupt, SystemExit):
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise

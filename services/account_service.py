@@ -5,7 +5,7 @@ import json
 import secrets
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Condition, Lock, Thread
@@ -31,6 +31,9 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
+    _ACCOUNT_REFRESH_TIMEOUT_SECONDS = 45.0
+    _TOKEN_REFRESH_REQUEST_TIMEOUT_SECONDS = 12.0
+    _MAX_REFRESH_BATCH_SECONDS = 10 * 60.0
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
     _OAUTH_USER_AGENT = (
@@ -378,7 +381,12 @@ class AccountService:
         due_at = anchor + timedelta(seconds=self._REFRESH_TOKEN_KEEPALIVE_SECONDS)
         return due_at if due_at <= now else None
 
-    def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None) -> dict[str, str]:
+    def _request_access_token_refresh(
+        self,
+        refresh_token: str,
+        account: dict | None = None,
+        timeout_secs: float = 60.0,
+    ) -> dict[str, str]:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
@@ -396,7 +404,7 @@ class AccountService:
                     "refresh_token": refresh_token,
                     "client_id": self._OAUTH_CLIENT_ID,
                 },
-                timeout=60,
+                timeout=max(0.1, float(timeout_secs)),
             )
             data = response.json() if response.text else {}
             if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
@@ -460,10 +468,35 @@ class AccountService:
         )
         return new_token
 
-    def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
+    def refresh_access_token(
+        self,
+        access_token: str,
+        *,
+        force: bool = False,
+        event: str = "refresh_access_token",
+        request_timeout_secs: float | None = None,
+    ) -> str:
         if not access_token:
             return ""
-        with self._token_refresh_lock:
+        deadline = (
+            time.monotonic() + max(0.1, float(request_timeout_secs))
+            if request_timeout_secs is not None
+            else None
+        )
+
+        def remaining() -> float:
+            if deadline is None:
+                return 60.0
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError("access token refresh timed out")
+            return max(0.1, value)
+
+        if deadline is None:
+            self._token_refresh_lock.acquire()
+        elif not self._token_refresh_lock.acquire(timeout=remaining()):
+            raise TimeoutError("access token refresh lock timed out")
+        try:
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 return access_token
@@ -476,7 +509,11 @@ class AccountService:
             if not force and self._recent_token_refresh_error(account):
                 return active_token
             try:
-                token_data = self._request_access_token_refresh(refresh_token, account)
+                token_data = self._request_access_token_refresh(
+                    refresh_token,
+                    account,
+                    timeout_secs=remaining(),
+                )
             except Exception as exc:
                 error_str = str(exc or "")
                 self._record_token_refresh_error(active_token, event, error_str)
@@ -495,6 +532,8 @@ class AccountService:
                         t.start()
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
+        finally:
+            self._token_refresh_lock.release()
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -1428,21 +1467,54 @@ class AccountService:
         if not access_token:
             raise ValueError("access_token is required")
 
+        deadline = time.monotonic() + self._ACCOUNT_REFRESH_TIMEOUT_SECONDS
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError(
+                    f"account refresh exceeded {self._ACCOUNT_REFRESH_TIMEOUT_SECONDS:g} seconds"
+                )
+            return max(0.1, value)
+
         def get_user_info(token: str) -> dict[str, Any]:
-            from services.openai_backend_api import OpenAIBackendAPI
+            from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 
-            client = OpenAIBackendAPI(token)
-            try:
-                return client.get_user_info(request_workers=1)
-            finally:
-                client.session.close()
+            last_error: Exception | None = None
+            for attempt in range(2):
+                client = OpenAIBackendAPI(token)
+                try:
+                    return client.get_user_info(
+                        request_workers=1,
+                        timeout_secs=min(20.0, remaining()),
+                    )
+                except InvalidAccessTokenError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    if attempt == 0 and remaining() > 1.0:
+                        time.sleep(min(0.25, remaining()))
+                        continue
+                    raise
+                finally:
+                    client.session.close()
+            raise last_error or RuntimeError("account info request failed")
 
-        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        active_token = self.refresh_access_token(
+            access_token,
+            event=f"{event}:preflight",
+            request_timeout_secs=min(self._TOKEN_REFRESH_REQUEST_TIMEOUT_SECONDS, remaining()),
+        ) or access_token
         try:
             from services.openai_backend_api import InvalidAccessTokenError
             result = get_user_info(active_token)
         except InvalidAccessTokenError as exc:
-            refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
+            refreshed_token = self.refresh_access_token(
+                active_token,
+                force=True,
+                event=f"{event}:invalid_access_token",
+                request_timeout_secs=min(self._TOKEN_REFRESH_REQUEST_TIMEOUT_SECONDS, remaining()),
+            )
             if refreshed_token and refreshed_token != active_token:
                 try:
                     result = get_user_info(refreshed_token)
@@ -1665,23 +1737,29 @@ class AccountService:
         refreshed = 0
         errors = []
         max_workers = min(self._MAX_REFRESH_WORKERS, len(access_tokens))
+        waves = (len(access_tokens) + max_workers - 1) // max_workers
+        batch_timeout = min(
+            self._MAX_REFRESH_BATCH_SECONDS,
+            max(60.0, waves * self._ACCOUNT_REFRESH_TIMEOUT_SECONDS + 15.0),
+        )
 
         if progress_id:
             self.init_refresh_progress(progress_id, len(access_tokens))
 
         self._begin_account_save_batch()
         executor = ThreadPoolExecutor(max_workers=max_workers)
+        batch_timed_out = False
         try:
             futures = {
                 executor.submit(self.fetch_remote_info, token, event, defer_invalid_removal, cleanup_action): token
                 for token in access_tokens
             }
-            for future in as_completed(futures):
-                token = futures[future]
+
+            def consume_future(future, token: str) -> None:
+                nonlocal refreshed
                 try:
                     account = future.result()
                 except (KeyboardInterrupt, SystemExit):
-                    executor.shutdown(wait=False, cancel_futures=True)
                     raise
                 except Exception as exc:
                     error_str = str(exc)
@@ -1695,13 +1773,41 @@ class AccountService:
 
                 if progress_id:
                     self.update_refresh_progress(progress_id, token)
+
+            processed_futures = set()
+            try:
+                for future in as_completed(futures, timeout=batch_timeout):
+                    processed_futures.add(future)
+                    consume_future(future, futures[future])
+            except FuturesTimeoutError:
+                batch_timed_out = True
+                pending_count = 0
+                for future, token in futures.items():
+                    if future in processed_futures:
+                        continue
+                    if future.done():
+                        consume_future(future, token)
+                        continue
+                    pending_count += 1
+                    future.cancel()
+                    errors.append({
+                        "token": anonymize_token(token),
+                        "error": f"account refresh batch exceeded {batch_timeout:g} seconds",
+                    })
+                    if progress_id:
+                        self.update_refresh_progress(progress_id, token)
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "账号批量刷新达到总时限",
+                    {"source": event, "pending": pending_count, "timeout_secs": batch_timeout},
+                )
         except (KeyboardInterrupt, SystemExit):
             if progress_id:
                 self.finish_refresh_progress(progress_id, error="cancelled")
             executor.shutdown(wait=False, cancel_futures=True)
             raise
         else:
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor.shutdown(wait=not batch_timed_out, cancel_futures=batch_timed_out)
         finally:
             self._end_account_save_batch()
 

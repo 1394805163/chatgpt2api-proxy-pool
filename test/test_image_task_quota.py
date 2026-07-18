@@ -25,6 +25,12 @@ def wait_for_status(
         items = service.list_tasks(identity, [task_id])["items"]
         last = items[0] if items else None
         if last and last.get("status") == status:
+            key = f"{identity.get('id')}:{task_id}"
+            with service._lock:
+                thread = service._threads.get(key)
+            if status in {"success", "error"} and thread is not None and thread.is_alive():
+                time.sleep(0.02)
+                continue
             return last
         time.sleep(0.02)
     raise AssertionError(f"task {task_id} did not reach {status}: {last}")
