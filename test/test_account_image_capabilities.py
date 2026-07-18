@@ -195,6 +195,28 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertLessEqual(peak_active, service._MAX_REFRESH_WORKERS)
             self.assertEqual(storage.save_accounts.call_count, 1)
 
+    def test_overlapping_refresh_batches_persist_when_each_batch_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            storage = JSONStorageBackend(Path(tmp_dir) / "accounts.json")
+            service = AccountService(storage)
+            service.add_accounts(["token-1"])
+            original_save = storage.save_accounts
+            storage.save_accounts = MagicMock(wraps=original_save)
+
+            service._begin_account_save_batch()
+            service._begin_account_save_batch()
+            service.update_account("token-1", {"quota": 3})
+            service._end_account_save_batch()
+
+            self.assertEqual(storage.save_accounts.call_count, 1)
+            self.assertEqual(service._account_save_batch_depth, 1)
+
+            service.update_account("token-1", {"quota": 2})
+            service._end_account_save_batch()
+
+            self.assertEqual(storage.save_accounts.call_count, 2)
+            self.assertEqual(service._account_save_batch_depth, 0)
+
     def test_refresh_accounts_batch_timeout_finishes_progress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))

@@ -143,7 +143,7 @@ class AccountService:
     def _end_account_save_batch(self) -> None:
         with self._lock:
             self._account_save_batch_depth = max(0, self._account_save_batch_depth - 1)
-            if self._account_save_batch_depth == 0 and self._account_save_pending:
+            if self._account_save_pending:
                 self._account_save_pending = False
                 self.storage.save_accounts(list(self._accounts.values()))
 
