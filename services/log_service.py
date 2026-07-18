@@ -463,26 +463,60 @@ class LoggedCall:
     started: float = field(default_factory=time.time)
     request_text: str = ""
     request_shape: dict[str, int] | None = None
+    quota_reservation_id: str = field(default_factory=lambda: uuid4().hex)
+    _quota_reserved: bool = field(default=False, init=False, repr=False)
+
+    def _reserve_quota(self) -> None:
+        from services.auth_service import auth_service
+
+        self._quota_reserved = auth_service.reserve_daily_request(self.identity, self.quota_reservation_id)
+
+    def _finish_quota(self, success: bool) -> None:
+        if not self._quota_reserved:
+            return
+        try:
+            from services.auth_service import auth_service
+
+            auth_service.finish_daily_request(
+                self.identity,
+                self.quota_reservation_id,
+                success=success,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to update daily request usage: {exc}")
+            return
+        self._quota_reserved = False
 
     async def run(self, handler, *args, sse: str = "openai"):
+        from services.auth_service import DailyRequestQuotaExceeded
         from services.protocol.conversation import ImageGenerationError
+
+        try:
+            self._reserve_quota()
+        except DailyRequestQuotaExceeded as exc:
+            self.log("调用失败", status="failed", error=str(exc))
+            raise HTTPException(status_code=429, detail={"error": "daily request quota exhausted"}) from exc
 
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
+            self._finish_quota(True)
             self.log("调用完成", result)
             response = dict(result)
             response.pop("_account_email", None)
@@ -492,18 +526,22 @@ class LoggedCall:
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
+            self._finish_quota(True)
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
@@ -512,15 +550,15 @@ class LoggedCall:
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
-        failed = False
+        completed = False
         try:
             for item in items:
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
                 yield _strip_internal_response_fields(item)
+            completed = True
         except Exception as exc:
-            failed = True
             self.log(
                 "流式调用失败",
                 status="failed",
@@ -535,9 +573,12 @@ class LoggedCall:
                 raise ImageGenerationError(public_image_error_message(str(exc))) from exc
             raise
         finally:
-            if not failed:
+            if completed:
+                self._finish_quota(True)
                 self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          conversation_id=conversation_ids[0] if conversation_ids else "")
+            else:
+                self._finish_quota(False)
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:

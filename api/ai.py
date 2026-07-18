@@ -6,8 +6,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
-from api.support import require_identity, resolve_image_base_url
+from api.support import enforce_image_request_limit, require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
+from services.auth_service import DailyRequestQuotaExceeded
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
 from services.protocol import (
@@ -24,7 +25,7 @@ from services.protocol import (
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
-    n: int = Field(default=1, ge=1, le=4)
+    n: int = Field(default=1, ge=1, le=100)
     size: str | None = None
     quality: str = "auto"
     response_format: str = "b64_json"
@@ -95,6 +96,7 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
+        enforce_image_request_limit(identity, body.n)
         payload = body.model_dump(mode="python")
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
@@ -108,6 +110,7 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
+        enforce_image_request_limit(identity, int(payload.get("n") or 1))
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
@@ -192,26 +195,32 @@ def create_router() -> APIRouter:
     async def create_ppt_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         await filter_or_log(LoggedCall(identity, "/v1/ppt/generations", "gpt-5-5-thinking", "PPT生成任务", request_text=body.prompt), body.prompt)
-        return await run_in_threadpool(
-            editable_file_task_service.submit_ppt,
-            identity,
-            client_task_id=body.client_task_id or "",
-            prompt=body.prompt,
-            base64_images=body.base64_images,
-            base_url=resolve_image_base_url(request),
-        )
+        try:
+            return await run_in_threadpool(
+                editable_file_task_service.submit_ppt,
+                identity,
+                client_task_id=body.client_task_id or "",
+                prompt=body.prompt,
+                base64_images=body.base64_images,
+                base_url=resolve_image_base_url(request),
+            )
+        except DailyRequestQuotaExceeded as exc:
+            raise HTTPException(status_code=429, detail={"error": "daily request quota exhausted"}) from exc
 
     @router.post("/v1/psd/generations")
     async def create_psd_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         await filter_or_log(LoggedCall(identity, "/v1/psd/generations", "gpt-5-5-thinking", "PSD生成任务", request_text=body.prompt), body.prompt)
-        return await run_in_threadpool(
-            editable_file_task_service.submit_psd,
-            identity,
-            client_task_id=body.client_task_id or "",
-            prompt=body.prompt,
-            base64_images=body.base64_images,
-            base_url=resolve_image_base_url(request),
-        )
+        try:
+            return await run_in_threadpool(
+                editable_file_task_service.submit_psd,
+                identity,
+                client_task_id=body.client_task_id or "",
+                prompt=body.prompt,
+                base64_images=body.base64_images,
+                base_url=resolve_image_base_url(request),
+            )
+        except DailyRequestQuotaExceeded as exc:
+            raise HTTPException(status_code=429, detail={"error": "daily request quota exhausted"}) from exc
 
     return router

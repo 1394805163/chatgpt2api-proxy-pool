@@ -34,6 +34,11 @@ export default function LoginPage() {
         role: data.role,
         subjectId: data.subject_id,
         name: data.name,
+        dailyRequestLimit: data.daily_request_limit,
+        dailyRequestUsed: data.daily_request_used,
+        dailyRequestRemaining: data.daily_request_remaining,
+        dailyRequestDate: data.daily_request_date || "",
+        imageRequestLimit: data.image_request_limit,
       });
       router.replace(getDefaultRouteForRole(data.role));
     } catch (error) {

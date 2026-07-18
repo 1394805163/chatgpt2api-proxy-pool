@@ -1303,6 +1303,8 @@ def _generate_single_image(
         returned_result = False
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
+        if account_email and request.progress_callback:
+            request.progress_callback(f"account_email:{account_email}")
         logger.debug({
             "event": "image_account_lookup",
             "token_prefix": token[:12] + "..." if len(token) > 12 else token,

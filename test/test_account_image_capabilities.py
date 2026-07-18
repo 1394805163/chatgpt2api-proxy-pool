@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
 from services.account_service import AccountService
-from services.auth_service import AuthService
+from services.auth_service import AuthService, DailyRequestQuotaExceeded, ImageRequestLimitExceeded
 from services.config import config
 from services.openai_backend_api import InvalidAccessTokenError
 from services.storage.json_storage import JSONStorageBackend
@@ -299,6 +299,60 @@ class TokenLogTests(unittest.TestCase):
 
 
 class AuthServiceTests(unittest.TestCase):
+    def test_daily_request_quota_counts_only_successful_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            item, raw_key = service.create_key(role="user", name="Alice", daily_request_limit=2)
+            identity = service.authenticate(raw_key)
+            self.assertIsNotNone(identity)
+
+            service.reserve_daily_request(identity, "failed-request")
+            service.finish_daily_request(identity, "failed-request", success=False)
+            service.reserve_daily_request(identity, "success-1")
+            service.finish_daily_request(identity, "success-1", success=True)
+            service.reserve_daily_request(identity, "success-2")
+            service.finish_daily_request(identity, "success-2", success=True)
+
+            current = service.list_keys(role="user")[0]
+            self.assertEqual(current["daily_request_used"], 2)
+            self.assertEqual(current["daily_request_remaining"], 0)
+            with self.assertRaises(DailyRequestQuotaExceeded):
+                service.reserve_daily_request(identity, "blocked-request")
+            self.assertFalse(service.finish_daily_request(identity, "success-2", success=True))
+
+    def test_daily_request_quota_resets_on_new_configured_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            item, raw_key = service.create_key(role="user", name="Alice", daily_request_limit=1)
+            identity = service.authenticate(raw_key)
+            self.assertIsNotNone(identity)
+            service.reserve_daily_request(identity, "success")
+            service.finish_daily_request(identity, "success", success=True)
+            with service._lock:
+                index, stored = service._find_item_locked(str(item["id"]))
+                previous = dict(stored)
+                previous["daily_request_date"] = "2000-01-01"
+                service._items[index] = previous
+
+            service.reserve_daily_request(identity, "next-day")
+            service.finish_daily_request(identity, "next-day", success=True)
+
+            current = service.list_keys(role="user")[0]
+            self.assertEqual(current["daily_request_used"], 1)
+            self.assertEqual(current["daily_request_remaining"], 0)
+
+    def test_image_request_limit_is_per_user_key_and_admin_is_unlimited(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            _, raw_key = service.create_key(role="user", name="Alice", image_request_limit=3)
+            identity = service.authenticate(raw_key)
+            self.assertIsNotNone(identity)
+
+            service.validate_image_request(identity, 3)
+            with self.assertRaises(ImageRequestLimitExceeded):
+                service.validate_image_request(identity, 4)
+            service.validate_image_request({"id": "admin", "role": "admin"}, 100)
+
     def test_create_authenticate_disable_and_delete_user_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))

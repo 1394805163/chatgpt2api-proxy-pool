@@ -70,6 +70,11 @@ def create_router(app_version: str) -> APIRouter:
             "role": identity.get("role"),
             "subject_id": identity.get("id"),
             "name": identity.get("name"),
+            "daily_request_limit": identity.get("daily_request_limit", 0),
+            "daily_request_used": identity.get("daily_request_used", 0),
+            "daily_request_remaining": identity.get("daily_request_remaining"),
+            "daily_request_date": identity.get("daily_request_date"),
+            "image_request_limit": identity.get("image_request_limit", 100),
         }
 
     @router.get("/version")

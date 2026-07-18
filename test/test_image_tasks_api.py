@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
+from services.auth_service import DailyRequestQuotaExceeded, ImageRequestLimitExceeded
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -58,6 +59,16 @@ class FakeImageTaskService:
             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
         }
 
+    def resume_poll(self, _identity, task_id, extra_timeout_secs):
+        return {
+            "id": task_id,
+            "status": "running",
+            "mode": "generate",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
+            "extra_timeout_secs": extra_timeout_secs,
+        }
+
 
 class ImageTasksApiTests(unittest.TestCase):
     def setUp(self):
@@ -65,6 +76,13 @@ class ImageTasksApiTests(unittest.TestCase):
         self.service_patcher = mock.patch.object(image_tasks_module, "image_task_service", self.fake_service)
         self.service_patcher.start()
         self.addCleanup(self.service_patcher.stop)
+        self.identity_patcher = mock.patch.object(
+            image_tasks_module,
+            "require_identity",
+            return_value={"id": "test-admin", "name": "Test Admin", "role": "admin"},
+        )
+        self.identity_patcher.start()
+        self.addCleanup(self.identity_patcher.stop)
         app = FastAPI()
         app.include_router(image_tasks_module.create_router())
         self.client = TestClient(app)
@@ -125,6 +143,43 @@ class ImageTasksApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
         self.assertEqual(payload["missing_ids"], ["missing"])
+
+    def test_resume_poll_returns_running_task(self):
+        response = self.client.post(
+            "/api/image-tasks/task-1/resume-poll",
+            headers=AUTH_HEADERS,
+            json={"extra_timeout_secs": 30},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "running")
+
+    def test_resume_poll_maps_quota_and_active_limit_errors(self):
+        with mock.patch.object(
+            self.fake_service,
+            "resume_poll",
+            side_effect=DailyRequestQuotaExceeded("daily request quota exhausted"),
+        ):
+            quota_response = self.client.post(
+                "/api/image-tasks/task-1/resume-poll",
+                headers=AUTH_HEADERS,
+                json={"extra_timeout_secs": 30},
+            )
+
+        with mock.patch.object(
+            self.fake_service,
+            "resume_poll",
+            side_effect=ImageRequestLimitExceeded(2),
+        ):
+            limit_response = self.client.post(
+                "/api/image-tasks/task-1/resume-poll",
+                headers=AUTH_HEADERS,
+                json={"extra_timeout_secs": 30},
+            )
+
+        self.assertEqual(quota_response.status_code, 429, quota_response.text)
+        self.assertEqual(limit_response.status_code, 400, limit_response.text)
+        self.assertEqual(limit_response.json()["detail"]["limit"], 2)
 
 
 if __name__ == "__main__":

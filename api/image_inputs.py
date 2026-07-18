@@ -50,13 +50,13 @@ def _parse_bool(value: object) -> bool | None:
 
 
 def _parse_count(value: object) -> int:
-    """解析生成数量：保持图片接口的 1 到 4 限制。"""
+    """Parse an image count; per-key policy is enforced after authentication."""
     try:
         count = int(value or 1)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if count < 1 or count > 4:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
+    if count < 1 or count > 100:
+        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 100"})
     return count
 
 

@@ -30,6 +30,10 @@ class StorageBackend(ABC):
         """保存所有鉴权密钥数据"""
         pass
 
+    def save_auth_key(self, auth_key: dict[str, Any]) -> bool:
+        """Update one auth key when supported; file backends fall back to a full save."""
+        return False
+
     @abstractmethod
     def health_check(self) -> dict[str, Any]:
         """健康检查，返回存储后端状态"""

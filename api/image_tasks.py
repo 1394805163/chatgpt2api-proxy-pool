@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
+from services.auth_service import DailyRequestQuotaExceeded, ImageRequestLimitExceeded
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
 
@@ -65,6 +66,13 @@ def create_router() -> APIRouter:
                 quality=body.quality,
                 base_url=resolve_image_base_url(request),
             )
+        except DailyRequestQuotaExceeded as exc:
+            raise HTTPException(status_code=429, detail={"error": "daily request quota exhausted"}) from exc
+        except ImageRequestLimitExceeded as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "image request limit exceeded", "limit": exc.limit},
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
@@ -96,6 +104,13 @@ def create_router() -> APIRouter:
                 images=images,
                 masks=masks,
             )
+        except DailyRequestQuotaExceeded as exc:
+            raise HTTPException(status_code=429, detail={"error": "daily request quota exhausted"}) from exc
+        except ImageRequestLimitExceeded as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "image request limit exceeded", "limit": exc.limit},
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
@@ -114,6 +129,13 @@ def create_router() -> APIRouter:
                 task_id,
                 body.extra_timeout_secs,
             )
+        except DailyRequestQuotaExceeded as exc:
+            raise HTTPException(status_code=429, detail={"error": "daily request quota exhausted"}) from exc
+        except ImageRequestLimitExceeded as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "image request limit exceeded", "limit": exc.limit},
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 

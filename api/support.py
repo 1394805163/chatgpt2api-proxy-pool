@@ -7,7 +7,7 @@ import time
 from fastapi import HTTPException, Request
 
 from services.account_service import account_service
-from services.auth_service import auth_service
+from services.auth_service import ImageRequestLimitExceeded, auth_service
 from services.config import config
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -45,6 +45,16 @@ def require_admin(authorization: str | None) -> dict[str, object]:
     if identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail={"error": "需要管理员权限才能执行这个操作"})
     return identity
+
+
+def enforce_image_request_limit(identity: dict[str, object], count: int) -> None:
+    try:
+        auth_service.validate_image_request(identity, count)
+    except ImageRequestLimitExceeded as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "image request limit exceeded", "limit": exc.limit},
+        ) from exc
 
 
 def resolve_image_base_url(request: Request) -> str:

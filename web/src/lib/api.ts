@@ -323,6 +323,11 @@ export type LoginResponse = {
   role: AuthRole;
   subject_id: string;
   name: string;
+  daily_request_limit: number;
+  daily_request_used: number;
+  daily_request_remaining: number | null;
+  daily_request_date: string | null;
+  image_request_limit: number;
 };
 
 export type UserKey = {
@@ -332,6 +337,11 @@ export type UserKey = {
   enabled: boolean;
   created_at: string | null;
   last_used_at: string | null;
+  daily_request_limit: number;
+  daily_request_used: number;
+  daily_request_remaining: number | null;
+  daily_request_date: string | null;
+  image_request_limit: number;
 };
 
 export type OutlookPoolStats = {
@@ -773,14 +783,21 @@ export async function fetchUserKeys() {
   return httpRequest<{ items: UserKey[] }>("/api/auth/users");
 }
 
-export async function createUserKey(name: string) {
+export async function createUserKey(input: { name: string; daily_request_limit: number; image_request_limit: number }) {
   return httpRequest<{ item: UserKey; key: string; items: UserKey[] }>("/api/auth/users", {
     method: "POST",
-    body: { name },
+    body: input,
   });
 }
 
-export async function updateUserKey(keyId: string, updates: { enabled?: boolean; name?: string; key?: string }) {
+export async function updateUserKey(keyId: string, updates: {
+  enabled?: boolean;
+  name?: string;
+  key?: string;
+  daily_request_limit?: number;
+  image_request_limit?: number;
+  reset_daily_usage?: boolean;
+}) {
   return httpRequest<{ item: UserKey; items: UserKey[] }>(`/api/auth/users/${keyId}`, {
     method: "POST",
     body: updates,

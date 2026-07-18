@@ -8,12 +8,14 @@ from typing import Any
 from urllib.parse import quote
 
 from services.account_service import account_service
+from services.auth_service import auth_service
 from services.config import DATA_DIR
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
 from services.time_utils import utc_now_iso, utc_timestamp_iso
 from utils.helper import new_uuid
+from utils.log import logger
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -115,15 +117,29 @@ class EditableFileTaskService:
         task_id = _clean(client_task_id) or new_uuid()
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
+        quota_reservation_id = f"editable-task:{key}"
         now = _now_iso()
         with self._lock:
             if key in self._tasks:
                 return _public_task(self._tasks[key])
+            quota_reserved = auth_service.reserve_daily_request(identity, quota_reservation_id)
             ts = time.time()
-            self._tasks[key] = {"id": task_id, "owner_id": owner, "status": TASK_STATUS_QUEUED, "kind": kind, "model": EDITABLE_FILE_MODEL, "created_at": now, "updated_at": now, "created_ts": ts, "updated_ts": ts}
+            self._tasks[key] = {"id": task_id, "owner_id": owner, "status": TASK_STATUS_QUEUED, "kind": kind, "model": EDITABLE_FILE_MODEL, "created_at": now, "updated_at": now, "created_ts": ts, "updated_ts": ts, "quota_reservation_id": quota_reservation_id if quota_reserved else ""}
             task = dict(self._tasks[key])
-            self._save_locked()
-        threading.Thread(target=self._run_task, args=(key, kind, prompt, base64_images, dict(identity), base_url), name=f"{kind}-file-task-{task_id[:16]}", daemon=True).start()
+            try:
+                self._save_locked()
+            except Exception:
+                self._tasks.pop(key, None)
+                if quota_reserved:
+                    auth_service.finish_daily_request(identity, quota_reservation_id, success=False)
+                raise
+        try:
+            threading.Thread(target=self._run_task, args=(key, kind, prompt, base64_images, dict(identity), base_url), name=f"{kind}-file-task-{task_id[:16]}", daemon=True).start()
+        except BaseException:
+            if quota_reserved:
+                self._settle_quota(key, identity, success=False)
+            self._update_task(key, status=TASK_STATUS_ERROR, error="editable task failed to start")
+            raise
         return _public_task(task)
 
     def _run_task(self, key: str, kind: str, prompt: str, base64_images: list[str], identity: dict[str, object], base_url: str) -> None:
@@ -143,10 +159,12 @@ class EditableFileTaskService:
             account_service.mark_text_used(token)
             data = {"conversation_id": result.conversation_id, "primary_url": _file_url(result.primary_path, base_url), "zip_url": _file_url(result.zip_path, base_url)}
             self._update_task(key, status=TASK_STATUS_SUCCESS, result=data, account_email=account_email, error="", ended_ts=time.time())
+            self._settle_quota(key, identity, success=True)
             self._log_call(identity, kind, started, request_text(prompt), account_email=account_email, result=data)
         except Exception as exc:
             error = str(exc) or "editable file task failed"
             self._update_task(key, status=TASK_STATUS_ERROR, error=error, account_email=account_email, ended_ts=time.time())
+            self._settle_quota(key, identity, success=False)
             self._log_call(identity, kind, started, request_text(prompt), status="failed", error=error, account_email=account_email)
 
     def public_file_path(self, relative_path: str) -> Path:
@@ -165,6 +183,24 @@ class EditableFileTaskService:
             task.update(updates)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
+            self._save_locked()
+
+    def _settle_quota(self, key: str, identity: dict[str, object], *, success: bool) -> None:
+        with self._lock:
+            task = self._tasks.get(key)
+            reservation_id = _clean(task.get("quota_reservation_id")) if task else ""
+            if not reservation_id:
+                return
+        try:
+            auth_service.finish_daily_request(identity, reservation_id, success=success)
+        except Exception as exc:
+            logger.error(f"Failed to settle editable task daily usage: {exc}")
+            return
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None or _clean(task.get("quota_reservation_id")) != reservation_id:
+                return
+            task["quota_reservation_id"] = ""
             self._save_locked()
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
@@ -195,6 +231,9 @@ class EditableFileTaskService:
             for field in ("result", "error", "started_ts", "ended_ts"):
                 if item.get(field):
                     task[field] = item[field]
+            quota_reservation_id = _clean(item.get("quota_reservation_id"))
+            if quota_reservation_id:
+                task["quota_reservation_id"] = quota_reservation_id
             tasks[_task_key(owner, task_id)] = task
         return tasks
 
@@ -213,6 +252,7 @@ class EditableFileTaskService:
                 task["ended_ts"] = time.time()
                 task["updated_at"] = _now_iso()
                 task["updated_ts"] = time.time()
+                task["quota_reservation_id"] = ""
                 changed = True
         return changed
 

@@ -37,12 +37,17 @@ from services.sub2api_service import (
 
 class UserKeyCreateRequest(BaseModel):
     name: str = ""
+    daily_request_limit: int = Field(default=0, ge=0, le=1_000_000)
+    image_request_limit: int = Field(default=5, ge=1, le=100)
 
 
 class UserKeyUpdateRequest(BaseModel):
     name: str | None = None
     enabled: bool | None = None
     key: str | None = None
+    daily_request_limit: int | None = Field(default=None, ge=0, le=1_000_000)
+    image_request_limit: int | None = Field(default=None, ge=1, le=100)
+    reset_daily_usage: bool | None = None
 
 
 class AccountCreateRequest(BaseModel):
@@ -169,7 +174,12 @@ def create_router() -> APIRouter:
     async def create_user_key(body: UserKeyCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            item, raw_key = auth_service.create_key(role="user", name=body.name)
+            item, raw_key = auth_service.create_key(
+                role="user",
+                name=body.name,
+                daily_request_limit=body.daily_request_limit,
+                image_request_limit=body.image_request_limit,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         return {"item": item, "key": raw_key, "items": auth_service.list_keys(role="user")}
@@ -187,6 +197,9 @@ def create_router() -> APIRouter:
                 "name": body.name,
                 "enabled": body.enabled,
                 "key": body.key,
+                "daily_request_limit": body.daily_request_limit,
+                "image_request_limit": body.image_request_limit,
+                "reset_daily_usage": body.reset_daily_usage,
             }.items()
             if value is not None
         }

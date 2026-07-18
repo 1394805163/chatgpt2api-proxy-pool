@@ -85,6 +85,26 @@ class DatabaseStorageBackend(StorageBackend):
         """保存鉴权密钥数据到数据库"""
         self._save_rows(AuthKeyModel, auth_keys, "id", "key_id")
 
+    def save_auth_key(self, auth_key: dict[str, Any]) -> bool:
+        key_id = str(auth_key.get("id") or "").strip()
+        if not key_id:
+            return False
+        session = self.Session()
+        try:
+            row = session.query(AuthKeyModel).filter(AuthKeyModel.key_id == key_id).one_or_none()
+            payload = json.dumps(auth_key, ensure_ascii=False)
+            if row is None:
+                session.add(AuthKeyModel(key_id=key_id, data=payload))
+            else:
+                row.data = payload
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def save_log(self, item: dict[str, Any]) -> bool:
         log_id = str(item.get("id") or "").strip()
         if not log_id:

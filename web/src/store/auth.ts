@@ -9,6 +9,11 @@ export type StoredAuthSession = {
   role: AuthRole;
   subjectId: string;
   name: string;
+  dailyRequestLimit: number;
+  dailyRequestUsed: number;
+  dailyRequestRemaining: number | null;
+  dailyRequestDate: string;
+  imageRequestLimit: number;
 };
 
 export const AUTH_KEY_STORAGE_KEY = "chatgpt2api_auth_key";
@@ -36,6 +41,12 @@ function normalizeSession(value: unknown, fallbackKey = ""): StoredAuthSession |
     role,
     subjectId: String(candidate.subjectId || "").trim(),
     name: String(candidate.name || "").trim(),
+    dailyRequestLimit: Math.max(0, Number(candidate.dailyRequestLimit) || 0),
+    dailyRequestUsed: Math.max(0, Number(candidate.dailyRequestUsed) || 0),
+    dailyRequestRemaining:
+      candidate.dailyRequestRemaining == null ? null : Math.max(0, Number(candidate.dailyRequestRemaining) || 0),
+    dailyRequestDate: String(candidate.dailyRequestDate || "").trim(),
+    imageRequestLimit: Math.min(100, Math.max(1, Number(candidate.imageRequestLimit) || (role === "admin" ? 100 : 5))),
   };
 }
 
