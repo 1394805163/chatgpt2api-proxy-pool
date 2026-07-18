@@ -796,8 +796,14 @@ function AccountsPageContent() {
                   }
                 }
               })
-                .catch((error) => {
-                  toast.error(error instanceof Error ? error.message : "导入账号后台刷新失败");
+                .catch(async (error) => {
+                  const message = error instanceof Error ? error.message : "导入账号后台刷新失败";
+                  if (message.toLowerCase().includes("progress not found")) {
+                    await loadAccounts(true);
+                    toast.info("账号已导入；服务重启导致刷新进度不可用，已重新读取号池");
+                    return;
+                  }
+                  toast.error(message);
                 })
                 .finally(() => {
                   setIsRefreshing(false);

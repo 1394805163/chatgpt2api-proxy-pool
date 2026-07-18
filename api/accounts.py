@@ -245,6 +245,7 @@ def create_router() -> APIRouter:
             result = account_service.add_accounts(tokens)
 
         progress_id = str(uuid.uuid4())
+        account_service.init_refresh_progress(progress_id, len(tokens))
 
         async def _do_refresh():
             try:
@@ -281,6 +282,7 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
+        account_service.init_refresh_progress(progress_id, len(access_tokens))
 
         async def _do_refresh():
             try:
@@ -309,6 +311,7 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
+        account_service.init_relogin_progress(progress_id, len(access_tokens))
 
         async def _do_relogin():
             try:

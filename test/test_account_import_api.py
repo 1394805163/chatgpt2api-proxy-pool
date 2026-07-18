@@ -46,6 +46,7 @@ class AccountImportAPITests(unittest.TestCase):
                 self.assertEqual(payload["added"], 2)
                 self.assertEqual(payload["refreshing"], 2)
                 self.assertTrue(payload["refresh_progress_id"])
+                service.init_refresh_progress.assert_called_once_with(payload["refresh_progress_id"], 2)
                 self.assertTrue(refresh_started.wait(timeout=1))
                 release_refresh.set()
 
