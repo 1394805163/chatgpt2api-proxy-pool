@@ -47,6 +47,7 @@ RUN uv run playwright install --with-deps chromium-headless-shell \
 
 COPY main.py ./
 COPY VERSION ./
+COPY config.json ./
 COPY api ./api
 COPY services ./services
 COPY utils ./utils

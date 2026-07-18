@@ -13,7 +13,6 @@ web/node_modules
 assets
 README.md
 data
-config.json
 .env
 .env.*
 .learnings
