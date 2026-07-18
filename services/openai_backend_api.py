@@ -188,6 +188,7 @@ class OpenAIBackendAPI:
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
         self.image_deadline_ts: float | None = None
+        self.image_task_timeout_secs: float | None = None
         self.image_cancel_event: Any = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
@@ -224,16 +225,17 @@ class OpenAIBackendAPI:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
     def _ensure_image_task_active(self) -> None:
+        timeout_secs = getattr(self, "image_task_timeout_secs", None) or config.image_task_timeout_secs
         cancel_event = getattr(self, "image_cancel_event", None)
         is_cancelled = getattr(cancel_event, "is_set", None)
         if callable(is_cancelled) and is_cancelled():
             raise ImageTaskDeadlineError(
-                f"图片任务已达到 {config.image_task_timeout_secs:g} 秒总时限；已停止等待，请重新提交"
+                f"图片任务已达到 {timeout_secs:g} 秒总时限；已停止等待，请重新提交"
             )
         deadline_ts = getattr(self, "image_deadline_ts", None)
         if deadline_ts is not None and time.time() >= deadline_ts:
             raise ImageTaskDeadlineError(
-                f"图片任务已达到 {config.image_task_timeout_secs:g} 秒总时限；已停止等待，请重新提交"
+                f"图片任务已达到 {timeout_secs:g} 秒总时限；已停止等待，请重新提交"
             )
 
     def _image_request_timeout(self, default: float) -> float:

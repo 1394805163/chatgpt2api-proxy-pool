@@ -22,6 +22,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
     task_deadline_ts = body.get("task_deadline_ts")
+    task_timeout_secs = body.get("task_timeout_secs")
     cancel_event = body.get("cancel_event")
     outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
@@ -34,6 +35,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         message_as_error=True,
         progress_callback=progress_callback,
         task_deadline_ts=float(task_deadline_ts) if task_deadline_ts is not None else None,
+        task_timeout_secs=float(task_timeout_secs) if task_timeout_secs is not None else None,
         cancel_event=cancel_event,
     ))
     if body.get("stream"):

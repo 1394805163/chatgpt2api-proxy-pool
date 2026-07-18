@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
-from services.auth_service import ImageRequestLimitExceeded, auth_service
+from services.auth_service import USER_IMAGE_TASK_TIMEOUT_SECS, ImageRequestLimitExceeded, auth_service
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.time_utils import utc_now_iso, utc_timestamp_iso
@@ -352,6 +352,7 @@ class ImageTaskService:
             **payload,
             "progress_callback": progress_callback,
             "task_deadline_ts": started + max_duration,
+            "task_timeout_secs": max_duration,
             "cancel_event": cancel_event,
         }
         try:
@@ -452,7 +453,7 @@ class ImageTaskService:
 
     def _max_task_duration(self, identity: dict[str, object] | None = None) -> float:
         if identity and identity.get("role") == "user":
-            return 180.0
+            return USER_IMAGE_TASK_TIMEOUT_SECS
         try:
             return max(0.01, float(self.max_task_duration_getter()))
         except Exception:

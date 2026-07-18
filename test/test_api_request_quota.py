@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -98,6 +99,25 @@ class ApiRequestQuotaTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(response.json()["detail"]["limit"], 2)
         handler.assert_not_called()
+
+    def test_direct_user_image_request_uses_180_second_timeout(self) -> None:
+        started = time.time()
+        with mock.patch.object(
+            ai_api.openai_v1_image_generations,
+            "handle",
+            return_value={"created": 1, "data": [{"url": "https://example.test/image.png"}]},
+        ) as handler:
+            response = self.client.post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer user"},
+                json={"model": "gpt-image-2", "prompt": "one cat", "n": 1},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = handler.call_args.args[0]
+        self.assertEqual(payload["task_timeout_secs"], 180.0)
+        self.assertGreaterEqual(payload["task_deadline_ts"], started + 179.0)
+        self.assertLessEqual(payload["task_deadline_ts"], time.time() + 180.0)
 
 
 if __name__ == "__main__":

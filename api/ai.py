@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
@@ -8,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import enforce_image_request_limit, require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
-from services.auth_service import DailyRequestQuotaExceeded
+from services.auth_service import DailyRequestQuotaExceeded, USER_IMAGE_TASK_TIMEOUT_SECS
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
 from services.protocol import (
@@ -70,6 +72,13 @@ class EditableFileTaskRequest(BaseModel):
     client_task_id: str | None = None
 
 
+def apply_user_image_timeout(identity: dict[str, object], payload: dict[str, object]) -> None:
+    if identity.get("role") != "user":
+        return
+    payload["task_timeout_secs"] = USER_IMAGE_TASK_TIMEOUT_SECS
+    payload["task_deadline_ts"] = time.time() + USER_IMAGE_TASK_TIMEOUT_SECS
+
+
 async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
         await run_in_threadpool(check_request, text)
@@ -98,6 +107,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         enforce_image_request_limit(identity, body.n)
         payload = body.model_dump(mode="python")
+        apply_user_image_timeout(identity, payload)
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
@@ -118,6 +128,7 @@ def create_router() -> APIRouter:
         payload["images"] = await read_image_sources(image_sources)
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
+        apply_user_image_timeout(identity, payload)
         payload["base_url"] = resolve_image_base_url(request)
         return await call.run(openai_v1_image_edit.handle, payload)
 

@@ -339,7 +339,17 @@ class ConversationRequest:
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
     task_deadline_ts: float | None = None
+    task_timeout_secs: float | None = None
     cancel_event: Any = None  # threading.Event | None
+
+
+def _image_task_timeout_secs(request: ConversationRequest) -> float:
+    try:
+        if request.task_timeout_secs is not None:
+            return max(0.01, float(request.task_timeout_secs))
+    except (TypeError, ValueError):
+        pass
+    return max(0.01, float(config.image_task_timeout_secs))
 
 
 @dataclass
@@ -933,9 +943,9 @@ def stream_image_outputs(
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
     # 导致对话文档中尚未写入图片工具的响应记录。
-    poll_timeout = config.image_task_timeout_secs
+    poll_timeout = _image_task_timeout_secs(request)
     if is_text_reply and conversation_id:
-        # 文本回复场景也使用配置的轮询超时，避免设置页的值被隐藏放大。
+        # 文本回复场景使用当前请求的总时限，普通用户密钥固定为 180 秒。
         logger.info({
             "event": "image_text_reply_extended_poll",
             "conversation_id": conversation_id,
@@ -1018,8 +1028,8 @@ def stream_image_outputs(
                 "conversation_id": conversation_id,
                 "message_preview": message[:200],
             })
-            # 文本回复场景下仍按配置轮询，并允许短暂重试来处理临时网络问题。
-            retry_poll_timeout = config.image_task_timeout_secs
+            # 文本回复场景仍按当前请求时限轮询，并允许短暂重试来处理临时网络问题。
+            retry_poll_timeout = _image_task_timeout_secs(request)
             MAX_POLL_RETRIES = 3
             for poll_attempt in range(1, MAX_POLL_RETRIES + 1):
                 try:
@@ -1122,8 +1132,8 @@ def stream_image_outputs(
             })
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
-        # 按配置轮询，并允许短暂重试来处理临时网络问题或图片尚未提交的情况。
-        retry_poll_timeout = config.image_task_timeout_secs
+        # 按当前请求时限轮询，并允许短暂重试来处理临时网络问题或图片尚未提交的情况。
+        retry_poll_timeout = _image_task_timeout_secs(request)
         MAX_FALLBACK_POLL_RETRIES = 3
         for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
             retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
@@ -1315,6 +1325,7 @@ def _generate_single_image(
         try:
             backend = OpenAIBackendAPI(access_token=token)
             backend.image_deadline_ts = request.task_deadline_ts
+            backend.image_task_timeout_secs = _image_task_timeout_secs(request)
             backend.image_cancel_event = request.cancel_event
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback

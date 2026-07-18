@@ -72,6 +72,14 @@ class FakeStreamingResponse:
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_deadline_error_uses_request_timeout_label(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.image_task_timeout_secs = 180.0
+        backend.image_cancel_event = mock.Mock(is_set=mock.Mock(return_value=True))
+
+        with self.assertRaisesRegex(ImageTaskDeadlineError, "180 秒总时限"):
+            backend._ensure_image_task_active()
+
     def _picture_stream_backend(self, response: FakeStreamingResponse) -> OpenAIBackendAPI:
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "token-1"
@@ -252,6 +260,27 @@ class MultiImageResultTests(unittest.TestCase):
         backend.resolve_conversation_image_urls.assert_called_once()
         self.assertEqual(backend.resolve_conversation_image_urls.call_args.kwargs["poll_timeout_secs"], 150)
         self.assertTrue(any(output.kind == "result" for output in outputs))
+
+    def test_user_request_timeout_overrides_persisted_poll_timeout(self) -> None:
+        backend = FakeBackend()
+        backend.resolve_conversation_image_urls = mock.Mock(return_value=[])
+        events = [{"type": "conversation.completed", "conversation_id": "conv-1", "text": ""}]
+
+        with (
+            mock.patch.dict(config.data, {"image_task_timeout_secs": 70}),
+            mock.patch("services.protocol.conversation.conversation_events", return_value=iter(events)),
+            mock.patch("services.protocol.conversation._get_detailed_error_from_tasks", return_value=""),
+        ):
+            list(stream_image_outputs(
+                backend,
+                ConversationRequest(
+                    model="gpt-image-2",
+                    prompt="draw a cat",
+                    task_timeout_secs=180,
+                ),
+            ))
+
+        self.assertEqual(backend.resolve_conversation_image_urls.call_args.kwargs["poll_timeout_secs"], 180)
 
     def test_progress_event_does_not_block_poll_timeout_retry(self) -> None:
         attempts = 0
