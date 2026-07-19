@@ -98,14 +98,21 @@ class ConfigLoadingTests(unittest.TestCase):
 
             store = module.ConfigStore(path)
             self.assertEqual(store.image_task_timeout_secs, 70)
+            self.assertEqual(store.user_image_task_timeout_secs, 180)
 
-            updated = store.update({"image_task_timeout_secs": 150, "image_poll_timeout_secs": 70})
+            updated = store.update({
+                "image_task_timeout_secs": 150,
+                "image_poll_timeout_secs": 70,
+                "user_image_task_timeout_secs": 240,
+            })
 
             self.assertEqual(updated["image_task_timeout_secs"], 150)
             self.assertEqual(updated["image_poll_timeout_secs"], 150)
+            self.assertEqual(updated["user_image_task_timeout_secs"], 240)
             persisted = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["image_task_timeout_secs"], 150)
             self.assertEqual(persisted["image_poll_timeout_secs"], 150)
+            self.assertEqual(persisted["user_image_task_timeout_secs"], 240)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
   "image_retention_days": 10,
   "image_poll_timeout_secs": 180,
   "image_task_timeout_secs": 180,
+  "user_image_task_timeout_secs": 180,
   "auto_remove_rate_limited_accounts": false,
   "auto_remove_invalid_accounts": false,
   "log_levels": [

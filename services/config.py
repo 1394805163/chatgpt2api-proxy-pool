@@ -467,6 +467,13 @@ class ConfigStore:
             return 150.0
 
     @property
+    def user_image_task_timeout_secs(self) -> float:
+        try:
+            return max(1.0, float(self.data.get("user_image_task_timeout_secs", 180.0)))
+        except (TypeError, ValueError):
+            return 180.0
+
+    @property
     def image_poll_interval_secs(self) -> float:
         try:
             return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
@@ -620,6 +627,7 @@ class ConfigStore:
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_task_timeout_secs"] = self.image_task_timeout_secs
+        data["user_image_task_timeout_secs"] = self.user_image_task_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_timeout_retry_secs"] = self.image_timeout_retry_secs
@@ -676,6 +684,11 @@ class ConfigStore:
         # Keep the old key synchronized for cached/older frontends, but do not
         # allow it to create a second independent timeout policy.
         next_data["image_poll_timeout_secs"] = image_task_timeout
+        try:
+            user_image_task_timeout = max(1.0, float(next_data.get("user_image_task_timeout_secs", 180.0)))
+        except (TypeError, ValueError):
+            user_image_task_timeout = 180.0
+        next_data["user_image_task_timeout_secs"] = user_image_task_timeout
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

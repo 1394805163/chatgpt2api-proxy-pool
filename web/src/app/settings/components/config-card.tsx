@@ -26,6 +26,7 @@ export function ConfigCard() {
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImageTaskTimeoutSecs = useSettingsStore((state) => state.setImageTaskTimeoutSecs);
+  const setUserImageTaskTimeoutSecs = useSettingsStore((state) => state.setUserImageTaskTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
@@ -184,14 +185,24 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">自动删除多少天前的本地图片。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">图片任务总时限</label>
+            <label className="text-sm text-stone-700">管理员密钥图片等待时限</label>
             <Input
               value={String(config?.image_task_timeout_secs || "")}
               onChange={(event) => setImageTaskTimeoutSecs(event.target.value)}
               placeholder="150"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">单位秒，从任务提交开始计算；达到时限后停止等待并标记失败。</p>
+            <p className="text-xs text-stone-500">管理员密钥发起生图时使用，单位秒；达到时限后停止等待并标记失败。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">普通用户密钥图片等待时限</label>
+            <Input
+              value={String(config?.user_image_task_timeout_secs || "")}
+              onChange={(event) => setUserImageTaskTimeoutSecs(event.target.value)}
+              placeholder="180"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">所有普通用户密钥共用此服务端时限，接口调用无法绕过。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">单账号图片并发</label>

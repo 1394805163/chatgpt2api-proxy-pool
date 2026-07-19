@@ -15,7 +15,6 @@ from services.storage.base import StorageBackend
 AuthRole = Literal["admin", "user"]
 DEFAULT_IMAGE_REQUEST_LIMIT = 5
 MAX_IMAGE_REQUEST_LIMIT = 100
-USER_IMAGE_TASK_TIMEOUT_SECS = 180.0
 
 
 class DailyRequestQuotaExceeded(ValueError):

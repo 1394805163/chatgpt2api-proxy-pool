@@ -10,7 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import enforce_image_request_limit, require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
-from services.auth_service import DailyRequestQuotaExceeded, USER_IMAGE_TASK_TIMEOUT_SECS
+from services.auth_service import DailyRequestQuotaExceeded
+from services.config import config
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
 from services.protocol import (
@@ -22,6 +23,7 @@ from services.protocol import (
     openai_v1_response,
     openai_search,
 )
+from utils.helper import is_image_chat_request
 
 
 class ImageGenerationRequest(BaseModel):
@@ -75,8 +77,9 @@ class EditableFileTaskRequest(BaseModel):
 def apply_user_image_timeout(identity: dict[str, object], payload: dict[str, object]) -> None:
     if identity.get("role") != "user":
         return
-    payload["task_timeout_secs"] = USER_IMAGE_TASK_TIMEOUT_SECS
-    payload["task_deadline_ts"] = time.time() + USER_IMAGE_TASK_TIMEOUT_SECS
+    timeout_secs = config.user_image_task_timeout_secs
+    payload["task_timeout_secs"] = timeout_secs
+    payload["task_deadline_ts"] = time.time() + timeout_secs
 
 
 async def filter_or_log(call: LoggedCall, text: str) -> None:
@@ -136,6 +139,8 @@ def create_router() -> APIRouter:
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        if is_image_chat_request(payload):
+            apply_user_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("prompt"), payload.get("messages"))
         call = LoggedCall(
@@ -153,6 +158,8 @@ def create_router() -> APIRouter:
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        if not openai_v1_response.is_text_response_request(payload):
+            apply_user_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
         call = LoggedCall(

@@ -152,9 +152,9 @@ class ImageTaskServiceTests(unittest.TestCase):
                     "model": "gpt-image-2",
                     "created_at": "2026-01-01T00:00:00Z",
                     "updated_at": "2026-01-01T00:00:30Z",
-                    "created_ts": now - 200,
-                    "updated_ts": now - 190,
-                    "started_ts": now - 190,
+                    "created_ts": now - 240,
+                    "updated_ts": now - 230,
+                    "started_ts": now - 230,
                 }
 
             with mock.patch.dict(
@@ -162,6 +162,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 {
                     "image_poll_timeout_secs": 70,
                     "image_task_timeout_secs": 150,
+                    "user_image_task_timeout_secs": 180,
                     "image_poll_initial_wait_secs": 10,
                     "image_poll_interval_secs": 10,
                 },

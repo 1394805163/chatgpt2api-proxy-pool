@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from services.auth_service import AuthService, DailyRequestQuotaExceeded, ImageRequestLimitExceeded
+from services.config import config
 from services.image_task_service import ImageTaskService
 from services.storage.json_storage import JSONStorageBackend
 
@@ -90,14 +91,15 @@ class ImageTaskQuotaTests(unittest.TestCase):
             self.assertEqual(item["daily_request_used"], 1)
             self.assertEqual(item["daily_request_remaining"], 2)
 
-    def test_user_tasks_use_180_second_limit_and_admin_uses_global_limit(self) -> None:
+    def test_user_tasks_use_configured_limit_and_admin_uses_global_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             _, identity = make_identity(root)
             service = make_service(root / "tasks.json", lambda _payload: {"data": [{"url": "ok"}]})
 
-            self.assertEqual(service._max_task_duration(identity), 180.0)
-            self.assertEqual(service._max_task_duration({"id": "admin", "role": "admin"}), 0.05)
+            with mock.patch.dict(config.data, {"user_image_task_timeout_secs": 240}):
+                self.assertEqual(service._max_task_duration(identity), 240.0)
+                self.assertEqual(service._max_task_duration({"id": "admin", "role": "admin"}), 0.05)
 
     def test_selected_account_email_is_kept_as_internal_task_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -201,6 +201,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_retention_days: Number(config.image_retention_days || 30),
     image_poll_timeout_secs: Number(config.image_task_timeout_secs || 150),
     image_task_timeout_secs: Number(config.image_task_timeout_secs || 150),
+    user_image_task_timeout_secs: Number(config.user_image_task_timeout_secs || 180),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
     image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -344,6 +345,7 @@ type SettingsStore = {
   setDisplayTimezone: (value: string) => void;
   setImageRetentionDays: (value: string) => void;
   setImageTaskTimeoutSecs: (value: string) => void;
+  setUserImageTaskTimeoutSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
   setImageSettleEnabled: (value: boolean) => void;
   setImageCheckBeforeHitEnabled: (value: boolean) => void;
@@ -493,6 +495,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingConfig: true });
     try {
       const imageTaskTimeoutSecs = Math.max(1, Number(config.image_task_timeout_secs) || 150);
+      const userImageTaskTimeoutSecs = Math.max(1, Number(config.user_image_task_timeout_secs) || 180);
       const data = await updateSettingsConfig({
         ...config,
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
@@ -500,6 +503,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
         image_poll_timeout_secs: imageTaskTimeoutSecs,
         image_task_timeout_secs: imageTaskTimeoutSecs,
+        user_image_task_timeout_secs: userImageTaskTimeoutSecs,
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
         image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -609,6 +613,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageTaskTimeoutSecs: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_task_timeout_secs: value } } : {});
+  },
+
+  setUserImageTaskTimeoutSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, user_image_task_timeout_secs: value } } : {});
   },
 
   setImageAccountConcurrency: (value) => {

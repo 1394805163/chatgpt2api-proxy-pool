@@ -352,6 +352,16 @@ def _image_task_timeout_secs(request: ConversationRequest) -> float:
     return max(0.01, float(config.image_task_timeout_secs))
 
 
+def image_task_timing(body: dict[str, Any]) -> tuple[float | None, float | None]:
+    def optional_float(value: object) -> float | None:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return optional_float(body.get("task_deadline_ts")), optional_float(body.get("task_timeout_secs"))
+
+
 @dataclass
 class ConversationState:
     text: str = ""
