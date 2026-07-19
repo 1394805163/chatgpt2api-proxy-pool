@@ -42,6 +42,13 @@ class LogModel(Base):
     data = Column(Text, nullable=False)
 
 
+class SettingsModel(Base):
+    __tablename__ = "settings"
+
+    key_id = Column(String(64), primary_key=True)
+    data = Column(Text, nullable=False)
+
+
 class DatabaseStorageBackend(StorageBackend):
     """数据库存储后端（支持 SQLite、PostgreSQL、MySQL 等）"""
 
@@ -97,6 +104,37 @@ class DatabaseStorageBackend(StorageBackend):
                 session.add(AuthKeyModel(key_id=key_id, data=payload))
             else:
                 row.data = payload
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def load_settings(self) -> dict[str, Any]:
+        session = self.Session()
+        try:
+            row = session.query(SettingsModel).filter(SettingsModel.key_id == "service").one_or_none()
+            if row is None:
+                return {}
+            try:
+                data = json.loads(row.data)
+            except json.JSONDecodeError:
+                return {}
+            return data if isinstance(data, dict) else {}
+        finally:
+            session.close()
+
+    def save_settings(self, settings: dict[str, Any]) -> bool:
+        session = self.Session()
+        try:
+            session.merge(
+                SettingsModel(
+                    key_id="service",
+                    data=json.dumps(settings, ensure_ascii=False, separators=(",", ":")),
+                )
+            )
             session.commit()
             return True
         except Exception:

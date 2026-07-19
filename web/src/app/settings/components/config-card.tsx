@@ -92,7 +92,7 @@ export function ConfigCard() {
     <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
       <CardContent className="space-y-4 p-6">
         <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm leading-6 text-stone-600">
-          管理员登录密钥继续从部署配置读取，不再在此页面展示；如需分发给其他人，请在下方创建普通用户密钥。
+          此处是服务端设置：使用 PostgreSQL 时会写入数据库，重启或重新部署后仍然保留，并约束所有 API 请求。主题、布局等浏览器本地偏好不会写入这里。管理员登录密钥继续从部署配置读取；如需分发给其他人，请在下方创建普通用户密钥。
         </div>
         <div className="grid gap-4 md:grid-cols-2">
           <div className="space-y-2">

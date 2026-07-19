@@ -413,6 +413,18 @@ class ConfigStore:
     def _save(self) -> None:
         self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    @staticmethod
+    def _persistent_data(data: dict[str, object]) -> dict[str, object]:
+        persisted = copy.deepcopy(data)
+        persisted.pop("auth-key", None)
+        return persisted
+
+    def _restore_persisted_settings(self, backend: StorageBackend) -> None:
+        persisted = backend.load_settings()
+        if not isinstance(persisted, dict) or not persisted:
+            return
+        self.data = {**self.data, **persisted}
+
     @property
     def auth_key(self) -> str:
         return _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or self.data.get("auth-key"))
@@ -691,6 +703,9 @@ class ConfigStore:
                     incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
             next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
         next_data.pop("backup_state", None)
+        backend = self._storage_backend
+        if backend is not None:
+            backend.save_settings(self._persistent_data(next_data))
         self.data = next_data
         self._save()
         return self.get()
@@ -709,6 +724,7 @@ class ConfigStore:
         if self._storage_backend is None:
             from services.storage.factory import create_storage_backend
             self._storage_backend = create_storage_backend(DATA_DIR)
+            self._restore_persisted_settings(self._storage_backend)
         return self._storage_backend
 
 

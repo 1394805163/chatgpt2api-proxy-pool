@@ -1,10 +1,11 @@
 {
   "auth-key": "12345678",
   "refresh_account_interval_minute": 5,
-  "image_retention_days": 15,
-  "image_poll_timeout_secs": 70,
-  "auto_remove_rate_limited_accounts": true,
-  "auto_remove_invalid_accounts": true,
+  "image_retention_days": 10,
+  "image_poll_timeout_secs": 180,
+  "image_task_timeout_secs": 180,
+  "auto_remove_rate_limited_accounts": false,
+  "auto_remove_invalid_accounts": false,
   "log_levels": [
     "debug",
     "error",
@@ -109,6 +110,6 @@
     "interval_minutes": 3,
     "failure_threshold": 2,
     "register_precheck_enabled": true,
-    "action": "delete"
+    "action": "mark_abnormal"
   }
 }
