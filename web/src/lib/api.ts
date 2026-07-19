@@ -279,6 +279,10 @@ export type ManagedImage = {
   width?: number;
   height?: number;
   tags?: string[];
+  browser_cached?: boolean;
+  server_available?: boolean;
+  cache_key?: string;
+  source_url?: string;
 };
 
 export type SystemLog = {

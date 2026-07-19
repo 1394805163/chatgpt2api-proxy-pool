@@ -18,6 +18,7 @@ import { deleteSystemLogs, fetchSystemLogs, type SystemLog } from "@/lib/api";
 import { formatDisplayDateTime } from "@/lib/display-time";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { useDisplayTimezone } from "@/lib/use-display-timezone";
+import { getBrowserCachedImageUrlMap, imageCacheKeyFromUrl } from "@/store/image-conversations";
 
 const LogType = {
   Call: "call",
@@ -39,9 +40,15 @@ function formatDuration(item: SystemLog) {
   return typeof value === "number" ? `${(value / 1000).toFixed(2)} s` : "-";
 }
 
-function getUrls(item: SystemLog | null) {
+function getUrls(item: SystemLog | null, cachedUrls?: Map<string, string>) {
   const urls = item?.detail?.urls;
-  return Array.isArray(urls) ? urls.filter((url): url is string => typeof url === "string") : [];
+  if (!Array.isArray(urls)) return [];
+  return urls
+    .filter((url): url is string => typeof url === "string")
+    .map((url) => {
+      const cacheKey = imageCacheKeyFromUrl(url);
+      return (cacheKey && cachedUrls?.get(cacheKey)) || url;
+    });
 }
 
 function getStatus(item: SystemLog) {
@@ -87,7 +94,8 @@ function LogsContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deletingItems, setDeletingItems] = useState<SystemLog[]>([]);
-  const detailUrls = getUrls(detailLog);
+  const [cachedImageUrls, setCachedImageUrls] = useState<Map<string, string>>(new Map());
+  const detailUrls = getUrls(detailLog, cachedImageUrls);
   const detailImages = detailUrls.map((url, index) => ({ id: `${index}`, src: url }));
   const isCallLog = type === LogType.Call;
   const pageSize = 10;
@@ -101,8 +109,12 @@ function LogsContent() {
   const loadLogs = async () => {
     setIsLoading(true);
     try {
-      const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate });
+      const [data, browserCache] = await Promise.all([
+        fetchSystemLogs({ type, start_date: startDate, end_date: endDate }),
+        getBrowserCachedImageUrlMap(),
+      ]);
       setItems(data.items);
+      setCachedImageUrls(browserCache);
       setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
       setPage(1);
     } catch (error) {
@@ -230,7 +242,7 @@ function LogsContent() {
               </TableHeader>
               <TableBody>
                 {currentRows.map((item) => {
-                  const urls = getUrls(item);
+                  const urls = getUrls(item, cachedImageUrls);
                   return (
                     <TableRow key={item.id} className="text-stone-600">
                       <TableCell>

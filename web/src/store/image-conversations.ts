@@ -63,6 +63,18 @@ export type ImageConversationStats = {
   running: number;
 };
 
+export type BrowserCachedImage = {
+  cacheKey: string;
+  taskId?: string;
+  sourceUrl?: string;
+  dataUrl: string;
+  name: string;
+  date: string;
+  size: number;
+  createdAt: string;
+  prompt: string;
+};
+
 const imageConversationStorage = localforage.createInstance({
   name: "chatgpt2api",
   storeName: "image_conversations",
@@ -237,6 +249,107 @@ async function readStoredImageConversations(): Promise<ImageConversation[]> {
 
 export async function listImageConversations(): Promise<ImageConversation[]> {
   return sortImageConversations(await readStoredImageConversations());
+}
+
+export function imageCacheKeyFromUrl(value: string | undefined): string | null {
+  const raw = String(value || "").trim();
+  if (!raw || raw.startsWith("data:")) return null;
+  try {
+    const url = new URL(raw, typeof window === "undefined" ? "https://local.invalid" : window.location.origin);
+    const marker = "/images/";
+    const markerIndex = url.pathname.indexOf(marker);
+    if (markerIndex >= 0) {
+      return `image:${decodeURIComponent(url.pathname.slice(markerIndex + marker.length))}`;
+    }
+    return `url:${url.href}`;
+  } catch {
+    return `url:${raw}`;
+  }
+}
+
+function browserCachedImageKey(image: StoredImage): string {
+  return imageCacheKeyFromUrl(image.url) || `task:${image.taskId || image.id}`;
+}
+
+function base64ByteLength(value: string): number {
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((value.length * 3) / 4) - padding);
+}
+
+function cachedImageName(sourceUrl: string | undefined, fallback: string): string {
+  if (!sourceUrl) return `${fallback}.png`;
+  try {
+    const url = new URL(sourceUrl, typeof window === "undefined" ? "https://local.invalid" : window.location.origin);
+    return decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) || `${fallback}.png`);
+  } catch {
+    return `${fallback}.png`;
+  }
+}
+
+function cachedImageDate(sourceUrl: string | undefined, createdAt: string): string {
+  const key = imageCacheKeyFromUrl(sourceUrl);
+  const pathDate = key?.match(/^image:(\d{4})\/(\d{2})\/(\d{2})\//);
+  if (pathDate) return `${pathDate[1]}-${pathDate[2]}-${pathDate[3]}`;
+  return createdAt.slice(0, 10);
+}
+
+export async function listBrowserCachedImages(): Promise<BrowserCachedImage[]> {
+  const items = await readStoredImageConversations();
+  const cached = new Map<string, BrowserCachedImage>();
+  for (const conversation of items) {
+    for (const turn of conversation.turns) {
+      for (const image of turn.images) {
+        const b64 = String(image.b64_json || "").trim();
+        if (!b64) continue;
+        const cacheKey = browserCachedImageKey(image);
+        const current = cached.get(cacheKey);
+        if (current && current.createdAt >= turn.createdAt) continue;
+        cached.set(cacheKey, {
+          cacheKey,
+          taskId: image.taskId,
+          sourceUrl: image.url,
+          dataUrl: `data:image/png;base64,${b64}`,
+          name: cachedImageName(image.url, image.taskId || image.id || "generated-image"),
+          date: cachedImageDate(image.url, turn.createdAt),
+          size: base64ByteLength(b64),
+          createdAt: turn.createdAt,
+          prompt: turn.prompt,
+        });
+      }
+    }
+  }
+  return [...cached.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function getBrowserCachedImageUrlMap(): Promise<Map<string, string>> {
+  return new Map((await listBrowserCachedImages()).map((image) => [image.cacheKey, image.dataUrl]));
+}
+
+export async function removeBrowserCachedImages(cacheKeys: string[]): Promise<number> {
+  const targets = new Set(cacheKeys);
+  if (targets.size === 0) return 0;
+  return queueImageConversationWrite(async () => {
+    const items = await readStoredImageConversations();
+    let removed = 0;
+    const nextItems = items.map((conversation) => ({
+      ...conversation,
+      turns: conversation.turns.map((turn) => ({
+        ...turn,
+        images: turn.images.map((image) => {
+          if (!image.b64_json || !targets.has(browserCachedImageKey(image))) return image;
+          removed += 1;
+          const nextImage = { ...image };
+          delete nextImage.b64_json;
+          delete nextImage.browserCachedAt;
+          return nextImage;
+        }),
+      })),
+    }));
+    if (removed > 0) {
+      await imageConversationStorage.setItem(IMAGE_CONVERSATIONS_KEY, sortImageConversations(nextItems));
+    }
+    return removed;
+  });
 }
 
 export async function saveImageConversations(conversations: ImageConversation[]): Promise<void> {

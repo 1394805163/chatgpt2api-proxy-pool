@@ -17,6 +17,7 @@ import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget,
 import { formatDisplayDateTime } from "@/lib/display-time";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { useDisplayTimezone } from "@/lib/use-display-timezone";
+import { imageCacheKeyFromUrl, listBrowserCachedImages, removeBrowserCachedImages } from "@/store/image-conversations";
 
 const LONG_PRESS_MS = 800;
 const IMAGE_MANAGER_CHECKBOX_CLASS = "border-stone-300 bg-white/80 dark:border-white/35 dark:bg-white/5 data-[state=checked]:border-stone-950 dark:data-[state=checked]:border-white";
@@ -26,7 +27,65 @@ function formatSize(size: number) {
 }
 
 function imageKey(item: ManagedImage) {
-  return item.rel || item.url;
+  return item.cache_key || item.rel || item.url;
+}
+
+function isWithinDateRange(date: string, startDate: string, endDate: string) {
+  return (!startDate || date >= startDate) && (!endDate || date <= endDate);
+}
+
+function downloadBrowserImage(item: ManagedImage) {
+  const link = document.createElement("a");
+  link.href = item.url;
+  link.download = item.name || "generated-image.png";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+async function mergeBrowserCachedImages(serverItems: ManagedImage[], startDate: string, endDate: string) {
+  const cachedItems = (await listBrowserCachedImages()).filter((item) =>
+    isWithinDateRange(item.date, startDate, endDate),
+  );
+  const cachedByKey = new Map(cachedItems.map((item) => [item.cacheKey, item]));
+  const serverKeys = new Set<string>();
+  const mergedServerItems = serverItems.map((item) => {
+    const cacheKey = imageCacheKeyFromUrl(item.url) || `image:${item.rel}`;
+    serverKeys.add(cacheKey);
+    const cached = cachedByKey.get(cacheKey);
+    return {
+      ...item,
+      cache_key: cacheKey,
+      server_available: true,
+      source_url: item.url,
+      ...(cached
+        ? {
+            url: cached.dataUrl,
+            thumbnail_url: cached.dataUrl,
+            browser_cached: true,
+          }
+        : {}),
+    } satisfies ManagedImage;
+  });
+  const browserOnlyItems = cachedItems
+    .filter((item) => !serverKeys.has(item.cacheKey))
+    .map((item) => ({
+      rel: item.cacheKey.startsWith("image:")
+        ? item.cacheKey.slice("image:".length)
+        : `browser-cache/${item.taskId || item.cacheKey.slice("task:".length)}.png`,
+      name: item.name,
+      date: item.date,
+      size: item.size,
+      url: item.dataUrl,
+      thumbnail_url: item.dataUrl,
+      created_at: item.createdAt,
+      tags: [],
+      browser_cached: true,
+      server_available: false,
+      cache_key: item.cacheKey,
+      source_url: item.sourceUrl,
+    } satisfies ManagedImage));
+  return [...mergedServerItems, ...browserOnlyItems].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
 function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
@@ -122,9 +181,10 @@ function ImageManagerContent() {
         fetchManagedImages({ start_date: startDate, end_date: endDate }),
         fetchImageTags(),
       ]);
-      setItems(data.items);
+      const mergedItems = await mergeBrowserCachedImages(data.items, startDate, endDate);
+      setItems(mergedItems);
       setAllTags(tagsData.tags);
-      setSelectedPaths((current) => current.filter((path) => data.items.some((item) => imageKey(item) === path)));
+      setSelectedPaths((current) => current.filter((path) => mergedItems.some((item) => imageKey(item) === path)));
       setPage(1);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "加载图片失败");
@@ -148,8 +208,13 @@ function ImageManagerContent() {
     if (!deleteTarget) return;
     setIsDeleting(true);
     try {
-      await deleteManagedImages({ paths: [deleteTarget.rel] });
-      setItems((prev) => prev.filter((item) => item.rel !== deleteTarget.rel));
+      if (deleteTarget.server_available !== false) {
+        await deleteManagedImages({ paths: [deleteTarget.rel] });
+      }
+      if (deleteTarget.cache_key) {
+        await removeBrowserCachedImages([deleteTarget.cache_key]);
+      }
+      setItems((prev) => prev.filter((item) => imageKey(item) !== imageKey(deleteTarget)));
       setSelectedPaths((prev) => prev.filter((p) => p !== imageKey(deleteTarget)));
       toast.success("图片已删除");
     } catch (error) {
@@ -161,6 +226,7 @@ function ImageManagerContent() {
   };
 
   const handleSetTags = async (item: ManagedImage, tags: string[]) => {
+    if (item.server_available === false) return;
     try {
       const result = await setImageTags(item.rel, tags);
       setItems((prev) => prev.map((i) => i.rel === item.rel ? { ...i, tags: result.tags } : i));
@@ -241,7 +307,19 @@ function ImageManagerContent() {
     if (!deleteMode || selectedCount === 0) return;
     setIsDeleting(true);
     try {
-      const data = await deleteManagedImages(deleteMode === "filtered" ? { start_date: startDate, end_date: endDate, all_matching: true } : { paths: selectedPaths });
+      const targets = deleteMode === "filtered"
+        ? items
+        : items.filter((item) => selectedSet.has(imageKey(item)));
+      const serverPaths = targets
+        .filter((item) => item.server_available !== false)
+        .map((item) => item.rel);
+      if (deleteMode === "filtered") {
+        await deleteManagedImages({ start_date: startDate, end_date: endDate, all_matching: true });
+      } else if (serverPaths.length > 0) {
+        await deleteManagedImages({ paths: serverPaths });
+      }
+      await removeBrowserCachedImages(targets.flatMap((item) => item.cache_key ? [item.cache_key] : []));
+      const data = { removed: targets.length };
       toast.success(`已删除 ${data.removed} 张图片`);
       setDeleteMode(null);
       setSelectedPaths([]);
@@ -254,12 +332,19 @@ function ImageManagerContent() {
   };
 
   const handleBatchDownload = async () => {
-    const paths = deleteMode === "filtered" ? items.map((item) => item.rel) : selectedPaths;
-    if (paths.length === 0) return;
+    const targets = deleteMode === "filtered"
+      ? items
+      : items.filter((item) => selectedSet.has(imageKey(item)));
+    if (targets.length === 0) return;
     setIsDownloading(true);
     try {
-      await downloadImages(paths);
-      toast.success(`已下载 ${paths.length} 张图片`);
+      const cached = targets.filter((item) => item.browser_cached);
+      const serverOnly = targets.filter((item) => !item.browser_cached && item.server_available !== false);
+      if (serverOnly.length > 0) {
+        await downloadImages(serverOnly.map((item) => item.rel));
+      }
+      cached.forEach(downloadBrowserImage);
+      toast.success(`已下载 ${targets.length} 张图片`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "下载失败");
     } finally {
@@ -268,6 +353,10 @@ function ImageManagerContent() {
   };
 
   const handleSingleDownload = async (item: ManagedImage) => {
+    if (item.browser_cached) {
+      downloadBrowserImage(item);
+      return;
+    }
     await downloadSingleImage(item.rel);
   };
 
@@ -425,7 +514,11 @@ function ImageManagerContent() {
                 if (!deleteStartDate) return;
                 try {
                   setIsDeleting(true);
-                  const r = await deleteManagedImages({ end_date: deleteStartDate, all_matching: true });
+                  const targets = items.filter((item) => item.date <= deleteStartDate);
+                  const serverResult = await deleteManagedImages({ end_date: deleteStartDate, all_matching: true });
+                  await removeBrowserCachedImages(targets.flatMap((item) => item.cache_key ? [item.cache_key] : []));
+                  const browserOnlyCount = targets.filter((item) => item.server_available === false).length;
+                  const r = { removed: serverResult.removed + browserOnlyCount };
                   toast.success(`已删除 ${r.removed} 张图片`);
                   setDeleteMode(null);
                   void loadStorage();
@@ -536,7 +629,7 @@ function ImageManagerContent() {
                         size="icon"
                         className="size-8 rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
                         onClick={() => {
-                          void navigator.clipboard.writeText(item.url);
+                          void navigator.clipboard.writeText(item.source_url || item.url);
                           toast.success("图片地址已复制");
                         }}
                       >
@@ -550,6 +643,7 @@ function ImageManagerContent() {
                     <span>{item.width && item.height ? `${item.width} x ${item.height}` : "-"}</span>
                   </div>
                   <div className="flex flex-wrap items-center gap-1">
+                    {item.browser_cached ? <Badge variant="outline" className="rounded-md text-[10px]">浏览器缓存</Badge> : null}
                     {(item.tags ?? []).map((tag) => (
                       <Badge key={tag} variant="secondary" className="gap-0.5 rounded-md py-0 pr-0.5 text-[10px]">
                         {tag}
@@ -567,7 +661,8 @@ function ImageManagerContent() {
                         <button
                           type="button"
                           className="inline-flex size-5 items-center justify-center rounded-full border border-dashed border-stone-300 text-stone-400 hover:border-stone-500 hover:text-stone-600"
-                          title="添加标签"
+                          title={item.server_available === false ? "本地缓存图片不支持服务端标签" : "添加标签"}
+                          disabled={item.server_available === false}
                         >
                           <Plus className="size-3" />
                         </button>
