@@ -58,11 +58,22 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class FakeStreamingResponse:
-    def __init__(self, close_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        close_error: Exception | None = None,
+        iter_error: Exception | None = None,
+        before_iter_error=None,
+    ) -> None:
         self.close_error = close_error
+        self.iter_error = iter_error
+        self.before_iter_error = before_iter_error
         self.close_calls = 0
 
     def iter_lines(self):
+        if self.iter_error is not None:
+            if self.before_iter_error is not None:
+                self.before_iter_error()
+            raise self.iter_error
         yield b"data: [DONE]\n"
 
     def close(self) -> None:
@@ -109,6 +120,42 @@ class MultiImageResultTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "unexpected close failure"):
             list(backend._stream_picture_conversation("cat", "gpt-image-2", []))
+
+    def test_picture_stream_maps_deadline_iter_write_error_to_task_timeout(self) -> None:
+        deadline_reached = False
+
+        def reach_deadline() -> None:
+            nonlocal deadline_reached
+            deadline_reached = True
+
+        def ensure_active() -> None:
+            if deadline_reached:
+                raise ImageTaskDeadlineError("图片任务已达到 180 秒总时限；已停止等待，请重新提交")
+
+        response = FakeStreamingResponse(
+            iter_error=RuntimeError(
+                "Failed to perform, curl: (23) client returned ERROR on write of 45 bytes."
+            ),
+            before_iter_error=reach_deadline,
+        )
+        backend = self._picture_stream_backend(response)
+        backend._ensure_image_task_active = mock.Mock(side_effect=ensure_active)
+
+        with self.assertRaisesRegex(ImageTaskDeadlineError, "180 秒总时限"):
+            list(backend._stream_picture_conversation("cat", "gpt-image-2", []))
+
+        self.assertEqual(response.close_calls, 1)
+
+    def test_picture_stream_keeps_active_iter_write_error(self) -> None:
+        response = FakeStreamingResponse(iter_error=RuntimeError(
+            "Failed to perform, curl: (23) client returned ERROR on write of 45 bytes."
+        ))
+        backend = self._picture_stream_backend(response)
+
+        with self.assertRaisesRegex(RuntimeError, r"curl: \(23\)"):
+            list(backend._stream_picture_conversation("cat", "gpt-image-2", []))
+
+        self.assertEqual(response.close_calls, 1)
 
     def test_task_deadline_releases_account_slot_without_marking_failure(self) -> None:
         with (

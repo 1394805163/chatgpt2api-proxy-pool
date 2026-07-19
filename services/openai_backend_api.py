@@ -46,13 +46,17 @@ class ImageContentPolicyError(RuntimeError):
     pass
 
 
+def _is_curl_stream_write_error(error: object) -> bool:
+    text = str(error or "").lower()
+    return "curl: (23)" in text and "error on write" in text
+
+
 def _close_stream_response(response: requests.Response, context: str) -> None:
     """Close a curl_cffi stream without surfacing its intentional abort error."""
     try:
         response.close()
     except Exception as exc:
-        error = str(exc).lower()
-        if "curl: (23)" not in error or "error on write" not in error:
+        if not _is_curl_stream_write_error(exc):
             raise
         logger.debug({
             "event": "stream_close_write_error_suppressed",
@@ -2665,6 +2669,13 @@ class OpenAIBackendAPI:
         try:
             yield from iter_sse_payloads(response, abort_check=self._ensure_image_task_active)
             self._ensure_image_task_active()
+        except Exception as exc:
+            if _is_curl_stream_write_error(exc):
+                # Closing curl_cffi from the deadline thread interrupts iter_lines()
+                # with CURLE_WRITE_ERROR. Re-check the task state so callers receive
+                # the intended timeout/cancel error instead of a misleading curl 23.
+                self._ensure_image_task_active()
+            raise
         finally:
             stop_closer.set()
             _close_stream_response(response, "image_generation")
