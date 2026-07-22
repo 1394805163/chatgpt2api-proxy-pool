@@ -96,6 +96,7 @@
   },
   "image_settle_enabled": true,
   "image_check_before_hit_enabled": true,
+  "image_remove_conversation_after_result": false,
   "image_settle_secs": 2,
   "auto_relogin_after_refresh": false,
   "image_timeout_retry_secs": 20,

@@ -1108,6 +1108,23 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json()
 
+    def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
+        """Hide a conversation from the ChatGPT upstream history."""
+        path = f"/backend-api/conversation/{conversation_id}"
+        response = self.session.patch(
+            self.base_url + path,
+            headers=self._headers(path, {
+                "Accept": "*/*",
+                "Content-Type": "application/json",
+                "Referer": f"{self.base_url}/c/{conversation_id}",
+                "X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}",
+            }),
+            json={"is_visible": False},
+            timeout=60,
+        )
+        ensure_ok(response, path)
+        return response.json()
+
     def _list_recent_conversations(self, limit: int = 5, timeout_secs: float = 10.0) -> list[Dict[str, Any]]:
         """列出最近的对话列表，按更新时间倒序。
 

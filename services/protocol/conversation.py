@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -836,6 +837,34 @@ def _get_detailed_error_from_tasks(
         return ""
 
 
+def _remove_image_conversation(access_token: str, conversation_id: str) -> None:
+    backend: OpenAIBackendAPI | None = None
+    try:
+        backend = OpenAIBackendAPI(access_token=access_token)
+        backend.delete_conversation(conversation_id)
+        logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
+    except Exception as exc:
+        logger.warning({
+            "event": "image_conversation_remove_failed",
+            "conversation_id": conversation_id,
+            "error": str(exc),
+        })
+    finally:
+        if backend is not None:
+            backend.close()
+
+
+def _remove_image_conversation_later(access_token: str, conversation_id: str) -> None:
+    if not config.image_remove_conversation_after_result or not access_token or not conversation_id:
+        return
+    threading.Thread(
+        target=_remove_image_conversation,
+        args=(access_token, conversation_id),
+        name=f"remove-image-conversation-{conversation_id}",
+        daemon=True,
+    ).start()
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -1384,6 +1413,15 @@ def _generate_single_image(
                     )
                 return outputs
             account_service.mark_image_result(token, True)
+            result_conversation_id = next(
+                (
+                    output.conversation_id
+                    for output in reversed(outputs)
+                    if output.kind == "result" and output.conversation_id
+                ),
+                "",
+            )
+            _remove_image_conversation_later(token, result_conversation_id)
             return outputs
         except ImageTaskDeadlineError as exc:
             account_service.release_image_slot(token)
