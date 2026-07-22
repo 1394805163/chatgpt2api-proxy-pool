@@ -544,7 +544,7 @@ export function Sub2APIConnections() {
             <ul className="mt-1 list-inside list-disc space-y-0.5">
               <li>输入 Sub2API 地址和管理员账户（或 Admin API Key），保存为一个连接。</li>
               <li>点击某个连接的「同步」会拉取其中 platform=openai 且 type=oauth 的账号列表。</li>
-              <li>勾选需要的账号后后端会并发拉取 access_token，自动导入本地号池并刷新状态。</li>
+              <li>勾选账号后，后端会批量导出 access_token，再自动导入本地号池并刷新状态。</li>
               <li>仅会读取 sub2api 凭据中的 access_token；refresh_token 等字段不会写入本地。</li>
             </ul>
           </div>

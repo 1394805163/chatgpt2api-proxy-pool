@@ -36,19 +36,20 @@ import {
   type AccountImportPayload,
   type OAuthLoginStartResponse,
 } from "@/lib/api";
+import { parseAccountImportPayload } from "@/lib/account-import";
 import { cn } from "@/lib/utils";
 
-type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "cpa" | "oauth";
+type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "account-json" | "oauth";
 
 type AccountImportDialogProps = {
   disabled?: boolean;
   onImported: (items: Account[], refreshProgressId?: string, refreshing?: number) => void;
 };
 
-type PendingCpaImport = {
+type PendingAccountJsonImport = {
   tokens: string[];
   accounts: AccountImportPayload[];
-  parsedFileCount: number;
+  parsedAccountCount: number;
   errorCount: number;
 };
 
@@ -64,30 +65,6 @@ function splitTokens(value: string) {
 function getSessionAccessToken(value: unknown) {
   const token = (value as { accessToken?: unknown })?.accessToken;
   return typeof token === "string" ? token.trim() : "";
-}
-
-function getCpaAccount(value: unknown): AccountImportPayload | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  const raw = value as Record<string, unknown>;
-  const tokenValue = raw.access_token ?? raw.accessToken;
-  const token = typeof tokenValue === "string" ? tokenValue.trim() : "";
-  if (!token) {
-    return null;
-  }
-
-  const payload: AccountImportPayload = {
-    ...raw,
-    access_token: token,
-    source_type: "codex",
-  };
-  delete payload.accessToken;
-  if (payload.type === "codex") {
-    payload.export_type = "codex";
-    delete payload.type;
-  }
-  return payload;
 }
 
 function getCodexAuthAccount(value: unknown): AccountImportPayload | null {
@@ -163,7 +140,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [sessionInput, setSessionInput] = useState("");
   const [codexAuthInput, setCodexAuthInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [pendingCpaImport, setPendingCpaImport] = useState<PendingCpaImport | null>(null);
+  const [pendingAccountJsonImport, setPendingAccountJsonImport] = useState<PendingAccountJsonImport | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [oauthEmailHint, setOauthEmailHint] = useState("");
   const [oauthSession, setOauthSession] = useState<OAuthLoginStartResponse | null>(null);
@@ -171,14 +148,14 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [oauthStarting, setOauthStarting] = useState(false);
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
-  const cpaInputRef = useRef<HTMLInputElement | null>(null);
+  const accountJsonInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetState = () => {
     setMethod("menu");
     setTokenInput("");
     setSessionInput("");
     setCodexAuthInput("");
-    setPendingCpaImport(null);
+    setPendingAccountJsonImport(null);
     setConfirmOpen(false);
     setOauthEmailHint("");
     setOauthSession(null);
@@ -379,7 +356,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     }
   };
 
-  const handleCpaSelected = async (event: ChangeEvent<HTMLInputElement>) => {
+  const handleAccountJsonSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
     event.target.value = "";
 
@@ -392,32 +369,29 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
         files.map(async (file) => {
           const raw = await readFileAsText(file);
           const parsed = JSON.parse(raw) as unknown;
-          const account = getCpaAccount(parsed);
-          return {
-            account,
-          };
+          return { accounts: parseAccountImportPayload(parsed) };
         }),
       );
 
-      const accounts = results.map((item) => item.account).filter((item): item is AccountImportPayload => Boolean(item));
+      const accounts = results.flatMap((item) => item.accounts);
       const tokens = accounts.map((item) => item.access_token);
-      const parsedFileCount = accounts.length;
-      const errorCount = results.length - parsedFileCount;
+      const parsedAccountCount = accounts.length;
+      const errorCount = results.filter((item) => item.accounts.length === 0).length;
 
-      if (parsedFileCount === 0) {
-        toast.error("这些 CPA JSON 文件里没有读取到可用 access_token");
+      if (parsedAccountCount === 0) {
+        toast.error("这些账号 JSON 文件里没有读取到可用 access_token");
         return;
       }
 
-      setPendingCpaImport({
+      setPendingAccountJsonImport({
         tokens,
         accounts,
-        parsedFileCount,
+        parsedAccountCount,
         errorCount,
       });
       setConfirmOpen(true);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "读取 CPA JSON 文件失败";
+      const message = error instanceof Error ? error.message : "读取账号 JSON 文件失败";
       toast.error(message);
     }
   };
@@ -620,7 +594,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       );
     }
 
-    if (method === "cpa") {
+    if (method === "account-json") {
       return (
         <div className="space-y-4">
           <button
@@ -633,33 +607,33 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           </button>
           <div className="rounded-2xl border border-dashed border-stone-200 bg-stone-50 p-5">
             <div className="space-y-2">
-              <div className="text-sm font-medium text-stone-800">多选本地 CPA JSON 文件</div>
+              <div className="text-sm font-medium text-stone-800">选择本地账号 JSON 文件</div>
               <div className="text-sm leading-6 text-stone-500">
-                每个文件应为一个 JSON 对象。系统会从对象中自动提取 `access_token` 或 `accessToken`，
+                支持本项目导出的单账号对象、完整账号数组和 `accounts/items` 包装结构，也兼容 CPA JSON。
               </div>
             </div>
             <Button
               type="button"
               className="mt-4 rounded-xl bg-stone-950 text-white hover:bg-stone-800"
-              onClick={() => cpaInputRef.current?.click()}
+              onClick={() => accountJsonInputRef.current?.click()}
               disabled={isSubmitting}
             >
               <Files className="size-4" />
-              选择多个 JSON 文件
+              选择 JSON 文件
             </Button>
           </div>
           <input
-            ref={cpaInputRef}
+            ref={accountJsonInputRef}
             type="file"
             accept=".json,application/json"
             multiple
             className="hidden"
-            onChange={(event) => void handleCpaSelected(event)}
+            onChange={(event) => void handleAccountJsonSelected(event)}
           />
-          {pendingCpaImport ? (
+          {pendingAccountJsonImport ? (
             <div className="rounded-2xl border border-stone-200 bg-white p-4 text-sm leading-6 text-stone-600">
-              最近一次读取到 {pendingCpaImport.parsedFileCount} 个 Token
-              {pendingCpaImport.errorCount > 0 ? `，另有 ${pendingCpaImport.errorCount} 个文件未提取成功` : ""}。
+              最近一次读取到 {pendingAccountJsonImport.parsedAccountCount} 个 Token
+              {pendingAccountJsonImport.errorCount > 0 ? `，另有 ${pendingAccountJsonImport.errorCount} 个文件未提取成功` : ""}。
             </div>
           ) : null}
         </div>
@@ -717,10 +691,10 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           onClick={() => setMethod("codex-auth")}
         />
         <MethodCard
-          title="导入 CPA JSON 文件"
-          description="支持一次多选多个本地 JSON 文件，逐个读取对象里的 access_token 后导入。"
+          title="导入账号 JSON 文件"
+          description="支持本项目导出的单账号 JSON 或完整账号数组，也兼容 CPA JSON 文件。"
           icon={Files}
-          onClick={() => setMethod("cpa")}
+          onClick={() => setMethod("account-json")}
         />
         <MethodCard
           title="从远程 CPA 服务器导入"
@@ -772,7 +746,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                       ? "导入 Codex 认证 JSON"
                     : method === "oauth"
                       ? "OAuth 登录已有账号"
-                      : "导入 CPA JSON"}
+                      : "导入账号 JSON"}
             </DialogTitle>
             <DialogDescription className="text-sm leading-6">
               {method === "menu"
@@ -843,14 +817,14 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                 完成导入
               </Button>
             ) : null}
-            {method === "cpa" ? (
+            {method === "account-json" ? (
               <Button
                 className={cn(
                   "h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800",
-                  !pendingCpaImport ? "hidden" : "",
+                  !pendingAccountJsonImport ? "hidden" : "",
                 )}
                 onClick={() => setConfirmOpen(true)}
-                disabled={footerDisabled || !pendingCpaImport}
+                disabled={footerDisabled || !pendingAccountJsonImport}
               >
                 查看导入确认
               </Button>
@@ -862,13 +836,13 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
-            <DialogTitle>确认导入 CPA Token</DialogTitle>
+            <DialogTitle>确认导入账号 Token</DialogTitle>
             <DialogDescription className="text-sm leading-6">
-              {pendingCpaImport
-                ? `确认识别到 ${pendingCpaImport.parsedFileCount} 个 Token，是否确认导入？`
+              {pendingAccountJsonImport
+                ? `确认识别到 ${pendingAccountJsonImport.parsedAccountCount} 个 Token，是否确认导入？`
                 : "尚未读取到可导入的 Token。"}
-              {pendingCpaImport?.errorCount
-                ? `，另有 ${pendingCpaImport.errorCount} 个文件未提取成功。`
+              {pendingAccountJsonImport?.errorCount
+                ? `，另有 ${pendingAccountJsonImport.errorCount} 个文件未提取成功。`
                 : "。"}
             </DialogDescription>
           </DialogHeader>
@@ -885,12 +859,12 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
               className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
               onClick={() =>
                 void submitTokens(
-                  pendingCpaImport?.tokens ?? [],
-                  "CPA JSON 导入完成",
-                  pendingCpaImport?.accounts ?? [],
+                  pendingAccountJsonImport?.tokens ?? [],
+                  "账号 JSON 导入完成",
+                  pendingAccountJsonImport?.accounts ?? [],
                 )
               }
-              disabled={isSubmitting || !pendingCpaImport}
+              disabled={isSubmitting || !pendingAccountJsonImport}
             >
               {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
               确认导入
