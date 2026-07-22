@@ -123,6 +123,53 @@ class ApiRequestQuotaTests(unittest.TestCase):
         self.assertGreaterEqual(payload["task_deadline_ts"], started + 239.0)
         self.assertLessEqual(payload["task_deadline_ts"], time.time() + 240.0)
 
+    def test_user_image_request_cannot_extend_configured_timeout(self) -> None:
+        with (
+            mock.patch.dict(config.data, {"user_image_task_timeout_secs": 240}),
+            mock.patch.object(
+                ai_api.openai_v1_image_generations,
+                "handle",
+                return_value={"created": 1, "data": [{"url": "https://example.test/image.png"}]},
+            ) as handler,
+        ):
+            response = self.client.post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer user"},
+                json={"model": "gpt-image-2", "prompt": "one cat", "n": 1, "timeout_secs": 300},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(handler.call_args.args[0]["task_timeout_secs"], 240.0)
+
+    def test_admin_image_request_uses_requested_timeout_and_client_task_id(self) -> None:
+        admin = {"id": "admin", "name": "admin", "role": "admin"}
+        started = time.time()
+        with (
+            mock.patch.object(ai_api, "require_identity", return_value=admin),
+            mock.patch.object(
+                ai_api.openai_v1_image_generations,
+                "handle",
+                return_value={"created": 1, "data": [{"url": "https://example.test/image.png"}]},
+            ) as handler,
+        ):
+            response = self.client.post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer admin"},
+                json={
+                    "model": "gpt-image-2",
+                    "prompt": "one cat",
+                    "n": 1,
+                    "timeout_secs": 300,
+                    "client_task_id": "ximage-test-1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = handler.call_args.args[0]
+        self.assertEqual(payload["task_timeout_secs"], 300.0)
+        self.assertEqual(payload["client_task_id"], "ximage-test-1")
+        self.assertGreaterEqual(payload["task_deadline_ts"], started + 299.0)
+
     def test_user_image_chat_request_receives_configured_timeout(self) -> None:
         with (
             mock.patch.dict(config.data, {"user_image_task_timeout_secs": 210}),

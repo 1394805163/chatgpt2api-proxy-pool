@@ -24,6 +24,11 @@ from services.protocol import (
     openai_search,
 )
 from utils.helper import is_image_chat_request
+from utils.log import logger
+
+
+IMAGE_TIMEOUT_MIN_SECS = 30.0
+IMAGE_TIMEOUT_MAX_SECS = 600.0
 
 
 class ImageGenerationRequest(BaseModel):
@@ -35,6 +40,8 @@ class ImageGenerationRequest(BaseModel):
     response_format: str = "b64_json"
     history_disabled: bool = True
     stream: bool | None = None
+    timeout_secs: float | None = Field(default=None, ge=IMAGE_TIMEOUT_MIN_SECS, le=IMAGE_TIMEOUT_MAX_SECS)
+    client_task_id: str | None = Field(default=None, max_length=128)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -74,12 +81,39 @@ class EditableFileTaskRequest(BaseModel):
     client_task_id: str | None = None
 
 
-def apply_user_image_timeout(identity: dict[str, object], payload: dict[str, object]) -> None:
-    if identity.get("role") != "user":
-        return
-    timeout_secs = config.user_image_task_timeout_secs
+def apply_image_timeout(identity: dict[str, object], payload: dict[str, object]) -> float:
+    configured_timeout = config.user_image_task_timeout_secs if identity.get("role") == "user" else config.image_task_timeout_secs
+    requested_timeout = payload.pop("timeout_secs", None)
+    timeout_secs = configured_timeout
+    if requested_timeout is not None:
+        try:
+            requested_timeout = float(requested_timeout)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail={"error": "timeout_secs must be a number"}) from exc
+        if requested_timeout < IMAGE_TIMEOUT_MIN_SECS or requested_timeout > IMAGE_TIMEOUT_MAX_SECS:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": f"timeout_secs must be between {IMAGE_TIMEOUT_MIN_SECS:g} and {IMAGE_TIMEOUT_MAX_SECS:g}"},
+            )
+        timeout_secs = min(requested_timeout, configured_timeout) if identity.get("role") == "user" else requested_timeout
     payload["task_timeout_secs"] = timeout_secs
     payload["task_deadline_ts"] = time.time() + timeout_secs
+    return timeout_secs
+
+
+def log_image_request(request: Request, identity: dict[str, object], endpoint: str, payload: dict[str, object], timeout_secs: float) -> None:
+    try:
+        content_length = max(0, int(request.headers.get("content-length") or 0))
+    except (TypeError, ValueError):
+        content_length = 0
+    logger.info({
+        "event": "image_api_request",
+        "endpoint": endpoint,
+        "client_task_id": str(payload.get("client_task_id") or "").strip(),
+        "role": identity.get("role"),
+        "timeout_secs": timeout_secs,
+        "content_length": content_length,
+    })
 
 
 async def filter_or_log(call: LoggedCall, text: str) -> None:
@@ -110,9 +144,18 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         enforce_image_request_limit(identity, body.n)
         payload = body.model_dump(mode="python")
-        apply_user_image_timeout(identity, payload)
+        timeout_secs = apply_image_timeout(identity, payload)
         payload["base_url"] = resolve_image_base_url(request)
-        call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
+        log_image_request(request, identity, "/v1/images/generations", payload, timeout_secs)
+        call = LoggedCall(
+            identity,
+            "/v1/images/generations",
+            body.model,
+            "文生图",
+            request_text=body.prompt,
+            client_task_id=body.client_task_id or "",
+            request_timeout_secs=timeout_secs,
+        )
         await filter_or_log(call, body.prompt)
         return await call.run(openai_v1_image_generations.handle, payload)
 
@@ -121,17 +164,28 @@ def create_router() -> APIRouter:
             request: Request,
             authorization: str | None = Header(default=None),
     ):
+        request_started = time.time()
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         enforce_image_request_limit(identity, int(payload.get("n") or 1))
         prompt = str(payload["prompt"])
         model = str(payload["model"])
-        call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
+        timeout_secs = apply_image_timeout(identity, payload)
+        log_image_request(request, identity, "/v1/images/edits", payload, timeout_secs)
+        call = LoggedCall(
+            identity,
+            "/v1/images/edits",
+            model,
+            "图生图",
+            started=request_started,
+            request_text=prompt,
+            client_task_id=str(payload.get("client_task_id") or ""),
+            request_timeout_secs=timeout_secs,
+        )
         await filter_or_log(call, prompt)
         payload["images"] = await read_image_sources(image_sources)
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
-        apply_user_image_timeout(identity, payload)
         payload["base_url"] = resolve_image_base_url(request)
         return await call.run(openai_v1_image_edit.handle, payload)
 
@@ -140,7 +194,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         if is_image_chat_request(payload):
-            apply_user_image_timeout(identity, payload)
+            apply_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("prompt"), payload.get("messages"))
         call = LoggedCall(
@@ -159,7 +213,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         if not openai_v1_response.is_text_response_request(payload):
-            apply_user_image_timeout(identity, payload)
+            apply_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
         call = LoggedCall(

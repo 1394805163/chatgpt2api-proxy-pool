@@ -463,6 +463,8 @@ class LoggedCall:
     started: float = field(default_factory=time.time)
     request_text: str = ""
     request_shape: dict[str, int] | None = None
+    client_task_id: str = ""
+    request_timeout_secs: float | None = None
     quota_reservation_id: str = field(default_factory=lambda: uuid4().hex)
     _quota_reserved: bool = field(default=False, init=False, repr=False)
 
@@ -598,6 +600,10 @@ class LoggedCall:
             detail["request_text"] = request_excerpt
         if self.request_shape:
             detail["request_shape"] = self.request_shape
+        if self.client_task_id:
+            detail["client_task_id"] = self.client_task_id
+        if self.request_timeout_secs is not None:
+            detail["request_timeout_secs"] = float(self.request_timeout_secs)
         if error:
             detail["error"] = error
         email = str(account_email or "").strip()

@@ -62,6 +62,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     progress_callback = body.get("progress_callback")
     task_deadline_ts = body.get("task_deadline_ts")
     task_timeout_secs = body.get("task_timeout_secs")
+    client_task_id = str(body.get("client_task_id") or "")
     cancel_event = body.get("cancel_event")
     encoded_images = encode_images(images)
     if not encoded_images:
@@ -79,6 +80,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         progress_callback=progress_callback,
         task_deadline_ts=float(task_deadline_ts) if task_deadline_ts is not None else None,
         task_timeout_secs=float(task_timeout_secs) if task_timeout_secs is not None else None,
+        client_task_id=client_task_id,
         cancel_event=cancel_event,
     ))
     if body.get("stream"):

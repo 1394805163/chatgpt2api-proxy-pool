@@ -193,6 +193,7 @@ class OpenAIBackendAPI:
         self.progress_callback: Callable[[str], None] | None = None
         self.image_deadline_ts: float | None = None
         self.image_task_timeout_secs: float | None = None
+        self.image_client_task_id = ""
         self.image_cancel_event: Any = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
@@ -2171,6 +2172,7 @@ class OpenAIBackendAPI:
         )
         logger.info({
             "event": "image_poll_start",
+            "client_task_id": getattr(self, "image_client_task_id", ""),
             "conversation_id": conversation_id,
             "timeout_secs": timeout_secs,
             "initial_wait_secs": initial_wait,
@@ -2318,6 +2320,7 @@ class OpenAIBackendAPI:
                 time.sleep(wait)
         logger.info({
             "event": "image_poll_timeout",
+            "client_task_id": getattr(self, "image_client_task_id", ""),
             "conversation_id": conversation_id,
             "timeout_secs": timeout_secs,
             "attempts_made": attempt,

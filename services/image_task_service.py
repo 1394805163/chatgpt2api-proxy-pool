@@ -222,6 +222,7 @@ class ImageTaskService:
         task_id = _clean(client_task_id)
         if not task_id:
             raise ValueError("client_task_id is required")
+        payload = {**payload, "client_task_id": task_id}
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
         quota_reservation_id = f"image-task:{key}"

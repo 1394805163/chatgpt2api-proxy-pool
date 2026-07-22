@@ -340,6 +340,7 @@ class ConversationRequest:
     progress_callback: Any = None  # Callable[[str], None] | None
     task_deadline_ts: float | None = None
     task_timeout_secs: float | None = None
+    client_task_id: str = ""
     cancel_event: Any = None  # threading.Event | None
 
 
@@ -1327,6 +1328,7 @@ def _generate_single_image(
             request.progress_callback(f"account_email:{account_email}")
         logger.debug({
             "event": "image_account_lookup",
+            "client_task_id": request.client_task_id,
             "token_prefix": token[:12] + "..." if len(token) > 12 else token,
             "account_email": account_email,
             "account_found": bool(account),
@@ -1336,6 +1338,7 @@ def _generate_single_image(
             backend = OpenAIBackendAPI(access_token=token)
             backend.image_deadline_ts = request.task_deadline_ts
             backend.image_task_timeout_secs = _image_task_timeout_secs(request)
+            backend.image_client_task_id = request.client_task_id
             backend.image_cancel_event = request.cancel_event
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
