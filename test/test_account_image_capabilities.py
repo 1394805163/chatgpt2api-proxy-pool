@@ -292,7 +292,7 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertEqual(result["quota"], 5)
             backend.get_user_info.assert_called_once_with(request_workers=1, timeout_secs=20.0)
-            backend.session.close.assert_called_once_with()
+            backend.close.assert_called_once_with()
 
     def test_get_user_info_uses_one_shared_deadline(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
