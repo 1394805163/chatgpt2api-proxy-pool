@@ -374,6 +374,18 @@ def _message_tracking_ref(message: dict[str, Any]) -> str:
     return f"content:{provider}:{mailbox}:{received_value}:{digest}"
 
 
+def _message_before_code_boundary(mailbox: dict[str, Any], message: dict[str, Any]) -> bool:
+    boundary = mailbox.get("_code_not_before")
+    received_at = message.get("received_at")
+    if not isinstance(boundary, datetime) or not isinstance(received_at, datetime):
+        return False
+    if boundary.tzinfo is None:
+        boundary = boundary.replace(tzinfo=timezone.utc)
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    return received_at < boundary
+
+
 class BaseMailProvider:
     name = "unknown"
 
@@ -400,6 +412,8 @@ class BaseMailProvider:
         seen_refs = {str(item) for item in seen_value}
 
         def extract_unseen_code(message: dict[str, Any]) -> str | None:
+            if _message_before_code_boundary(mailbox, message):
+                return None
             ref = _message_tracking_ref(message)
             if ref in seen_refs:
                 return None
@@ -670,6 +684,17 @@ class CloudMailGenProvider(BaseMailProvider):
             raise RuntimeError(f"CloudMailGen emailList 返回异常: {data}")
         return data
 
+    def _add_user(self, token: str, address: str) -> dict:
+        data = self._request(
+            "POST",
+            "/api/public/addUser",
+            headers={"Authorization": token},
+            payload={"list": [{"email": address}]},
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"CloudMailGen addUser 返回异常: {data}")
+        return data
+
     def _get_token(self) -> str:
         if not self.admin_email or not self.admin_password:
             raise RuntimeError("CloudMailGen 缺少 admin_email 或 admin_password")
@@ -709,6 +734,14 @@ class CloudMailGenProvider(BaseMailProvider):
         if not self.domain:
             raise RuntimeError("CloudMailGen 需要至少配置一个 domain")
         address = self._resolve_address(username)
+        token = self._get_token()
+        data = self._add_user(token, address)
+        if not self._is_success_payload(data):
+            self._clear_token_cache()
+            token = self._get_token()
+            data = self._add_user(token, address)
+        if not self._is_success_payload(data):
+            raise RuntimeError(f"CloudMailGen addUser 返回异常: {data}")
         return {"provider": self.name, "provider_ref": self.provider_ref, "address": address}
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
@@ -1404,6 +1437,8 @@ class OutlookTokenProvider(BaseMailProvider):
         deadline = time.monotonic() + self.conf["wait_timeout"]
         while time.monotonic() < deadline:
             for message in self.fetch_recent_messages(mailbox):
+                if _message_before_code_boundary(mailbox, message):
+                    continue
                 ref = _message_tracking_ref(message)
                 if ref in seen_refs:
                     continue
@@ -1492,6 +1527,7 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
                 release_mailbox(mailbox)
                 last_error = f"邮箱域名 {domain} 因低成功率被临时停用"
                 continue
+            mailbox["_code_not_before"] = datetime.now(timezone.utc)
             return mailbox
         except RuntimeError as error:
             last_error = str(error)

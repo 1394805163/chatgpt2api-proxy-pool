@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 import copy
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from services.register import mail_provider, openai_register
@@ -87,7 +87,13 @@ class RegisterMailProxyTests(unittest.TestCase):
         created: list[FakeSession] = []
 
         def session_factory(**kwargs):
-            session = FakeSession(**kwargs)
+            session = FakeSession(
+                responses=[
+                    FakeResponse({"code": 200, "data": {"token": "mail-token"}}),
+                    FakeResponse({"code": 200, "data": {}}),
+                ],
+                **kwargs,
+            )
             created.append(session)
             return session
 
@@ -95,8 +101,91 @@ class RegisterMailProxyTests(unittest.TestCase):
             mailbox = openai_register.create_mailbox(register_proxy="http://worker.example:9000")
 
         self.assertEqual(mailbox["provider"], "cloudmail_gen")
+        self.assertIsInstance(mailbox.get("_code_not_before"), datetime)
         self.assertEqual(len(created), 1)
         self.assertNotIn("proxy", created[0].kwargs)
+
+    def test_cloudmail_gen_registers_new_address_before_returning_it(self) -> None:
+        session = FakeSession(
+            responses=[
+                FakeResponse({"code": 200, "data": {"token": "mail-token"}}),
+                FakeResponse({"code": 200, "data": {}}),
+            ]
+        )
+
+        with patch.object(mail_provider, "_create_session", return_value=session):
+            provider = mail_provider.CloudMailGenProvider(cloudmail_entry(), mail_provider._config({"proxy": ""}))
+            mailbox = provider.create_mailbox("new-user")
+
+        self.assertEqual(mailbox["address"], "new-user@example.com")
+        self.assertEqual([call["url"] for call in session.calls], [
+            "https://mail.example/api/public/genToken",
+            "https://mail.example/api/public/addUser",
+        ])
+        self.assertEqual(session.calls[1]["headers"]["Authorization"], "mail-token")
+        self.assertEqual(session.calls[1]["json"], {"list": [{"email": "new-user@example.com"}]})
+
+    def test_cloudmail_gen_refreshes_cached_token_when_add_user_rejects_it(self) -> None:
+        entry = cloudmail_entry()
+        cache_key = f"{entry['api_base']}|{entry['admin_email']}"
+        mail_provider.cloudmail_token_cache[cache_key] = ("stale-token", time.time() + 3600)
+        session = FakeSession(
+            responses=[
+                FakeResponse({"code": 401, "message": "invalid token"}),
+                FakeResponse({"code": 200, "data": {"token": "fresh-token"}}),
+                FakeResponse({"code": 200, "data": {}}),
+            ]
+        )
+
+        with patch.object(mail_provider, "_create_session", return_value=session):
+            provider = mail_provider.CloudMailGenProvider(entry, mail_provider._config({"proxy": ""}))
+            mailbox = provider.create_mailbox("new-user")
+
+        self.assertEqual(mailbox["address"], "new-user@example.com")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "stale-token")
+        self.assertEqual(session.calls[2]["headers"]["Authorization"], "fresh-token")
+
+    def test_base_provider_ignores_codes_received_before_mailbox_boundary(self) -> None:
+        boundary = datetime.now(timezone.utc)
+        messages = [
+            {
+                "message_id": "old",
+                "text_content": "Verification code: 111111",
+                "received_at": boundary - timedelta(seconds=1),
+            },
+            {
+                "message_id": "new",
+                "text_content": "Verification code: 222222",
+                "received_at": boundary + timedelta(seconds=1),
+            },
+        ]
+
+        class SequenceProvider(mail_provider.BaseMailProvider):
+            def fetch_latest_message(self, _mailbox):
+                return messages.pop(0) if messages else None
+
+        provider = SequenceProvider({"wait_timeout": 0.5, "wait_interval": 0.001})
+
+        self.assertEqual(provider.wait_for_code({"_code_not_before": boundary}), "222222")
+
+    def test_outlook_provider_ignores_codes_received_before_mailbox_boundary(self) -> None:
+        boundary = datetime.now(timezone.utc)
+        provider = object.__new__(mail_provider.OutlookTokenProvider)
+        provider.conf = {"wait_timeout": 0.1, "wait_interval": 0.001}
+        provider.fetch_recent_messages = lambda _mailbox: [
+            {
+                "message_id": "old",
+                "text_content": "Verification code: 111111",
+                "received_at": boundary - timedelta(seconds=1),
+            },
+            {
+                "message_id": "new",
+                "text_content": "Verification code: 222222",
+                "received_at": boundary + timedelta(seconds=1),
+            },
+        ]
+
+        self.assertEqual(provider.wait_for_code({"_code_not_before": boundary}), "222222")
 
     def test_cloudmail_gen_parses_current_field_names_and_retries_transient_errors(self) -> None:
         responses = [
