@@ -1497,7 +1497,7 @@ class AccountService:
                         continue
                     raise
                 finally:
-                    client.session.close()
+                    client.close()
             raise last_error or RuntimeError("account info request failed")
 
         active_token = self.refresh_access_token(

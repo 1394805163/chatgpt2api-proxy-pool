@@ -229,6 +229,28 @@ class OpenAIBackendAPI:
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        session = getattr(self, "session", None)
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "OpenAIBackendAPI":
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        self.close()
+        return False
+
+    def __del__(self) -> None:
+        self.close()
+
     def _ensure_image_task_active(self) -> None:
         timeout_secs = getattr(self, "image_task_timeout_secs", None) or config.image_task_timeout_secs
         cancel_event = getattr(self, "image_cancel_event", None)

@@ -30,7 +30,11 @@ def _backend_models() -> dict[str, Any]:
             if now - cached_at < MODEL_CACHE_TTL_SECONDS:
                 return deepcopy(cached_result)
 
-    result = OpenAIBackendAPI().list_models()
+    backend = OpenAIBackendAPI()
+    try:
+        result = backend.list_models()
+    finally:
+        backend.close()
     with _model_cache_lock:
         _model_cache = (monotonic(), deepcopy(result))
     return result
