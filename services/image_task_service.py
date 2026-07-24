@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,13 +98,15 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["progress"] = task.get("progress")
     if task.get("duration_ms") is not None:
         item["duration_ms"] = task.get("duration_ms")
+    if task.get("queue_duration_ms") is not None:
+        item["queue_duration_ms"] = task.get("queue_duration_ms")
     if task.get("status") in (TASK_STATUS_RUNNING, TASK_STATUS_QUEUED):
         if task.get("status") == TASK_STATUS_RUNNING:
             # RUNNING 状态仅在 started_ts 被设置后（image_stream_resolve_start）才计时
             base_ts = task.get("started_ts")
         else:
             # QUEUED 状态从 created_ts 开始计时（排队等待中）
-            base_ts = task.get("created_ts") or task.get("updated_ts")
+            base_ts = task.get("queued_ts") or task.get("created_ts") or task.get("updated_ts")
         if base_ts:
             item["elapsed_secs"] = round(time.time() - base_ts, 1)
     return item
@@ -119,6 +122,9 @@ class ImageTaskService:
         retention_days_getter: Callable[[], int] | None = None,
         stale_task_timeout_getter: Callable[[], float] | None = None,
         max_task_duration_getter: Callable[[], float] | None = None,
+        global_concurrency_getter: Callable[[], int] | None = None,
+        per_owner_concurrency_getter: Callable[[], int] | None = None,
+        queue_timeout_getter: Callable[[], float] | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
@@ -126,9 +132,21 @@ class ImageTaskService:
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self.stale_task_timeout_getter = stale_task_timeout_getter or self._default_stale_task_timeout
         self.max_task_duration_getter = max_task_duration_getter or (lambda: config.image_task_timeout_secs)
+        self.global_concurrency_getter = global_concurrency_getter or (lambda: config.image_global_concurrency)
+        self.per_owner_concurrency_getter = per_owner_concurrency_getter or (lambda: config.image_user_concurrency)
+        self.queue_timeout_getter = queue_timeout_getter or (lambda: config.image_queue_timeout_secs)
         self._lock = threading.RLock()
+        self._dispatch_lock = threading.Lock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self._threads: dict[str, threading.Thread] = {}
+        self._pending: dict[
+            str,
+            tuple[Callable[..., None], tuple[Any, ...], dict[str, object], str],
+        ] = {}
+        self._pending_by_owner: dict[str, deque[str]] = {}
+        self._ready_owners: deque[str] = deque()
+        self._queue_timer: threading.Timer | None = None
+        self._queue_timer_deadline: float | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
@@ -186,6 +204,8 @@ class ImageTaskService:
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
+        self._expire_queued_tasks()
+        self._dispatch_available()
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
         with self._lock:
@@ -227,6 +247,7 @@ class ImageTaskService:
         key = _task_key(owner, task_id)
         quota_reservation_id = f"image-task:{key}"
         now = _now_iso()
+        now_ts = time.time()
         should_start = False
         quota_reserved = False
         with self._lock:
@@ -261,7 +282,8 @@ class ImageTaskService:
                 "base_url": _clean(payload.get("base_url")),
                 "created_at": now,
                 "updated_at": now,
-                "created_ts": time.time(),
+                "created_ts": now_ts,
+                "queued_ts": now_ts,
                 "quota_reservation_id": quota_reservation_id if quota_reserved else "",
             }
             self._tasks[key] = task
@@ -272,22 +294,240 @@ class ImageTaskService:
                 if quota_reserved:
                     auth_service.finish_daily_request(identity, quota_reservation_id, success=False)
                 raise
+            self._enqueue_pending_locked(
+                key,
+                self._run_task,
+                (key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
+                dict(identity),
+                f"image-task-{task_id[:16]}",
+            )
             should_start = True
 
         if should_start:
-            try:
-                self._start_tracked_thread(
-                    key,
-                    self._run_task,
-                    args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
-                    name=f"image-task-{task_id[:16]}",
-                )
-            except BaseException:
-                if quota_reserved:
+            self._dispatch_available()
+        with self._lock:
+            return _public_task(self._tasks.get(key, task))
+
+    def _enqueue_pending_locked(
+        self,
+        key: str,
+        target: Callable[..., None],
+        args: tuple[Any, ...],
+        identity: dict[str, object],
+        name: str,
+    ) -> None:
+        owner = _owner_id(identity)
+        owner_queue = self._pending_by_owner.get(owner)
+        if owner_queue is None:
+            owner_queue = deque()
+            self._pending_by_owner[owner] = owner_queue
+        if not owner_queue:
+            self._ready_owners.append(owner)
+        owner_queue.append(key)
+        self._pending[key] = (target, args, identity, name)
+        self._schedule_queue_expiry_locked()
+
+    def _running_count_locked(self, owner: str | None = None) -> int:
+        count = 0
+        stale_keys: list[str] = []
+        for key, thread in self._threads.items():
+            if not thread.is_alive():
+                stale_keys.append(key)
+                continue
+            task = self._tasks.get(key)
+            if (
+                task
+                and task.get("status") in UNFINISHED_STATUSES
+                and (owner is None or task.get("owner_id") == owner)
+            ):
+                count += 1
+        for key in stale_keys:
+            self._threads.pop(key, None)
+        return count
+
+    def _physical_thread_count_locked(self) -> int:
+        return sum(1 for thread in self._threads.values() if thread.is_alive())
+
+    def _global_concurrency(self) -> int:
+        try:
+            return max(1, int(self.global_concurrency_getter()))
+        except Exception:
+            return 10
+
+    def _per_owner_concurrency(self) -> int:
+        try:
+            return max(1, int(self.per_owner_concurrency_getter()))
+        except Exception:
+            return 2
+
+    def _queue_timeout(self) -> float:
+        try:
+            return max(0.01, float(self.queue_timeout_getter()))
+        except Exception:
+            return 600.0
+
+    def _take_next_pending_locked(
+        self,
+    ) -> tuple[str, tuple[Callable[..., None], tuple[Any, ...], dict[str, object], str]] | None:
+        owner_attempts = len(self._ready_owners)
+        per_owner_limit = self._per_owner_concurrency()
+        for _ in range(owner_attempts):
+            owner = self._ready_owners.popleft()
+            owner_queue = self._pending_by_owner.get(owner)
+            if not owner_queue:
+                self._pending_by_owner.pop(owner, None)
+                continue
+            if self._running_count_locked(owner) >= per_owner_limit:
+                self._ready_owners.append(owner)
+                continue
+            key = owner_queue.popleft()
+            if owner_queue:
+                self._ready_owners.append(owner)
+            else:
+                self._pending_by_owner.pop(owner, None)
+            pending = self._pending.pop(key, None)
+            if pending is None:
+                continue
+            task = self._tasks.get(key)
+            if not task or task.get("status") != TASK_STATUS_QUEUED:
+                continue
+            self._schedule_queue_expiry_locked()
+            return key, pending
+        self._schedule_queue_expiry_locked()
+        return None
+
+    def _dispatch_available(self) -> None:
+        with self._dispatch_lock:
+            self._expire_queued_tasks()
+            while True:
+                with self._lock:
+                    global_limit = self._global_concurrency()
+                    hard_thread_limit = max(global_limit + 2, global_limit * 2)
+                    if (
+                        self._running_count_locked() >= global_limit
+                        or self._physical_thread_count_locked() >= hard_thread_limit
+                    ):
+                        return
+                    selected = self._take_next_pending_locked()
+                if selected is None:
+                    return
+                key, (target, args, identity, name) = selected
+                try:
+                    self._start_tracked_thread(
+                        key,
+                        target,
+                        args=args,
+                        name=name,
+                    )
+                except BaseException as exc:
                     self._settle_quota(key, identity, success=False)
-                self._update_task(key, status=TASK_STATUS_ERROR, error="image task failed to start", data=[])
-                raise
-        return _public_task(task)
+                    self._update_task(
+                        key,
+                        status=TASK_STATUS_ERROR,
+                        error=str(exc) or "image task failed to start",
+                        data=[],
+                    )
+
+    def _remove_pending_locked(self, key: str) -> None:
+        pending = self._pending.pop(key, None)
+        if pending is None:
+            return
+        task = self._tasks.get(key)
+        owner = _clean(task.get("owner_id")) if task else ""
+        owner_queue = self._pending_by_owner.get(owner)
+        if owner_queue is None:
+            return
+        try:
+            owner_queue.remove(key)
+        except ValueError:
+            pass
+        if owner_queue:
+            return
+        self._pending_by_owner.pop(owner, None)
+        self._ready_owners = deque(item for item in self._ready_owners if item != owner)
+
+    def _schedule_queue_expiry_locked(self) -> None:
+        if not self._pending:
+            if self._queue_timer is not None:
+                self._queue_timer.cancel()
+            self._queue_timer = None
+            self._queue_timer_deadline = None
+            return
+        now = time.time()
+        timeout = self._queue_timeout()
+        deadlines: list[float] = []
+        for key in self._pending:
+            task = self._tasks.get(key)
+            try:
+                created_ts = float(task.get("queued_ts") or task.get("created_ts") or now) if task else now
+            except (TypeError, ValueError):
+                created_ts = now
+            deadlines.append(created_ts + timeout)
+        next_deadline = min(deadlines)
+        if (
+            self._queue_timer is not None
+            and self._queue_timer.is_alive()
+            and self._queue_timer_deadline is not None
+            and self._queue_timer_deadline <= next_deadline
+        ):
+            return
+        if self._queue_timer is not None:
+            self._queue_timer.cancel()
+        timer = threading.Timer(max(0.01, next_deadline - now), self._on_queue_timer)
+        timer.daemon = True
+        self._queue_timer = timer
+        self._queue_timer_deadline = next_deadline
+        timer.start()
+
+    def _on_queue_timer(self) -> None:
+        current = threading.current_thread()
+        with self._lock:
+            if self._queue_timer is not current:
+                return
+            self._queue_timer = None
+            self._queue_timer_deadline = None
+        self._expire_queued_tasks()
+        self._dispatch_available()
+
+    def _expire_queued_tasks(self) -> None:
+        now = time.time()
+        timeout = self._queue_timeout()
+        releases: list[tuple[dict[str, object], str]] = []
+        changed = False
+        with self._lock:
+            for key, pending in list(self._pending.items()):
+                task = self._tasks.get(key)
+                if not task or task.get("status") != TASK_STATUS_QUEUED:
+                    self._remove_pending_locked(key)
+                    continue
+                try:
+                    created_ts = float(task.get("queued_ts") or task.get("created_ts") or now)
+                except (TypeError, ValueError):
+                    created_ts = now
+                if now - created_ts < timeout:
+                    continue
+                identity = pending[2]
+                reservation_id = _clean(task.get("quota_reservation_id"))
+                task["status"] = TASK_STATUS_ERROR
+                task["error"] = f"图片任务排队超过 {timeout:g} 秒，已取消；请稍后重新提交"
+                task["data"] = []
+                task["queue_duration_ms"] = int(max(0.0, now - created_ts) * 1000)
+                task["duration_ms"] = task["queue_duration_ms"]
+                task["updated_at"] = _now_iso()
+                task["updated_ts"] = now
+                task["quota_reservation_id"] = ""
+                self._remove_pending_locked(key)
+                if reservation_id:
+                    releases.append((identity, reservation_id))
+                changed = True
+            if changed:
+                self._save_locked()
+            self._schedule_queue_expiry_locked()
+        for identity, reservation_id in releases:
+            try:
+                auth_service.finish_daily_request(identity, reservation_id, success=False)
+            except Exception as exc:
+                logger.error(f"Failed to release queued image task quota: {exc}")
 
     def _start_tracked_thread(
         self,
@@ -305,17 +545,17 @@ class ImageTaskService:
                 with self._lock:
                     if self._threads.get(key) is current:
                         self._threads.pop(key, None)
+                self._dispatch_available()
 
         thread = threading.Thread(target=run, name=name, daemon=True)
         with self._lock:
             self._threads[key] = thread
-        try:
-            thread.start()
-        except BaseException:
-            with self._lock:
+            try:
+                thread.start()
+            except BaseException:
                 if self._threads.get(key) is thread:
                     self._threads.pop(key, None)
-            raise
+                raise
 
     def _run_task(
         self,
@@ -334,7 +574,18 @@ class ImageTaskService:
             args=(key, identity, mode, model, started, payload, cancel_event, max_duration),
         )
         deadline_timer.daemon = True
-        self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        with self._lock:
+            task = self._tasks.get(key)
+            try:
+                created_ts = float(task.get("queued_ts") or task.get("created_ts") or started) if task else started
+            except (TypeError, ValueError):
+                created_ts = started
+        self._update_task(
+            key,
+            status=TASK_STATUS_RUNNING,
+            error="",
+            queue_duration_ms=int(max(0.0, started - created_ts) * 1000),
+        )
         deadline_timer.start()
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
@@ -504,6 +755,7 @@ class ImageTaskService:
             status="failed",
             error=error_message,
         )
+        self._dispatch_available()
 
     def _log_call(
         self,
@@ -592,9 +844,11 @@ class ImageTaskService:
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
                 "created_ts": item.get("created_ts"),
+                "queued_ts": item.get("queued_ts"),
                 "updated_ts": item.get("updated_ts"),
                 "started_ts": item.get("started_ts"),
                 "duration_ms": item.get("duration_ms"),
+                "queue_duration_ms": item.get("queue_duration_ms"),
             }
             conversation_id = _clean(item.get("conversation_id"))
             if conversation_id:
@@ -648,6 +902,8 @@ class ImageTaskService:
         changed = False
         for key, task in self._tasks.items():
             if task.get("status") not in UNFINISHED_STATUSES:
+                continue
+            if task.get("status") == TASK_STATUS_QUEUED and key in self._pending:
                 continue
             thread = self._threads.get(key)
             if thread is not None and thread.is_alive():
@@ -728,6 +984,9 @@ class ImageTaskService:
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
                 raise ValueError("task has no conversation_id")
+            existing_thread = self._threads.get(key)
+            if existing_thread is not None and existing_thread.is_alive():
+                raise ValueError("original image task is still shutting down")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
             if identity.get("role") == "user":
@@ -747,11 +1006,13 @@ class ImageTaskService:
 
             quota_reserved = auth_service.reserve_daily_request(identity, reservation_id)
             previous_task = dict(task)
-            task["status"] = TASK_STATUS_RUNNING
+            queued_ts = time.time()
+            task["status"] = TASK_STATUS_QUEUED
             task["error"] = ""
             task["quota_reservation_id"] = reservation_id if quota_reserved else ""
             task["updated_at"] = _now_iso()
-            task["updated_ts"] = time.time()
+            task["updated_ts"] = queued_ts
+            task["queued_ts"] = queued_ts
             try:
                 self._save_locked()
             except Exception:
@@ -759,26 +1020,16 @@ class ImageTaskService:
                 if quota_reserved:
                     auth_service.finish_daily_request(identity, reservation_id, success=False)
                 raise
-
-        try:
-            self._start_tracked_thread(
+            self._enqueue_pending_locked(
                 key,
                 self._run_resume_poll,
-                args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
-                name=f"image-resume-{_clean(task_id)[:16]}",
+                (key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+                dict(identity),
+                f"image-resume-{_clean(task_id)[:16]}",
             )
-        except BaseException:
-            if quota_reserved:
-                self._settle_quota(key, identity, success=False)
-            self._update_task(
-                key,
-                _expected_status=TASK_STATUS_RUNNING,
-                status=TASK_STATUS_ERROR,
-                error="image resume task failed to start",
-                data=[],
-            )
-            raise
-        return _public_task(task)
+        self._dispatch_available()
+        with self._lock:
+            return _public_task(self._tasks.get(key, task))
 
     def _run_resume_poll(
         self,
@@ -792,6 +1043,20 @@ class ImageTaskService:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
         backend = None
+        with self._lock:
+            task = self._tasks.get(key)
+            try:
+                created_ts = float(task.get("queued_ts") or task.get("updated_ts") or started) if task else started
+            except (TypeError, ValueError):
+                created_ts = started
+        if not self._update_task(
+            key,
+            _expected_status=TASK_STATUS_QUEUED,
+            status=TASK_STATUS_RUNNING,
+            error="",
+            queue_duration_ms=int(max(0.0, started - created_ts) * 1000),
+        ):
+            return
         try:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result

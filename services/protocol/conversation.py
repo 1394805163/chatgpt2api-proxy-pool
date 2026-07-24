@@ -265,20 +265,63 @@ def encoding_for_model(model: str):
             return tiktoken.get_encoding("cl100k_base")
 
 
+_token_encoding_warning_lock = threading.Lock()
+_token_encoding_warning_logged = False
+
+
+def _estimated_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    ascii_count = sum(1 for char in text if ord(char) < 128)
+    non_ascii_count = len(text) - ascii_count
+    return non_ascii_count + (ascii_count + 3) // 4
+
+
+def _log_token_encoding_fallback(exc: Exception) -> None:
+    global _token_encoding_warning_logged
+    with _token_encoding_warning_lock:
+        if _token_encoding_warning_logged:
+            return
+        _token_encoding_warning_logged = True
+    logger.warning({
+        "event": "token_encoding_fallback",
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    })
+
+
+def _safe_encoding_for_model(model: str):
+    try:
+        return encoding_for_model(model)
+    except Exception as exc:
+        _log_token_encoding_fallback(exc)
+        return None
+
+
+def _encoded_text_tokens(text: str, encoding: Any) -> int:
+    if encoding is None:
+        return _estimated_text_tokens(text)
+    try:
+        return len(encoding.encode(text))
+    except Exception as exc:
+        _log_token_encoding_fallback(exc)
+        return _estimated_text_tokens(text)
+
+
 def count_message_image_tokens(messages: list[dict[str, Any]], model: str) -> int:
     return sum(count_image_content_tokens(message.get("content"), model) for message in messages)
 
 
 def count_message_text_tokens(messages: list[dict[str, Any]], model: str) -> int:
-    encoding = encoding_for_model(model)
+    encoding = _safe_encoding_for_model(model)
     total = 0
     for message in messages:
         total += 3
         for key, value in message.items():
             if key == "content" and isinstance(value, list):
-                total += len(encoding.encode(message_text(value)))
+                total += _encoded_text_tokens(message_text(value), encoding)
             elif isinstance(value, str):
-                total += len(encoding.encode(value))
+                total += _encoded_text_tokens(value, encoding)
             else:
                 continue
             if key == "name":
@@ -291,7 +334,7 @@ def count_message_tokens(messages: list[dict[str, Any]], model: str) -> int:
 
 
 def count_text_tokens(text: str, model: str) -> int:
-    return len(encoding_for_model(model).encode(text))
+    return _encoded_text_tokens(text, _safe_encoding_for_model(model))
 
 
 def format_image_result(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
@@ -41,10 +41,13 @@ def create_router() -> APIRouter:
 
     @router.get("/api/image-tasks")
     async def list_image_tasks(
+        response: Response,
         ids: str = Query(default=""),
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Vary"] = "Authorization"
         return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
 
     @router.post("/api/image-tasks/generations")

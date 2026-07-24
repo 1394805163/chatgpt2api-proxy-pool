@@ -147,6 +147,39 @@ class ImageTaskQuotaTests(unittest.TestCase):
 
             self.assertEqual(auth.list_keys(role="user")[0]["daily_request_used"], 1)
 
+    def test_queued_timeout_releases_daily_quota_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            auth, identity = make_identity(root, daily_limit=2, image_limit=2)
+            release = threading.Event()
+
+            def handler(payload):
+                if payload["client_task_id"] == "blocking":
+                    release.wait(1)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = ImageTaskService(
+                root / "tasks.json",
+                generation_handler=handler,
+                edit_handler=handler,
+                retention_days_getter=lambda: 30,
+                stale_task_timeout_getter=lambda: 5,
+                max_task_duration_getter=lambda: 1,
+                global_concurrency_getter=lambda: 1,
+                per_owner_concurrency_getter=lambda: 1,
+                queue_timeout_getter=lambda: 0.05,
+            )
+            with mock.patch("services.image_task_service.auth_service", auth):
+                service.submit_generation(identity, client_task_id="blocking", prompt="cat", model="gpt-image-2", size=None)
+                service.submit_generation(identity, client_task_id="queued-timeout", prompt="cat", model="gpt-image-2", size=None)
+                wait_for_status(service, identity, "queued-timeout", "error")
+                release.set()
+                wait_for_status(service, identity, "blocking", "success")
+
+            item = auth.list_keys(role="user")[0]
+            self.assertEqual(item["daily_request_used"], 1)
+            self.assertEqual(item["daily_request_remaining"], 1)
+
     def test_resume_poll_reserves_and_counts_a_new_successful_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

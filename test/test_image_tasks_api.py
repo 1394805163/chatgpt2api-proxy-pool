@@ -143,6 +143,8 @@ class ImageTasksApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
         self.assertEqual(payload["missing_ids"], ["missing"])
+        self.assertEqual(response.headers.get("cache-control"), "no-store")
+        self.assertIn("Authorization", response.headers.get("vary", ""))
 
     def test_resume_poll_returns_running_task(self):
         response = self.client.post(

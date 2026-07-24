@@ -99,20 +99,32 @@ class ConfigLoadingTests(unittest.TestCase):
             store = module.ConfigStore(path)
             self.assertEqual(store.image_task_timeout_secs, 70)
             self.assertEqual(store.user_image_task_timeout_secs, 180)
+            self.assertEqual(store.image_global_concurrency, 10)
+            self.assertEqual(store.image_user_concurrency, 2)
+            self.assertEqual(store.image_queue_timeout_secs, 600)
 
             updated = store.update({
                 "image_task_timeout_secs": 150,
                 "image_poll_timeout_secs": 70,
                 "user_image_task_timeout_secs": 240,
+                "image_global_concurrency": 5,
+                "image_user_concurrency": 9,
+                "image_queue_timeout_secs": 10,
             })
 
             self.assertEqual(updated["image_task_timeout_secs"], 150)
             self.assertEqual(updated["image_poll_timeout_secs"], 150)
             self.assertEqual(updated["user_image_task_timeout_secs"], 240)
+            self.assertEqual(updated["image_global_concurrency"], 5)
+            self.assertEqual(updated["image_user_concurrency"], 5)
+            self.assertEqual(updated["image_queue_timeout_secs"], 30)
             persisted = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["image_task_timeout_secs"], 150)
             self.assertEqual(persisted["image_poll_timeout_secs"], 150)
             self.assertEqual(persisted["user_image_task_timeout_secs"], 240)
+            self.assertEqual(persisted["image_global_concurrency"], 5)
+            self.assertEqual(persisted["image_user_concurrency"], 5)
+            self.assertEqual(persisted["image_queue_timeout_secs"], 30)
 
 
 if __name__ == "__main__":

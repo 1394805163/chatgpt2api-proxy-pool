@@ -474,6 +474,27 @@ class ConfigStore:
             return 180.0
 
     @property
+    def image_global_concurrency(self) -> int:
+        try:
+            return max(1, min(100, int(self.data.get("image_global_concurrency", 10))))
+        except (TypeError, ValueError):
+            return 10
+
+    @property
+    def image_user_concurrency(self) -> int:
+        try:
+            return max(1, min(self.image_global_concurrency, int(self.data.get("image_user_concurrency", 2))))
+        except (TypeError, ValueError):
+            return min(2, self.image_global_concurrency)
+
+    @property
+    def image_queue_timeout_secs(self) -> float:
+        try:
+            return max(30.0, float(self.data.get("image_queue_timeout_secs", 600.0)))
+        except (TypeError, ValueError):
+            return 600.0
+
+    @property
     def image_poll_interval_secs(self) -> float:
         try:
             return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
@@ -636,6 +657,9 @@ class ConfigStore:
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_task_timeout_secs"] = self.image_task_timeout_secs
         data["user_image_task_timeout_secs"] = self.user_image_task_timeout_secs
+        data["image_global_concurrency"] = self.image_global_concurrency
+        data["image_user_concurrency"] = self.image_user_concurrency
+        data["image_queue_timeout_secs"] = self.image_queue_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_timeout_retry_secs"] = self.image_timeout_retry_secs
@@ -698,6 +722,24 @@ class ConfigStore:
         except (TypeError, ValueError):
             user_image_task_timeout = 180.0
         next_data["user_image_task_timeout_secs"] = user_image_task_timeout
+        try:
+            image_global_concurrency = max(1, min(100, int(next_data.get("image_global_concurrency", 10))))
+        except (TypeError, ValueError):
+            image_global_concurrency = 10
+        next_data["image_global_concurrency"] = image_global_concurrency
+        try:
+            image_user_concurrency = max(
+                1,
+                min(image_global_concurrency, int(next_data.get("image_user_concurrency", 2))),
+            )
+        except (TypeError, ValueError):
+            image_user_concurrency = min(2, image_global_concurrency)
+        next_data["image_user_concurrency"] = image_user_concurrency
+        try:
+            image_queue_timeout_secs = max(30.0, float(next_data.get("image_queue_timeout_secs", 600.0)))
+        except (TypeError, ValueError):
+            image_queue_timeout_secs = 600.0
+        next_data["image_queue_timeout_secs"] = image_queue_timeout_secs
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:
