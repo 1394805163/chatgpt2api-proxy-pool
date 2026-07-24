@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,39 @@ from api.accounts import create_router
 
 
 class AccountImportAPITests(unittest.TestCase):
+    def test_import_can_skip_background_refresh(self) -> None:
+        service = MagicMock()
+        service.add_accounts.return_value = {
+            "added": 2,
+            "skipped": 0,
+            "items": [
+                {"access_token": "token-1"},
+                {"access_token": "token-2"},
+            ],
+        }
+
+        app = FastAPI()
+        with patch("api.accounts.account_service", service), patch("api.accounts.require_admin"):
+            app.include_router(create_router())
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/accounts",
+                    headers={"Authorization": "Bearer test"},
+                    json={
+                        "tokens": ["token-1", "token-2"],
+                        "refresh_after_import": False,
+                    },
+                )
+
+                self.assertEqual(response.status_code, 200)
+                payload = response.json()
+                self.assertEqual(payload["added"], 2)
+                self.assertEqual(payload["refreshing"], 0)
+                self.assertIsNone(payload["refresh_progress_id"])
+                service.init_refresh_progress.assert_not_called()
+                time.sleep(0.6)
+                service.refresh_accounts.assert_not_called()
+
     def test_import_returns_before_background_refresh_finishes(self) -> None:
         refresh_started = threading.Event()
         release_refresh = threading.Event()

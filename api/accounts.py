@@ -53,6 +53,7 @@ class UserKeyUpdateRequest(BaseModel):
 class AccountCreateRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
     accounts: list[dict[str, Any]] = Field(default_factory=list)
+    refresh_after_import: bool = True
 
 
 class AccountDeleteRequest(BaseModel):
@@ -243,6 +244,16 @@ def create_router() -> APIRouter:
                 result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
         else:
             result = account_service.add_accounts(tokens)
+
+        if not body.refresh_after_import:
+            return {
+                **result,
+                "refreshed": 0,
+                "errors": [],
+                "items": result.get("items", []),
+                "refresh_progress_id": None,
+                "refreshing": 0,
+            }
 
         progress_id = str(uuid.uuid4())
         account_service.init_refresh_progress(progress_id, len(tokens))
