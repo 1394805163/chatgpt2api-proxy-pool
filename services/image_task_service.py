@@ -377,7 +377,21 @@ class ImageTaskService:
             if not owner_queue:
                 self._pending_by_owner.pop(owner, None)
                 continue
-            if self._running_count_locked(owner) >= per_owner_limit:
+            pending = self._pending.get(owner_queue[0])
+            if pending is None:
+                owner_queue.popleft()
+                if owner_queue:
+                    self._ready_owners.append(owner)
+                else:
+                    self._pending_by_owner.pop(owner, None)
+                continue
+            identity = pending[2]
+            owner_limit = (
+                self._global_concurrency()
+                if _clean(identity.get("role")).lower() == "admin"
+                else per_owner_limit
+            )
+            if self._running_count_locked(owner) >= owner_limit:
                 self._ready_owners.append(owner)
                 continue
             key = owner_queue.popleft()

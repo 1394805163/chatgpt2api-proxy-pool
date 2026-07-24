@@ -279,9 +279,14 @@ class ImageTaskServiceTests(unittest.TestCase):
                 per_owner_concurrency_getter=lambda: 1,
             )
             owners = [
-                {"id": f"owner-{index}", "name": f"Owner {index}", "role": "admin"}
+                {"id": f"owner-{index}", "name": f"Owner {index}", "role": "user"}
                 for index in range(1, 4)
             ]
+            quota = mock.Mock()
+            quota.reserve_daily_request.return_value = False
+            quota_patcher = mock.patch("services.image_task_service.auth_service", quota)
+            quota_patcher.start()
+            self.addCleanup(quota_patcher.stop)
             for round_index in range(2):
                 for owner in owners:
                     task_id = f"{owner['id']}-{round_index}"
@@ -319,6 +324,61 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual(max_running, 3)
             self.assertTrue(all(value == 1 for value in max_running_by_owner.values()))
+
+    def test_admin_can_fill_global_concurrency_for_ten_image_batch(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            release = threading.Event()
+            state_lock = threading.Lock()
+            running = 0
+            max_running = 0
+            started_task_ids: list[str] = []
+
+            def handler(payload):
+                nonlocal running, max_running
+                with state_lock:
+                    running += 1
+                    max_running = max(max_running, running)
+                    started_task_ids.append(str(payload["client_task_id"]))
+                release.wait(10)
+                with state_lock:
+                    running -= 1
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=handler,
+                edit_handler=handler,
+                retention_days_getter=lambda: 30,
+                global_concurrency_getter=lambda: 10,
+                per_owner_concurrency_getter=lambda: 2,
+            )
+            for index in range(10):
+                service.submit_generation(
+                    OWNER,
+                    client_task_id=f"admin-batch-{index}",
+                    prompt="same prompt",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                with state_lock:
+                    if running == 10:
+                        break
+                time.sleep(0.01)
+
+            with state_lock:
+                observed_running = running
+                observed_started = len(set(started_task_ids))
+            release.set()
+            for index in range(10):
+                wait_for_task(service, OWNER, f"admin-batch-{index}", "success")
+
+            self.assertEqual(observed_running, 10)
+            self.assertEqual(max_running, 10)
+            self.assertEqual(observed_started, 10)
 
     def test_queued_time_does_not_consume_generation_deadline(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
