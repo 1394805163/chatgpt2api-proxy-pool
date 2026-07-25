@@ -87,6 +87,150 @@ class FakeSentinelSDKClient:
 
 
 class RegisterProxyRuntimeTests(unittest.TestCase):
+    def test_browser_fallback_user_agent_matches_runtime_chromium(self):
+        value = openai_register.BrowserPlatformRegistrar._user_agent_for_version(
+            "149.0.7827.55"
+        )
+
+        self.assertIn("Chrome/149.0.7827.55", value)
+        self.assertIn("X11; Linux x86_64", value)
+        self.assertNotIn("HeadlessChrome", value)
+
+    def test_browser_fallback_only_accepts_protocol_and_sentinel_failures(self):
+        retryable = [
+            openai_register.SentinelSDKError("Sentinel Node runner failed"),
+            RuntimeError("Cloudflare clearance retry is still blocked"),
+            RuntimeError('create_account_http_400, detail={"code":"registration_disallowed"}'),
+        ]
+        non_retryable = [
+            RuntimeError('TempMail.lol HTTP 429 {"error":"Rate limited (free)"}'),
+            RuntimeError("CloudflareTempMail request failed: HTTP 500"),
+            RuntimeError("waiting for registration OTP timed out"),
+            RuntimeError("Failed to create account. Please try again. mailbox domain rejected"),
+        ]
+
+        self.assertTrue(all(openai_register.should_use_browser_fallback(error) for error in retryable))
+        self.assertTrue(all(not openai_register.should_use_browser_fallback(error) for error in non_retryable))
+
+    def test_worker_retries_once_in_browser_with_next_pool_proxy(self):
+        class TrackingLock:
+            def __init__(self):
+                self.active = False
+
+            def __enter__(self):
+                self.active = True
+
+            def __exit__(self, *_args):
+                self.active = False
+
+        browser_lock = TrackingLock()
+        selections = [
+            SimpleNamespace(
+                proxy="http://protocol.example:8080",
+                source="text",
+                count=2,
+                last_error="",
+                last_fetch=0.0,
+            ),
+            SimpleNamespace(
+                proxy="http://browser.example:8080",
+                source="text",
+                count=2,
+                last_error="",
+                last_fetch=0.0,
+            ),
+        ]
+        def next_proxy(**_kwargs):
+            if len(selections) == 1:
+                self.assertTrue(browser_lock.active)
+            return selections.pop(0)
+
+        pool = SimpleNamespace(
+            next_proxy=next_proxy,
+            record_result=unittest.mock.Mock(return_value={"bucket": "other", "cooldown_seconds": 0}),
+        )
+        protocol_instances = []
+        browser_instances = []
+
+        class FailingProtocolRegistrar:
+            def __init__(self, proxy):
+                self.proxy = proxy
+                self.stage_timings = {"platform_authorize_ms": 12.0}
+                self.closed = False
+                protocol_instances.append(self)
+
+            def register(self, _index):
+                raise openai_register.SentinelSDKError("turnstile token is empty")
+
+            def close(self):
+                self.closed = True
+
+        class SuccessfulBrowserRegistrar:
+            def __init__(self, proxy):
+                self.proxy = proxy
+                browser_instances.append(self)
+
+            def register(self, _index):
+                return {
+                    "email": "browser@example.com",
+                    "password": "Password1!",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "id_token": "id-token",
+                    "source_type": "web",
+                    "created_at": "2026-07-25T00:00:00+00:00",
+                }
+
+        with patch.object(openai_register, "proxy_pool", pool), patch.object(
+            openai_register,
+            "PlatformRegistrar",
+            FailingProtocolRegistrar,
+        ), patch.object(
+            openai_register,
+            "BrowserPlatformRegistrar",
+            SuccessfulBrowserRegistrar,
+        ), patch.object(
+            openai_register.account_service,
+            "add_account_items",
+        ), patch.object(
+            openai_register.account_service,
+            "refresh_accounts",
+            return_value={"errors": []},
+        ), patch.object(
+            openai_register,
+            "log",
+        ), patch.object(
+            openai_register,
+            "step",
+        ), patch.object(
+            openai_register,
+            "browser_fallback_lock",
+            browser_lock,
+        ):
+            original_mode = openai_register.config.get("proxy_input_mode")
+            original_stats = dict(openai_register.stats)
+            try:
+                openai_register.config["proxy_input_mode"] = "text"
+                openai_register.stats.update(
+                    {"done": 0, "success": 0, "fail": 0, "start_time": 1.0}
+                )
+                result = openai_register.worker(1)
+            finally:
+                openai_register.config["proxy_input_mode"] = original_mode
+                openai_register.stats.clear()
+                openai_register.stats.update(original_stats)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(protocol_instances[0].closed)
+        self.assertEqual(browser_instances[0].proxy, "http://browser.example:8080")
+        self.assertEqual(pool.record_result.call_count, 2)
+        first_record = pool.record_result.call_args_list[0]
+        second_record = pool.record_result.call_args_list[1]
+        self.assertEqual(first_record.args[0], "http://protocol.example:8080")
+        self.assertFalse(first_record.kwargs["success"])
+        self.assertEqual(second_record.args[0], "http://browser.example:8080")
+        self.assertTrue(second_record.kwargs["success"])
+
     def test_create_session_uses_proxy_settings_without_breaking_existing_proxy_argument(self):
         fake_proxy = FakeProxySettings()
         created = []
@@ -109,6 +253,26 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertEqual(fake_proxy.session_kwargs_calls[0]["impersonate"], "chrome")
         self.assertFalse(fake_proxy.session_kwargs_calls[0]["verify"])
         self.assertEqual(session.kwargs["proxy"], "http://runtime.example:8118")
+
+    def test_clearance_user_agent_updates_matching_client_hints(self):
+        fake_proxy = FakeProxySettings()
+        clearance_user_agent = (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36"
+        )
+
+        with patch.object(openai_register, "proxy_settings", fake_proxy):
+            headers = openai_register._headers_with_clearance(
+                dict(openai_register.common_headers),
+                "https://auth.openai.com/api/accounts/create_account",
+                user_agent_override=clearance_user_agent,
+            )
+
+        normalized = {key.lower(): value for key, value in headers.items()}
+        self.assertEqual(normalized["user-agent"], clearance_user_agent)
+        self.assertIn('v="149"', normalized["sec-ch-ua"])
+        self.assertIn('149.0.7827.55', normalized["sec-ch-ua-full-version-list"])
+        self.assertEqual(normalized["sec-ch-ua-platform"], '"Linux"')
 
     def test_cloudflare_without_clearance_keeps_clear_register_error(self):
         fake_proxy = FakeProxySettings(bundle=None)
@@ -330,6 +494,22 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertIn("so_token=yes", logs)
         self.assertNotIn("sentinel-secret-value", logs)
         self.assertNotIn("so-secret-value", logs)
+
+    def test_sentinel_uses_cloudflare_clearance_user_agent(self):
+        fake_proxy = FakeProxySettings()
+        sentinel = FakeSentinelSDKClient()
+
+        with patch.object(openai_register, "proxy_settings", fake_proxy), patch.object(
+            openai_register,
+            "create_session",
+            return_value=FakeSession(),
+        ):
+            registrar = openai_register.PlatformRegistrar(proxy="")
+            registrar.sentinel_sdk = sentinel
+            registrar.clearance_user_agent = "Cloudflare Browser UA"
+            registrar._sentinel_headers("authorize_continue", 1)
+
+        self.assertEqual(sentinel.user_agent, "Cloudflare Browser UA")
 
 
 if __name__ == "__main__":

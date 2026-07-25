@@ -2,6 +2,9 @@
 
 ## Unreleased
 
++ [修复] OpenAI 协议注册改为动态发现并缓存当前官方 Sentinel SDK，通过轻量 Node VM 生成非空 Turnstile Token；最终建号使用 `oauth_create_account` 并等待 5000ms 生成 SO Token，同时写入 `oai-sc` Cookie。
++ [新增] 协议注册在 Sentinel、Cloudflare 或 `registration_disallowed` 阶段失败时，使用新邮箱执行一次全浏览器兜底；浏览器兜底全局单并发，代理池模式强制排除本次失败代理。
++ [安全] Sentinel SDK、frame 和 challenge 强制 TLS 校验，旧未验证缓存自动失效；Node runner 使用受限文件权限和脱敏环境，不向日志输出 Token 明文或原始错误流。
 + [优化] 管理员批量生图可使用全部空闲的全局并发容量；普通用户继续受单用户并发限制，兼顾管理员 10 张批量任务的集中返回与多用户公平性。
 + [优化] 生图任务采用全局与单用户双层公平队列，区分排队超时和实际生成超时，避免卡住任务长期占用并发槽。
 + [优化] 图片任务状态接口禁用共享缓存并缓存 CORS 预检，Docker 构建预取 token 编码资源且运行时支持离线估算回退。

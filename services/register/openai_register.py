@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from curl_cffi import requests
 
@@ -20,7 +20,7 @@ from services.account_service import account_service
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
 from services.register.proxy_pool import RegisterProxyPool
-from utils.sentinel_sdk import SentinelSDKClient, SentinelSDKTokens
+from utils.sentinel_sdk import SentinelSDKClient, SentinelSDKError, SentinelSDKTokens
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -77,6 +77,7 @@ sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0
 default_timeout = 30
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
+browser_fallback_lock = threading.Lock()
 stats = {
     "done": 0,
     "success": 0,
@@ -197,6 +198,29 @@ def _random_birthdate() -> str:
     return f"{random.randint(1996, 2006):04d}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
 
 
+def _platform_authorize_url(email: str, device_id: str) -> tuple[str, str]:
+    code_verifier, code_challenge = _generate_pkce()
+    params = {
+        "issuer": auth_base,
+        "client_id": platform_oauth_client_id,
+        "audience": platform_oauth_audience,
+        "redirect_uri": platform_oauth_redirect_uri,
+        "device_id": device_id,
+        "screen_hint": "signup",
+        "max_age": "0",
+        "login_hint": email,
+        "scope": "openid profile email offline_access",
+        "response_type": "code",
+        "response_mode": "query",
+        "state": secrets.token_urlsafe(32),
+        "nonce": secrets.token_urlsafe(32),
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "auth0Client": platform_auth0_client,
+    }
+    return f"{auth_base}/api/accounts/authorize?{urlencode(params)}", code_verifier
+
+
 def _response_json(resp) -> dict:
     try:
         data = resp.json()
@@ -300,8 +324,16 @@ def create_mailbox(username: str | None = None, register_proxy: str = "") -> dic
     return mail_provider.create_mailbox(_mail_config(register_proxy), username)
 
 
-def wait_for_code(mailbox: dict, register_proxy: str = "") -> str | None:
-    return mail_provider.wait_for_code(_mail_config(register_proxy), mailbox)
+def wait_for_code(
+    mailbox: dict,
+    register_proxy: str = "",
+    *,
+    wait_timeout: int | None = None,
+) -> str | None:
+    mail_config = _mail_config(register_proxy)
+    if wait_timeout is not None:
+        mail_config["wait_timeout"] = max(1, int(wait_timeout))
+    return mail_provider.wait_for_code(mail_config, mailbox)
 
 
 from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
@@ -353,6 +385,21 @@ def _headers_with_clearance(
     if user_agent_override:
         ua_key = next((key for key in normalized if key.lower() == "user-agent"), "user-agent")
         normalized[ua_key] = user_agent_override
+        fingerprint = SentinelSDKClient.client_hints_for_user_agent(user_agent_override)
+        hint_values = {
+            "sec-ch-ua": fingerprint["sec_ch_ua"],
+            "sec-ch-ua-full-version-list": fingerprint["sec_ch_ua_full_version_list"],
+            "sec-ch-ua-platform": f'"{fingerprint["platform"]}"',
+            "sec-ch-ua-platform-version": f'"{fingerprint["platform_version"]}"',
+            "sec-ch-ua-arch": f'"{fingerprint["architecture"]}"',
+            "sec-ch-ua-bitness": '"64"',
+        }
+        for header_name, header_value in hint_values.items():
+            key = next(
+                (item for item in normalized if item.lower() == header_name),
+                header_name,
+            )
+            normalized[key] = header_value
     return normalized
 
 
@@ -448,12 +495,10 @@ class PlatformRegistrar:
         self.code_verifier = ""
         self.platform_auth_code = ""
         self.stage_timings: dict[str, float] = {}
-        profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True)
-        sentinel_proxy = str(getattr(profile, "proxy_url", "") or self.proxy).strip()
         self.sentinel_sdk = SentinelSDKClient(
+            session=self.session,
             device_id=self.device_id,
             user_agent=user_agent,
-            proxy=sentinel_proxy,
         )
 
     def close(self) -> None:
@@ -469,6 +514,7 @@ class PlatformRegistrar:
         *,
         include_so: bool = False,
     ) -> dict[str, str]:
+        self.sentinel_sdk.user_agent = self.clearance_user_agent or user_agent
         tokens: SentinelSDKTokens = self.sentinel_sdk.get_tokens(
             flow,
             include_so=include_so,
@@ -759,6 +805,369 @@ class PlatformRegistrar:
         }
 
 
+def should_use_browser_fallback(error: BaseException) -> bool:
+    if isinstance(error, SentinelSDKError):
+        return True
+    text = str(error or "").lower()
+    if "registration_disallowed" in text:
+        return True
+    non_retryable = (
+        "rate limited (free)",
+        "http 429",
+        "otp timed out",
+        "otp_timeout",
+        "failed to create account. please try again",
+        "mailbox domain",
+        "email provider",
+        "tempmail",
+    )
+    if any(marker in text for marker in non_retryable):
+        return False
+    return "sentinel" in text or "cloudflare" in text or "just a moment" in text
+
+
+class BrowserPlatformRegistrar:
+    EMAIL_SELECTORS = (
+        'input[type="email"]',
+        'input[name="email"]',
+        'input[name="username"]',
+        '#email-input',
+    )
+    PASSWORD_SELECTORS = (
+        'input[type="password"]',
+        'input[name="password"]',
+    )
+    OTP_SELECTORS = (
+        'input[autocomplete="one-time-code"]',
+        'input[name="code"]',
+        'input[inputmode="numeric"]',
+    )
+    NAME_SELECTORS = (
+        'input[name="name"]',
+        'input[autocomplete="name"]',
+        'input[placeholder*="name" i]',
+    )
+    BIRTHDATE_SELECTORS = (
+        'input[name="birthdate"]',
+        'input[name="birthday"]',
+        'input[type="date"]',
+        'input[placeholder*="MM" i]',
+    )
+    SUBMIT_SELECTORS = (
+        'button[type="submit"]',
+        'button:has-text("Continue")',
+        'button:has-text("Create account")',
+        'button:has-text("Verify")',
+    )
+
+    def __init__(self, proxy: str = "") -> None:
+        self.proxy = str(proxy or "").strip()
+        self.device_id = str(uuid.uuid4())
+        self.response_events: list[str] = []
+
+    @staticmethod
+    def _user_agent_for_version(version: str) -> str:
+        browser_version = str(version or "").strip().rsplit("/", 1)[-1]
+        if not browser_version or any(
+            character not in "0123456789." for character in browser_version
+        ):
+            browser_version = "145.0.0.0"
+        return (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{browser_version} Safari/537.36"
+        )
+
+    @staticmethod
+    def _proxy_config(proxy: str) -> dict[str, str] | None:
+        value = str(proxy or "").strip()
+        if not value:
+            return None
+        if "://" not in value:
+            value = f"http://{value}"
+        parsed = urlparse(value)
+        if not parsed.hostname:
+            raise RuntimeError("Browser fallback proxy is invalid")
+        scheme = "socks5" if parsed.scheme.lower() == "socks5h" else parsed.scheme.lower()
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        server = f"{scheme}://{host}"
+        if parsed.port:
+            server += f":{parsed.port}"
+        result = {"server": server}
+        if parsed.username:
+            result["username"] = unquote(parsed.username)
+        if parsed.password:
+            result["password"] = unquote(parsed.password)
+        return result
+
+    @staticmethod
+    def _visible_locator(page: Any, selectors: tuple[str, ...], timeout_ms: int = 60000) -> Any:
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            for selector in selectors:
+                locator = page.locator(selector).first
+                try:
+                    if locator.count() and locator.is_visible():
+                        return locator
+                except Exception:
+                    continue
+            page.wait_for_timeout(250)
+        return None
+
+    @classmethod
+    def _fill(cls, page: Any, selectors: tuple[str, ...], value: str, label: str) -> Any:
+        locator = cls._visible_locator(page, selectors)
+        if locator is None:
+            raise RuntimeError(f"Browser fallback could not find {label} input")
+        locator.fill(value)
+        return locator
+
+    @classmethod
+    def _submit(cls, page: Any, fallback_locator: Any) -> None:
+        button = cls._visible_locator(page, cls.SUBMIT_SELECTORS, timeout_ms=5000)
+        if button is not None:
+            button.click()
+        else:
+            fallback_locator.press("Enter")
+
+    @classmethod
+    def _fill_otp(cls, page: Any, code: str) -> Any:
+        locator = cls._visible_locator(page, cls.OTP_SELECTORS)
+        if locator is None:
+            raise RuntimeError("Browser fallback could not find OTP input")
+        try:
+            locator.fill(code)
+            return locator
+        except Exception:
+            inputs = page.locator('input[inputmode="numeric"]:visible')
+            if inputs.count() < len(code):
+                raise RuntimeError("Browser fallback OTP input layout is unsupported")
+            for index, digit in enumerate(code):
+                inputs.nth(index).fill(digit)
+            return inputs.nth(len(code) - 1)
+
+    @classmethod
+    def _fill_birthdate(cls, page: Any, birthdate: str) -> Any:
+        locator = cls._visible_locator(page, cls.BIRTHDATE_SELECTORS, timeout_ms=10000)
+        if locator is not None:
+            locator.fill(birthdate)
+            return locator
+        year, month, day = birthdate.split("-")
+        segment_values = (
+            (('input[name="month"]', '[role="spinbutton"][aria-label*="month" i]'), month),
+            (('input[name="day"]', '[role="spinbutton"][aria-label*="day" i]'), day),
+            (('input[name="year"]', '[role="spinbutton"][aria-label*="year" i]'), year),
+        )
+        last_locator = None
+        for selectors, value in segment_values:
+            last_locator = cls._visible_locator(page, selectors, timeout_ms=5000)
+            if last_locator is None:
+                raise RuntimeError("Browser fallback could not find birthdate input")
+            last_locator.fill(value)
+        return last_locator
+
+    def _record_response(self, response: Any) -> None:
+        url = str(getattr(response, "url", "") or "")
+        if "/api/accounts/" not in url:
+            return
+        try:
+            status = int(getattr(response, "status", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status < 400:
+            return
+        code = ""
+        message = ""
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                error = data.get("error") if isinstance(data.get("error"), dict) else data
+                code = str(error.get("code") or error.get("type") or "")
+                message = str(error.get("message") or data.get("message") or "")
+        except Exception:
+            pass
+        path = urlparse(url).path
+        self.response_events.append(
+            f"{path}:HTTP {status}, code={code[:80]}, message={message[:180]}"
+        )
+        self.response_events = self.response_events[-5:]
+
+    def _page_error_context(self, page: Any) -> str:
+        try:
+            title = str(page.title() or "")[:120]
+        except Exception:
+            title = ""
+        try:
+            body = " ".join(str(page.locator("body").inner_text(timeout=1000) or "").split())[:240]
+        except Exception:
+            body = ""
+        events = " | ".join(self.response_events[-3:])
+        return (
+            f"url={str(getattr(page, 'url', '') or '')[:240]}, title={title}, "
+            f"body={body}, responses={events}"
+        )
+
+    def _complete_browser_flow(
+        self,
+        page: Any,
+        *,
+        authorize_url: str,
+        mailbox: dict,
+        email: str,
+        password: str,
+        name: str,
+        birthdate: str,
+        index: int,
+    ) -> str:
+        page.goto(authorize_url, wait_until="domcontentloaded", timeout=90000)
+        stage_locator = self._visible_locator(
+            page,
+            self.EMAIL_SELECTORS + self.PASSWORD_SELECTORS,
+        )
+        if stage_locator is None:
+            raise RuntimeError(
+                f"Browser fallback did not reach signup form: {self._page_error_context(page)}"
+            )
+        if str(stage_locator.get_attribute("type") or "").lower() != "password":
+            stage_locator.fill(email)
+            self._submit(page, stage_locator)
+        password_input = self._fill(page, self.PASSWORD_SELECTORS, password, "password")
+        self._submit(page, password_input)
+
+        if self._visible_locator(page, self.OTP_SELECTORS) is None:
+            raise RuntimeError(
+                f"Browser fallback did not reach OTP form: {self._page_error_context(page)}"
+            )
+        step(index, "Browser fallback is waiting for a fresh mailbox OTP")
+        code = wait_for_code(mailbox, register_proxy=self.proxy, wait_timeout=90)
+        if not code:
+            raise RuntimeError("Browser fallback OTP timed out")
+        otp_input = self._fill_otp(page, code)
+        self._submit(page, otp_input)
+
+        deadline = time.monotonic() + 60
+        name_input = None
+        while time.monotonic() < deadline:
+            callback = extract_oauth_callback_params_from_url(str(page.url or ""))
+            if callback:
+                return callback["code"]
+            name_input = self._visible_locator(page, self.NAME_SELECTORS, timeout_ms=500)
+            if name_input is not None:
+                break
+        if name_input is None:
+            raise RuntimeError(
+                f"Browser fallback did not reach profile form: {self._page_error_context(page)}"
+            )
+        name_input.fill(name)
+        birthdate_input = self._fill_birthdate(page, birthdate)
+        self._submit(page, birthdate_input)
+
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            callback = extract_oauth_callback_params_from_url(str(page.url or ""))
+            if callback:
+                return callback["code"]
+            page.wait_for_timeout(250)
+        raise RuntimeError(
+            f"Browser fallback did not receive OAuth callback: {self._page_error_context(page)}"
+        )
+
+    def register(self, index: int) -> dict:
+        mailbox = create_mailbox(register_proxy=self.proxy)
+        email = str(mailbox.get("address") or "").strip()
+        if not email:
+            mail_provider.release_mailbox(mailbox)
+            raise RuntimeError("Browser fallback mailbox has no address")
+        password = _random_password()
+        first_name, last_name = _random_name()
+        name = f"{first_name} {last_name}"
+        birthdate = _random_birthdate()
+        authorize_url, code_verifier = _platform_authorize_url(email, self.device_id)
+        step(index, f"Browser fallback created fresh mailbox [{mailbox.get('label', '')}]: {email}")
+        try:
+            try:
+                from playwright.sync_api import sync_playwright
+            except Exception as exc:
+                raise RuntimeError("Playwright is required for browser registration fallback") from exc
+
+            profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True)
+            browser_proxy = str(getattr(profile, "proxy_url", "") or self.proxy).strip()
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            }
+            proxy_config = self._proxy_config(browser_proxy)
+            if proxy_config:
+                launch_kwargs["proxy"] = proxy_config
+
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(**launch_kwargs)
+                try:
+                    context = browser.new_context(
+                        user_agent=self._user_agent_for_version(browser.version),
+                        locale="en-US",
+                        viewport={"width": 1365, "height": 900},
+                        ignore_https_errors=True,
+                    )
+                    context.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                    )
+                    context.add_cookies(
+                        [
+                            {
+                                "name": "oai-did",
+                                "value": self.device_id,
+                                "domain": ".openai.com",
+                                "path": "/",
+                                "secure": True,
+                                "sameSite": "Lax",
+                            }
+                        ]
+                    )
+                    page = context.new_page()
+                    page.set_default_timeout(60000)
+                    page.on("response", self._record_response)
+                    auth_code = self._complete_browser_flow(
+                        page,
+                        authorize_url=authorize_url,
+                        mailbox=mailbox,
+                        email=email,
+                        password=password,
+                        name=name,
+                        birthdate=birthdate,
+                        index=index,
+                    )
+                finally:
+                    browser.close()
+
+            token_session = create_session(self.proxy)
+            try:
+                tokens = request_platform_oauth_token(token_session, auth_code, code_verifier)
+            finally:
+                token_session.close()
+            if not tokens:
+                raise RuntimeError("Browser fallback OAuth token exchange failed")
+        except Exception as error:
+            mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
+            raise
+        mail_provider.mark_mailbox_result(mailbox, success=True)
+        return {
+            "email": email,
+            "password": password,
+            "access_token": str(tokens.get("access_token") or "").strip(),
+            "refresh_token": str(tokens.get("refresh_token") or "").strip(),
+            "id_token": str(tokens.get("id_token") or "").strip(),
+            "source_type": "web",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
 def configure_proxy_pool(fetch_now: bool = False) -> dict[str, object]:
     try:
         refresh_interval = int(config.get("proxy_refresh_interval") or 120)
@@ -829,18 +1238,61 @@ def worker(index: int) -> dict:
     if str(config.get("proxy_input_mode") or "single") in {"url", "text"} and not selection.proxy:
         step(index, selection.last_error or "No proxy available, skipping", "yellow")
         return {"ok": False, "index": index, "error": selection.last_error or "no_proxy"}
-    registrar = PlatformRegistrar(selection.proxy)
+    active_selection = selection
+    attempt_started = start
+    attempt_recorded = False
+    registrar: PlatformRegistrar | None = PlatformRegistrar(selection.proxy)
     try:
         step(index, "任务启动")
-        result = registrar.register(index)
+        try:
+            result = registrar.register(index)
+        except Exception as protocol_error:
+            if not should_use_browser_fallback(protocol_error):
+                raise
+            platform_authorize_ms = float(
+                registrar.stage_timings.get("platform_authorize_ms") or 0.0
+            )
+            proxy_pool.record_result(
+                active_selection.proxy,
+                success=False,
+                error=str(protocol_error),
+                cost_seconds=time.time() - attempt_started,
+                platform_authorize_ms=platform_authorize_ms,
+            )
+            attempt_recorded = True
+            registrar.close()
+            registrar = None
+            with browser_fallback_lock:
+                if str(config.get("proxy_input_mode") or "single") in {"url", "text"}:
+                    active_selection = proxy_pool.next_proxy(
+                        exclude_proxy=selection.proxy,
+                    )
+                    if not active_selection.proxy:
+                        raise RuntimeError(
+                            active_selection.last_error or "No proxy available for browser fallback"
+                        )
+                with stats_lock:
+                    stats["current_proxy"] = active_selection.proxy
+                attempt_started = time.time()
+                attempt_recorded = False
+                step(
+                    index,
+                    "Protocol registration failed in Sentinel/Cloudflare stage; "
+                    "starting one serialized browser fallback with a fresh mailbox",
+                    "yellow",
+                )
+                result = BrowserPlatformRegistrar(active_selection.proxy).register(index)
         cost = time.time() - start
-        platform_authorize_ms = float(registrar.stage_timings.get("platform_authorize_ms") or 0.0)
-        proxy_outcome = proxy_pool.record_result(
-            selection.proxy,
+        platform_authorize_ms = float(
+            registrar.stage_timings.get("platform_authorize_ms") or 0.0
+        ) if registrar is not None else 0.0
+        proxy_pool.record_result(
+            active_selection.proxy,
             success=True,
-            cost_seconds=cost,
+            cost_seconds=time.time() - attempt_started,
             platform_authorize_ms=platform_authorize_ms,
         )
+        attempt_recorded = True
         access_token = str(result["access_token"])
         account_service.add_account_items([result])
         refresh_result = account_service.refresh_accounts([access_token])
@@ -854,18 +1306,22 @@ def worker(index: int) -> dict:
         return {"ok": True, "index": index, "result": result}
     except Exception as e:
         cost = time.time() - start
-        platform_authorize_ms = float(registrar.stage_timings.get("platform_authorize_ms") or 0.0)
-        proxy_outcome = proxy_pool.record_result(
-            selection.proxy,
-            success=False,
-            error=str(e),
-            cost_seconds=cost,
-            platform_authorize_ms=platform_authorize_ms,
-        )
+        platform_authorize_ms = float(
+            registrar.stage_timings.get("platform_authorize_ms") or 0.0
+        ) if registrar is not None else 0.0
+        if not attempt_recorded:
+            proxy_pool.record_result(
+                active_selection.proxy,
+                success=False,
+                error=str(e),
+                cost_seconds=time.time() - attempt_started,
+                platform_authorize_ms=platform_authorize_ms,
+            )
         with stats_lock:
             stats["done"] += 1
             stats["fail"] += 1
         log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
         return {"ok": False, "index": index, "error": str(e)}
     finally:
-        registrar.close()
+        if registrar is not None:
+            registrar.close()

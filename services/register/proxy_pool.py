@@ -161,7 +161,8 @@ class RegisterProxyPool:
             self._reset_selection_cycle_locked()
             return self.state()
 
-    def next_proxy(self) -> ProxyPoolSelection:
+    def next_proxy(self, *, exclude_proxy: str = "") -> ProxyPoolSelection:
+        excluded = normalize_proxy_url(exclude_proxy)
         with self._lock:
             mode = self._mode
         if mode == "url" and self._should_refresh():
@@ -187,7 +188,17 @@ class RegisterProxyPool:
                     last_fetch=self._last_fetch,
                     selection_reason="no_proxy",
                 )
-            proxy, proxy_index, used_cooling_proxy, selection_reason = self._next_available_proxy_locked()
+            if excluded and all(proxy == excluded for proxy in self._proxies):
+                self._current_proxy = ""
+                return ProxyPoolSelection(
+                    proxy="",
+                    source=self._mode,
+                    count=len(self._proxies),
+                    last_error="No alternate proxy is available for browser fallback",
+                    last_fetch=self._last_fetch,
+                    selection_reason="alternate_proxy_unavailable",
+                )
+            proxy, proxy_index, used_cooling_proxy, selection_reason = self._next_available_proxy_locked(excluded)
             self._current_proxy = proxy
             return ProxyPoolSelection(
                 proxy=proxy,
@@ -333,7 +344,7 @@ class RegisterProxyPool:
             self._save_proxy_state_locked()
             return {"bucket": bucket, "cooldown_seconds": cooldown_seconds}
 
-    def _next_available_proxy_locked(self) -> tuple[str, int, bool, str]:
+    def _next_available_proxy_locked(self, excluded_proxy: str = "") -> tuple[str, int, bool, str]:
         now = time.time()
         count = len(self._proxies)
         start_index = self._index
@@ -343,6 +354,8 @@ class RegisterProxyPool:
         for offset in range(count):
             index = (start_index + offset) % count
             proxy = self._proxies[index]
+            if proxy == excluded_proxy:
+                continue
             state = self._proxy_state.get(proxy) or {}
             if self._is_proxy_blocked_locked(state, now):
                 continue
@@ -362,7 +375,12 @@ class RegisterProxyPool:
             self._record_selection_metric_locked(reason)
             return proxy, index, False, reason
 
-        index, proxy = self._fallback_proxy_locked(start_index, now, avoid_new_proxy=history_exists and not new_proxy_allowed)
+        index, proxy = self._fallback_proxy_locked(
+            start_index,
+            now,
+            avoid_new_proxy=history_exists and not new_proxy_allowed,
+            excluded_proxy=excluded_proxy,
+        )
         proxy = self._proxies[index]
         self._index = index + 1
         state = self._proxy_state.get(proxy) or {}
@@ -381,13 +399,22 @@ class RegisterProxyPool:
             return "new_proxy", 1.0
         return "retry_after_cooldown", 2.0
 
-    def _fallback_proxy_locked(self, start_index: int, now: float, *, avoid_new_proxy: bool) -> tuple[int, str]:
+    def _fallback_proxy_locked(
+        self,
+        start_index: int,
+        now: float,
+        *,
+        avoid_new_proxy: bool,
+        excluded_proxy: str = "",
+    ) -> tuple[int, str]:
         fallback: tuple[float, int, str] | None = None
         count = len(self._proxies)
         for prefer_history in (avoid_new_proxy, False):
             for offset in range(count):
                 index = (start_index + offset) % count
                 proxy = self._proxies[index]
+                if proxy == excluded_proxy:
+                    continue
                 state = self._proxy_state.get(proxy) or {}
                 if prefer_history and int(state.get("success_count") or 0) <= 0:
                     continue
