@@ -81,6 +81,38 @@ class RegisterProxyPoolTests(unittest.TestCase):
         self.assertEqual(pool.next_proxy().proxy, "http://127.0.0.2:8080")
         self.assertEqual(pool.next_proxy().proxy, "http://127.0.0.1:8080")
 
+    def test_browser_fallback_can_exclude_failed_protocol_proxy(self) -> None:
+        pool = self.make_pool()
+        pool.configure(
+            mode="text",
+            single_proxy="",
+            proxy_url="",
+            proxy_list_text="127.0.0.1:8080\n127.0.0.2:8080",
+            refresh_interval=120,
+        )
+        failed = pool.next_proxy()
+        pool.record_result(failed.proxy, success=False, error="Sentinel SDK failed")
+
+        fallback = pool.next_proxy(exclude_proxy=failed.proxy)
+
+        self.assertNotEqual(fallback.proxy, failed.proxy)
+
+    def test_browser_fallback_exclusion_does_not_reuse_the_only_failed_proxy(self) -> None:
+        pool = self.make_pool()
+        pool.configure(
+            mode="text",
+            single_proxy="",
+            proxy_url="",
+            proxy_list_text="127.0.0.1:8080",
+            refresh_interval=120,
+        )
+        failed = pool.next_proxy()
+
+        fallback = pool.next_proxy(exclude_proxy=failed.proxy)
+
+        self.assertEqual(fallback.proxy, "")
+        self.assertIn("alternate proxy", fallback.last_error.lower())
+
     def test_url_mode_fetches_proxy_list(self) -> None:
         with proxy_list_server("127.0.0.1:8080\nsocks5://127.0.0.2:1080\n") as url:
             pool = self.make_pool()

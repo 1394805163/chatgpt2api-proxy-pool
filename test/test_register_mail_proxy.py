@@ -79,6 +79,25 @@ class RegisterMailProxyTests(unittest.TestCase):
 
         self.assertEqual(openai_register._mail_config("http://worker.example:9000")["proxy"], "")
 
+    def test_browser_fallback_can_extend_mail_wait_without_changing_saved_config(self) -> None:
+        openai_register.config["mail"] = {
+            "api_use_register_proxy": False,
+            "wait_timeout": 30,
+            "providers": [cloudmail_entry()],
+        }
+        mailbox = {"address": "user@example.com"}
+
+        with patch.object(mail_provider, "wait_for_code", return_value="123456") as wait:
+            code = openai_register.wait_for_code(
+                mailbox,
+                register_proxy="http://worker.example:9000",
+                wait_timeout=90,
+            )
+
+        self.assertEqual(code, "123456")
+        self.assertEqual(wait.call_args.args[0]["wait_timeout"], 90)
+        self.assertEqual(openai_register.config["mail"]["wait_timeout"], 30)
+
     def test_provider_session_receives_no_proxy_when_disabled(self) -> None:
         openai_register.config["mail"] = {
             "api_use_register_proxy": False,
