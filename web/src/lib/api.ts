@@ -16,12 +16,22 @@ export type ImageStorageSettings = {
   public_base_url: string;
 };
 
+export type FreeAccountCleanupAction = "mark_abnormal" | "delete";
+
+export type FreeAccountCleanupSettings = {
+  enabled: boolean;
+  interval_minutes: number | string;
+  failure_threshold: number | string;
+  action: FreeAccountCleanupAction;
+};
+
 export type Account = {
   access_token: string;
   type: AccountType;
   source_type?: string | null;
   status: AccountStatus;
   quota: number;
+  image_quota_unknown?: boolean;
   email?: string | null;
   user_id?: string | null;
   limits_progress?: Array<{
@@ -30,6 +40,8 @@ export type Account = {
     reset_after?: string;
   }>;
   default_model_slug?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
   restore_at?: string | null;
   success: number;
   fail: number;
@@ -74,6 +86,8 @@ type AccountMutationResponse = {
   removed?: number;
   refreshed?: number;
   relogined?: number;
+  refresh_progress_id?: string;
+  refreshing?: number;
   errors?: Array<{ access_token: string; error: string }>;
 };
 
@@ -154,6 +168,7 @@ export type ThirdPartyAppsSettings = {
 export type SettingsConfig = {
   proxy: string;
   base_url?: string;
+  display_timezone?: string;
   global_system_prompt?: string;
   sensitive_words?: string[];
   ai_review?: {
@@ -166,6 +181,8 @@ export type SettingsConfig = {
   refresh_account_interval_minute?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
+  image_task_timeout_secs?: number | string;
+  user_image_task_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
   image_parallel_generation?: boolean;
   image_settle_enabled?: boolean;
@@ -176,6 +193,7 @@ export type SettingsConfig = {
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
   auto_relogin_after_refresh?: boolean;
+  free_account_cleanup?: FreeAccountCleanupSettings;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
   proxy_runtime?: ProxyRuntimeSettings;
@@ -261,6 +279,10 @@ export type ManagedImage = {
   width?: number;
   height?: number;
   tags?: string[];
+  browser_cached?: boolean;
+  server_available?: boolean;
+  cache_key?: string;
+  source_url?: string;
 };
 
 export type SystemLog = {
@@ -305,6 +327,11 @@ export type LoginResponse = {
   role: AuthRole;
   subject_id: string;
   name: string;
+  daily_request_limit: number;
+  daily_request_used: number;
+  daily_request_remaining: number | null;
+  daily_request_date: string | null;
+  image_request_limit: number;
 };
 
 export type UserKey = {
@@ -314,6 +341,19 @@ export type UserKey = {
   enabled: boolean;
   created_at: string | null;
   last_used_at: string | null;
+  daily_request_limit: number;
+  daily_request_used: number;
+  daily_request_remaining: number | null;
+  daily_request_date: string | null;
+  image_request_limit: number;
+};
+
+export type OutlookPoolStats = {
+  unused: number;
+  in_use: number;
+  used: number;
+  token_invalid: number;
+  failed: number;
 };
 
 export async function login(authKey: string) {
@@ -517,6 +557,10 @@ export async function fetchSettingsConfig() {
   return httpRequest<{ config: SettingsConfig }>("/api/settings");
 }
 
+export async function fetchDisplaySettings() {
+  return httpRequest<{ display_timezone: string }>("/api/display-settings");
+}
+
 export async function updateSettingsConfig(settings: SettingsConfig) {
   return httpRequest<{ config: SettingsConfig }>("/api/settings", {
     method: "POST",
@@ -674,14 +718,21 @@ export async function fetchUserKeys() {
   return httpRequest<{ items: UserKey[] }>("/api/auth/users");
 }
 
-export async function createUserKey(name: string) {
+export async function createUserKey(input: { name: string; daily_request_limit: number; image_request_limit: number }) {
   return httpRequest<{ item: UserKey; key: string; items: UserKey[] }>("/api/auth/users", {
     method: "POST",
-    body: { name },
+    body: input,
   });
 }
 
-export async function updateUserKey(keyId: string, updates: { enabled?: boolean; name?: string; key?: string }) {
+export async function updateUserKey(keyId: string, updates: {
+  enabled?: boolean;
+  name?: string;
+  key?: string;
+  daily_request_limit?: number;
+  image_request_limit?: number;
+  reset_daily_usage?: boolean;
+}) {
   return httpRequest<{ item: UserKey; items: UserKey[] }>(`/api/auth/users/${keyId}`, {
     method: "POST",
     body: updates,

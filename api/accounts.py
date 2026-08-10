@@ -37,17 +37,23 @@ from services.sub2api_service import (
 
 class UserKeyCreateRequest(BaseModel):
     name: str = ""
+    daily_request_limit: int = Field(default=0, ge=0, le=1_000_000)
+    image_request_limit: int = Field(default=5, ge=1, le=100)
 
 
 class UserKeyUpdateRequest(BaseModel):
     name: str | None = None
     enabled: bool | None = None
     key: str | None = None
+    daily_request_limit: int | None = Field(default=None, ge=0, le=1_000_000)
+    image_request_limit: int | None = Field(default=None, ge=1, le=100)
+    reset_daily_usage: bool | None = None
 
 
 class AccountCreateRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
     accounts: list[dict[str, Any]] = Field(default_factory=list)
+    refresh_after_import: bool = True
 
 
 class AccountDeleteRequest(BaseModel):
@@ -169,7 +175,12 @@ def create_router() -> APIRouter:
     async def create_user_key(body: UserKeyCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            item, raw_key = auth_service.create_key(role="user", name=body.name)
+            item, raw_key = auth_service.create_key(
+                role="user",
+                name=body.name,
+                daily_request_limit=body.daily_request_limit,
+                image_request_limit=body.image_request_limit,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         return {"item": item, "key": raw_key, "items": auth_service.list_keys(role="user")}
@@ -187,6 +198,9 @@ def create_router() -> APIRouter:
                 "name": body.name,
                 "enabled": body.enabled,
                 "key": body.key,
+                "daily_request_limit": body.daily_request_limit,
+                "image_request_limit": body.image_request_limit,
+                "reset_daily_usage": body.reset_daily_usage,
             }.items()
             if value is not None
         }
@@ -230,12 +244,35 @@ def create_router() -> APIRouter:
                 result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
         else:
             result = account_service.add_accounts(tokens)
-        refresh_result = account_service.refresh_accounts(tokens)
+
+        if not body.refresh_after_import:
+            return {
+                **result,
+                "refreshed": 0,
+                "errors": [],
+                "items": result.get("items", []),
+                "refresh_progress_id": None,
+                "refreshing": 0,
+            }
+
+        progress_id = str(uuid.uuid4())
+        account_service.init_refresh_progress(progress_id, len(tokens))
+
+        async def _do_refresh():
+            try:
+                await asyncio.sleep(0.5)
+                await run_in_threadpool(account_service.refresh_accounts, tokens, progress_id, False)
+            except Exception as exc:
+                account_service.finish_refresh_progress(progress_id, error=str(exc))
+
+        asyncio.create_task(_do_refresh())
         return {
             **result,
-            "refreshed": refresh_result.get("refreshed", 0),
-            "errors": refresh_result.get("errors", []),
-            "items": refresh_result.get("items", result.get("items", [])),
+            "refreshed": 0,
+            "errors": [],
+            "items": result.get("items", []),
+            "refresh_progress_id": progress_id,
+            "refreshing": len(tokens),
         }
 
     @router.delete("/api/accounts")
@@ -256,6 +293,7 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
+        account_service.init_refresh_progress(progress_id, len(access_tokens))
 
         async def _do_refresh():
             try:
@@ -284,6 +322,7 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
+        account_service.init_relogin_progress(progress_id, len(access_tokens))
 
         async def _do_relogin():
             try:

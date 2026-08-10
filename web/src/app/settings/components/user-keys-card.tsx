@@ -17,30 +17,24 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { createUserKey, deleteUserKey, fetchUserKeys, updateUserKey, type UserKey } from "@/lib/api";
+import { DEFAULT_DISPLAY_TIMEZONE, formatDisplayDateTime, normalizeDisplayTimezone } from "@/lib/display-time";
 
-function formatDateTime(value?: string | null) {
-  if (!value) {
-    return "—";
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
+import { useSettingsStore } from "../store";
+
+function formatDateTime(value: string | null | undefined, timezone: string) {
+  return formatDisplayDateTime(value, timezone, "—");
 }
 
 export function UserKeysCard() {
+  const config = useSettingsStore((state) => state.config);
+  const displayTimezone = normalizeDisplayTimezone(config?.display_timezone || DEFAULT_DISPLAY_TIMEZONE);
   const didLoadRef = useRef(false);
   const [items, setItems] = useState<UserKey[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [name, setName] = useState("");
+  const [dailyRequestLimit, setDailyRequestLimit] = useState("0");
+  const [imageRequestLimit, setImageRequestLimit] = useState("5");
   const [isCreating, setIsCreating] = useState(false);
   const [pendingIds, setPendingIds] = useState<Set<string>>(() => new Set());
   const [revealedKey, setRevealedKey] = useState("");
@@ -48,6 +42,8 @@ export function UserKeysCard() {
   const [editingItem, setEditingItem] = useState<UserKey | null>(null);
   const [editName, setEditName] = useState("");
   const [editKey, setEditKey] = useState("");
+  const [editDailyRequestLimit, setEditDailyRequestLimit] = useState("0");
+  const [editImageRequestLimit, setEditImageRequestLimit] = useState("5");
 
   const load = async () => {
     setIsLoading(true);
@@ -72,10 +68,16 @@ export function UserKeysCard() {
   const handleCreate = async () => {
     setIsCreating(true);
     try {
-      const data = await createUserKey(name.trim());
+      const data = await createUserKey({
+        name: name.trim(),
+        daily_request_limit: Math.max(0, Number(dailyRequestLimit) || 0),
+        image_request_limit: Math.min(100, Math.max(1, Number(imageRequestLimit) || 5)),
+      });
       setItems(data.items);
       setRevealedKey(data.key);
       setName("");
+      setDailyRequestLimit("0");
+      setImageRequestLimit("5");
       setIsDialogOpen(false);
       toast.success("用户密钥已创建");
     } catch (error) {
@@ -132,6 +134,8 @@ export function UserKeysCard() {
     setEditingItem(item);
     setEditName(item.name);
     setEditKey("");
+    setEditDailyRequestLimit(String(item.daily_request_limit));
+    setEditImageRequestLimit(String(item.image_request_limit));
   };
 
   const handleEdit = async () => {
@@ -141,7 +145,14 @@ export function UserKeysCard() {
     const item = editingItem;
     const trimmedName = editName.trim();
     const trimmedKey = editKey.trim();
-    if (trimmedName === item.name && !trimmedKey) {
+    const nextDailyRequestLimit = Math.max(0, Number(editDailyRequestLimit) || 0);
+    const nextImageRequestLimit = Math.min(100, Math.max(1, Number(editImageRequestLimit) || 5));
+    if (
+      trimmedName === item.name &&
+      !trimmedKey &&
+      nextDailyRequestLimit === item.daily_request_limit &&
+      nextImageRequestLimit === item.image_request_limit
+    ) {
       setEditingItem(null);
       return;
     }
@@ -150,6 +161,12 @@ export function UserKeysCard() {
       const data = await updateUserKey(item.id, {
         ...(trimmedName !== item.name ? { name: trimmedName } : {}),
         ...(trimmedKey ? { key: trimmedKey } : {}),
+        ...(nextDailyRequestLimit !== item.daily_request_limit
+          ? { daily_request_limit: nextDailyRequestLimit }
+          : {}),
+        ...(nextImageRequestLimit !== item.image_request_limit
+          ? { image_request_limit: nextImageRequestLimit }
+          : {}),
       });
       setItems(data.items);
       setEditingItem(null);
@@ -231,8 +248,12 @@ export function UserKeysCard() {
                         </Badge>
                       </div>
                       <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-500">
-                        <span>创建时间 {formatDateTime(item.created_at)}</span>
-                        <span>最近使用 {formatDateTime(item.last_used_at)}</span>
+                        <span>创建时间 {formatDateTime(item.created_at, displayTimezone)}</span>
+                        <span>最近使用 {formatDateTime(item.last_used_at, displayTimezone)}</span>
+                        <span>
+                          今日成功请求 {item.daily_request_used} / {item.daily_request_limit > 0 ? item.daily_request_limit : "不限"}
+                        </span>
+                        <span>单次生图最多 {item.image_request_limit} 张</span>
                       </div>
                     </div>
 
@@ -298,6 +319,31 @@ export function UserKeysCard() {
               placeholder="例如：设计同学 A、运营临时账号"
               className="h-11 rounded-xl border-stone-200 bg-white"
             />
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">每日成功请求上限</label>
+              <Input
+                type="number"
+                min="0"
+                max="1000000"
+                value={dailyRequestLimit}
+                onChange={(event) => setDailyRequestLimit(event.target.value)}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">填 0 表示不限，按设置时区每天 00:00 重置。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">单次生图上限</label>
+              <Input
+                type="number"
+                min="1"
+                max="100"
+                value={imageRequestLimit}
+                onChange={(event) => setImageRequestLimit(event.target.value)}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+            </div>
           </div>
           <DialogFooter>
             <Button
@@ -390,6 +436,31 @@ export function UserKeysCard() {
               <p className="text-xs leading-5 text-stone-500">
                 保存后旧密钥会立即失效，新密钥生效。系统仍只保存哈希，不会回显当前密钥。
               </p>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700">每日成功请求上限</label>
+                <Input
+                  type="number"
+                  min="0"
+                  max="1000000"
+                  value={editDailyRequestLimit}
+                  onChange={(event) => setEditDailyRequestLimit(event.target.value)}
+                  className="h-11 rounded-xl border-stone-200 bg-white"
+                />
+                <p className="text-xs text-stone-500">填 0 表示不限；失败请求不计数。</p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700">单次生图上限</label>
+                <Input
+                  type="number"
+                  min="1"
+                  max="100"
+                  value={editImageRequestLimit}
+                  onChange={(event) => setEditImageRequestLimit(event.target.value)}
+                  className="h-11 rounded-xl border-stone-200 bg-white"
+                />
+              </div>
             </div>
           </div>
           <DialogFooter>

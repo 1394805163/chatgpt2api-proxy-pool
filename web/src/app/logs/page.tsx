@@ -15,7 +15,10 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { deleteSystemLogs, fetchSystemLogs, type SystemLog } from "@/lib/api";
+import { formatDisplayDateTime } from "@/lib/display-time";
 import { useAuthGuard } from "@/lib/use-auth-guard";
+import { useDisplayTimezone } from "@/lib/use-display-timezone";
+import { getBrowserCachedImageUrlMap, imageCacheKeyFromUrl } from "@/store/image-conversations";
 
 const LogType = {
   Call: "call",
@@ -37,9 +40,15 @@ function formatDuration(item: SystemLog) {
   return typeof value === "number" ? `${(value / 1000).toFixed(2)} s` : "-";
 }
 
-function getUrls(item: SystemLog | null) {
+function getUrls(item: SystemLog | null, cachedUrls?: Map<string, string>) {
   const urls = item?.detail?.urls;
-  return Array.isArray(urls) ? urls.filter((url): url is string => typeof url === "string") : [];
+  if (!Array.isArray(urls)) return [];
+  return urls
+    .filter((url): url is string => typeof url === "string")
+    .map((url) => {
+      const cacheKey = imageCacheKeyFromUrl(url);
+      return (cacheKey && cachedUrls?.get(cacheKey)) || url;
+    });
 }
 
 function getStatus(item: SystemLog) {
@@ -49,7 +58,29 @@ function getStatus(item: SystemLog) {
   return "-";
 }
 
+function getFailureCount(item: SystemLog) {
+  const value = item.detail?.failure_count;
+  return typeof value === "number" && Number.isFinite(value) && value > 1 ? value : 1;
+}
+
+function getLogDeleteIds(item: SystemLog) {
+  const groupedIds = item.detail?.grouped_log_ids;
+  if (Array.isArray(groupedIds)) {
+    const ids = groupedIds.filter((id): id is string => typeof id === "string" && id.length > 0);
+    if (ids.length > 0) return ids;
+  }
+  return [item.id];
+}
+
+function formatDetailValue(key: string, value: unknown, timezone: string) {
+  if (key === "time" || key.endsWith("_at")) {
+    return formatDisplayDateTime(value, timezone, String(value));
+  }
+  return String(value);
+}
+
 function LogsContent() {
+  const displayTimezone = useDisplayTimezone();
   const [items, setItems] = useState<SystemLog[]>([]);
   const [type, setType] = useState<string>(LogType.Call);
   const [startDate, setStartDate] = useState("");
@@ -63,7 +94,8 @@ function LogsContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deletingItems, setDeletingItems] = useState<SystemLog[]>([]);
-  const detailUrls = getUrls(detailLog);
+  const [cachedImageUrls, setCachedImageUrls] = useState<Map<string, string>>(new Map());
+  const detailUrls = getUrls(detailLog, cachedImageUrls);
   const detailImages = detailUrls.map((url, index) => ({ id: `${index}`, src: url }));
   const isCallLog = type === LogType.Call;
   const pageSize = 10;
@@ -77,8 +109,12 @@ function LogsContent() {
   const loadLogs = async () => {
     setIsLoading(true);
     try {
-      const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate });
+      const [data, browserCache] = await Promise.all([
+        fetchSystemLogs({ type, start_date: startDate, end_date: endDate }),
+        getBrowserCachedImageUrlMap(),
+      ]);
       setItems(data.items);
+      setCachedImageUrls(browserCache);
       setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
       setPage(1);
     } catch (error) {
@@ -109,15 +145,16 @@ function LogsContent() {
   };
 
   const confirmDelete = async () => {
-    const ids = deletingItems.map((item) => item.id);
+    const ids = Array.from(new Set(deletingItems.flatMap(getLogDeleteIds)));
+    const rowIds = deletingItems.map((item) => item.id);
     if (ids.length === 0) return;
     setIsDeleting(true);
     try {
       const data = await deleteSystemLogs(ids);
       toast.success(`已删除 ${data.removed} 条日志`);
       setDeletingItems([]);
-      setSelectedIds((current) => current.filter((id) => !ids.includes(id)));
-      if (detailLog && ids.includes(detailLog.id)) {
+      setSelectedIds((current) => current.filter((id) => !ids.includes(id) && !rowIds.includes(id)));
+      if (detailLog && (ids.includes(detailLog.id) || rowIds.includes(detailLog.id))) {
         setDetailOpen(false);
         setDetailLog(null);
       }
@@ -205,13 +242,13 @@ function LogsContent() {
               </TableHeader>
               <TableBody>
                 {currentRows.map((item) => {
-                  const urls = getUrls(item);
+                  const urls = getUrls(item, cachedImageUrls);
                   return (
                     <TableRow key={item.id} className="text-stone-600">
                       <TableCell>
                         <Checkbox checked={selectedSet.has(item.id)} onCheckedChange={(checked) => toggleIds([item.id], Boolean(checked))} />
                       </TableCell>
-                      <TableCell className="whitespace-nowrap">{item.time}</TableCell>
+                      <TableCell className="whitespace-nowrap">{formatDisplayDateTime(item.time, displayTimezone, item.time)}</TableCell>
                       <TableCell><Badge variant="secondary" className="rounded-md">{typeLabels[item.type] || item.type}</Badge></TableCell>
                       {isCallLog ? <TableCell>{getDetailText(item, "key_name")}</TableCell> : null}
                       {isCallLog ? <TableCell>{formatDuration(item)}</TableCell> : null}
@@ -219,6 +256,7 @@ function LogsContent() {
                         <TableCell>
                           <Badge variant={item.detail?.status === "failed" ? "danger" : "success"} className="rounded-md">
                             {getStatus(item)}
+                            {getFailureCount(item) > 1 ? <span className="ml-1 tabular-nums">×{getFailureCount(item)}</span> : null}
                           </Badge>
                         </TableCell>
                       ) : null}
@@ -289,7 +327,7 @@ function LogsContent() {
                   .map(([key, value]) => (
                     <div key={key} className="flex items-start justify-between gap-4">
                       <span className="text-stone-400">{key}</span>
-                      <span className="text-right font-medium break-all text-stone-700">{String(value)}</span>
+                      <span className="text-right font-medium break-all text-stone-700">{formatDetailValue(key, value, displayTimezone)}</span>
                     </div>
                   ))}
               </div>

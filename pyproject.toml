@@ -11,6 +11,7 @@ dependencies = [
     "pybase64>=1.4.3",
     "python-multipart>=0.0.26",
     "tiktoken>=0.12.0",
+    "tzdata>=2025.2",
     "uvicorn>=0.44.0",
     "sqlalchemy>=2.0.0",
     "psycopg2-binary>=2.9.0",

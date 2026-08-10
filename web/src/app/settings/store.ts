@@ -23,6 +23,7 @@ import {
   type BackupState,
   type CPAPool,
   type CPARemoteFile,
+  type FreeAccountCleanupSettings,
   type ImageStorageMode,
   type ImageStorageSettings,
   type ProxyRuntimeClearanceMode,
@@ -31,6 +32,7 @@ import {
   type SettingsConfig,
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
+import { DEFAULT_DISPLAY_TIMEZONE, normalizeDisplayTimezone } from "@/lib/display-time";
 
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
@@ -64,6 +66,13 @@ const DEFAULT_THIRD_PARTY_APPS: ThirdPartyAppsSettings = {
     enabled: false,
     url: "https://canvas.best",
   },
+};
+
+const DEFAULT_FREE_ACCOUNT_CLEANUP: FreeAccountCleanupSettings = {
+  enabled: false,
+  interval_minutes: 10,
+  failure_threshold: 2,
+  action: "mark_abnormal",
 };
 
 function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
@@ -121,6 +130,16 @@ function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
   };
 }
 
+function normalizeFreeAccountCleanup(value: unknown): FreeAccountCleanupSettings {
+  const source = typeof value === "object" && value !== null ? value as Partial<FreeAccountCleanupSettings> : {};
+  return {
+    enabled: Boolean(source.enabled),
+    interval_minutes: Math.max(1, Number(source.interval_minutes) || Number(DEFAULT_FREE_ACCOUNT_CLEANUP.interval_minutes)),
+    failure_threshold: Math.max(1, Number(source.failure_threshold) || Number(DEFAULT_FREE_ACCOUNT_CLEANUP.failure_threshold)),
+    action: source.action === "delete" ? "delete" : "mark_abnormal",
+  };
+}
+
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
   const imageStorage = typeof config.image_storage === "object" && config.image_storage
     ? config.image_storage as ImageStorageSettings
@@ -166,8 +185,11 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
   return {
     ...config,
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
+    display_timezone: normalizeDisplayTimezone(config.display_timezone || DEFAULT_DISPLAY_TIMEZONE),
     image_retention_days: Number(config.image_retention_days || 30),
-    image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
+    image_poll_timeout_secs: Number(config.image_task_timeout_secs || 150),
+    image_task_timeout_secs: Number(config.image_task_timeout_secs || 150),
+    user_image_task_timeout_secs: Number(config.user_image_task_timeout_secs || 180),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
     image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -177,6 +199,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
     auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
     auto_relogin_after_refresh: Boolean(config.auto_relogin_after_refresh),
+    free_account_cleanup: normalizeFreeAccountCleanup(config.free_account_cleanup),
     log_levels: Array.isArray(config.log_levels) ? config.log_levels : [],
     proxy: typeof config.proxy === "string" ? config.proxy : "",
     base_url: typeof config.base_url === "string" ? config.base_url : "",
@@ -256,6 +279,7 @@ type SettingsStore = {
   isTestingImageStorage: boolean;
   isSyncingImageStorage: boolean;
 
+
   pools: CPAPool[];
   isLoadingPools: boolean;
   deletingId: string | null;
@@ -286,8 +310,10 @@ type SettingsStore = {
   removeBackup: (key: string) => Promise<void>;
   testBackup: () => Promise<void>;
   setRefreshAccountIntervalMinute: (value: string) => void;
+  setDisplayTimezone: (value: string) => void;
   setImageRetentionDays: (value: string) => void;
-  setImagePollTimeoutSecs: (value: string) => void;
+  setImageTaskTimeoutSecs: (value: string) => void;
+  setUserImageTaskTimeoutSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
   setImageSettleEnabled: (value: boolean) => void;
   setImageCheckBeforeHitEnabled: (value: boolean) => void;
@@ -297,6 +323,7 @@ type SettingsStore = {
   setAutoRemoveInvalidAccounts: (value: boolean) => void;
   setAutoRemoveRateLimitedAccounts: (value: boolean) => void;
   setAutoReloginAfterRefresh: (value: boolean) => void;
+  setFreeAccountCleanupField: <K extends keyof FreeAccountCleanupSettings>(key: K, value: FreeAccountCleanupSettings[K]) => void;
   setLogLevel: (level: string, enabled: boolean) => void;
   setProxy: (value: string) => void;
   setBaseUrl: (value: string) => void;
@@ -312,6 +339,7 @@ type SettingsStore = {
   syncImagesToWebDAV: () => Promise<void>;
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
   setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
+
 
   loadPools: (silent?: boolean) => Promise<void>;
   openAddDialog: () => void;
@@ -346,6 +374,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isTestingBackup: false,
   isTestingImageStorage: false,
   isSyncingImageStorage: false,
+
 
   pools: [],
   isLoadingPools: true,
@@ -408,11 +437,16 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
     set({ isSavingConfig: true });
     try {
+      const imageTaskTimeoutSecs = Math.max(1, Number(config.image_task_timeout_secs) || 150);
+      const userImageTaskTimeoutSecs = Math.max(1, Number(config.user_image_task_timeout_secs) || 180);
       const data = await updateSettingsConfig({
         ...config,
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
+        display_timezone: normalizeDisplayTimezone(config.display_timezone || DEFAULT_DISPLAY_TIMEZONE),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
-        image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
+        image_poll_timeout_secs: imageTaskTimeoutSecs,
+        image_task_timeout_secs: imageTaskTimeoutSecs,
+        user_image_task_timeout_secs: userImageTaskTimeoutSecs,
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
         image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -422,6 +456,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
         auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
         auto_relogin_after_refresh: Boolean(config.auto_relogin_after_refresh),
+        free_account_cleanup: {
+          ...normalizeFreeAccountCleanup(config.free_account_cleanup),
+          interval_minutes: Math.max(1, Number(config.free_account_cleanup?.interval_minutes) || 10),
+          failure_threshold: Math.max(1, Number(config.free_account_cleanup?.failure_threshold) || 2),
+        },
         proxy: config.proxy.trim(),
         base_url: String(config.base_url || "").trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
@@ -508,12 +547,20 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     });
   },
 
+  setDisplayTimezone: (value) => {
+    set((state) => state.config ? { config: { ...state.config, display_timezone: value } } : {});
+  },
+
   setImageRetentionDays: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_retention_days: value } } : {});
   },
 
-  setImagePollTimeoutSecs: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_poll_timeout_secs: value } } : {});
+  setImageTaskTimeoutSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_task_timeout_secs: value } } : {});
+  },
+
+  setUserImageTaskTimeoutSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, user_image_task_timeout_secs: value } } : {});
   },
 
   setImageAccountConcurrency: (value) => {
@@ -550,6 +597,24 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setAutoReloginAfterRefresh: (value) => {
     set((state) => state.config ? { config: { ...state.config, auto_relogin_after_refresh: value } } : {});
+  },
+
+  setFreeAccountCleanupField: (key, value) => {
+    set((state) => {
+      if (!state.config) {
+        return {};
+      }
+      const current = normalizeFreeAccountCleanup(state.config.free_account_cleanup);
+      return {
+        config: {
+          ...state.config,
+          free_account_cleanup: normalizeFreeAccountCleanup({
+            ...current,
+            [key]: value,
+          }),
+        },
+      };
+    });
   },
 
   setLogLevel: (level, enabled) => {

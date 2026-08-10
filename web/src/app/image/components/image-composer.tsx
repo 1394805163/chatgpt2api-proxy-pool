@@ -20,6 +20,7 @@ type ImageComposerProps = {
   imageQuality: string;
   imageModel: ImageModel;
   imageModels: ImageModel[];
+  maxImageCount: number;
   availableQuota: string;
   activeTaskCount: number;
   referenceImages: Array<{ name: string; dataUrl: string }>;
@@ -78,8 +79,6 @@ const aspectOptions = [
   { ratio: "9:16", tier: "4k", width: "2160", height: "3840", label: "9:16(4k)", icon: RectangleVertical },
   { ratio: "auto", tier: "auto", width: "1024", height: "1024", label: "auto", icon: null },
 ];
-const countOptions = Array.from({ length: 10 }, (_, index) => String(index + 1));
-
 export function ImageComposer({
   prompt,
   imageCount,
@@ -90,6 +89,7 @@ export function ImageComposer({
   imageQuality,
   imageModel,
   imageModels,
+  maxImageCount,
   availableQuota,
   activeTaskCount,
   referenceImages,
@@ -122,6 +122,10 @@ export function ImageComposer({
   const modelOptions = useMemo(
     () => imageModels.map((model) => ({ value: model, label: model })),
     [imageModels],
+  );
+  const countOptions = useMemo(
+    () => Array.from({ length: Math.min(10, Math.max(1, maxImageCount)) }, (_, index) => String(index + 1)),
+    [maxImageCount],
   );
   const qualityLabel = qualityOptions.find((option) => option.value === imageQuality)?.label || "自动";
   const ratioLabel = imageRatio === "auto" ? "auto" : `${imageRatio}(${imageTier})`;
@@ -509,7 +513,7 @@ export function ImageComposer({
                               type="number"
                               inputMode="numeric"
                               min="1"
-                              max="100"
+                              max={maxImageCount}
                               step="1"
                               value={imageCount}
                               onChange={(event) => onImageCountChange(event.target.value)}

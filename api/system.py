@@ -23,7 +23,7 @@ from services.image_service import (
 )
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
-from services.log_service import log_service
+from services.log_service import LOG_TYPE_CALL, log_service
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
 
 
@@ -70,6 +70,11 @@ def create_router(app_version: str) -> APIRouter:
             "role": identity.get("role"),
             "subject_id": identity.get("id"),
             "name": identity.get("name"),
+            "daily_request_limit": identity.get("daily_request_limit", 0),
+            "daily_request_used": identity.get("daily_request_used", 0),
+            "daily_request_remaining": identity.get("daily_request_remaining"),
+            "daily_request_date": identity.get("daily_request_date"),
+            "image_request_limit": identity.get("image_request_limit", 100),
         }
 
     @router.get("/version")
@@ -80,6 +85,11 @@ def create_router(app_version: str) -> APIRouter:
     async def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"config": config.get()}
+
+    @router.get("/api/display-settings")
+    async def get_display_settings(authorization: str | None = Header(default=None)):
+        require_identity(authorization)
+        return {"display_timezone": config.display_timezone}
 
     @router.get("/api/third-party-apps")
     async def get_third_party_apps(authorization: str | None = Header(default=None)):
@@ -103,8 +113,16 @@ def create_router(app_version: str) -> APIRouter:
     async def get_image(image_path: str):
         return get_image_response(image_path)
 
+    @router.head("/images/{image_path:path}", include_in_schema=False)
+    async def head_image(image_path: str):
+        return get_image_response(image_path)
+
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
+        return get_thumbnail_response(image_path)
+
+    @router.head("/image-thumbnails/{image_path:path}", include_in_schema=False)
+    async def head_image_thumbnail(image_path: str):
         return get_thumbnail_response(image_path)
 
     @router.post("/api/images/delete")
@@ -130,7 +148,20 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/logs")
     async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
+        log_type = type.strip()
+        start = start_date.strip()
+        end = end_date.strip()
+        has_date_filter = bool(start or end)
+        return {
+            "items": log_service.list(
+                type=log_type,
+                start_date=start,
+                end_date=end,
+                limit=None if has_date_filter else 200,
+                collapse_image_failures=log_type == LOG_TYPE_CALL,
+                display_timezone=config.display_timezone,
+            )
+        }
 
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):

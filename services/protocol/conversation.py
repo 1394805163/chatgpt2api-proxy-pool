@@ -14,7 +14,12 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    ImageContentPolicyError,
+    ImagePollTimeoutError,
+    ImageTaskDeadlineError,
+    OpenAIBackendAPI,
+)
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -113,6 +118,33 @@ def image_stream_error_message(message: str) -> str:
     if is_connection_timeout_error(text):
         return "upstream connection timed out, please retry later"
     return text or "image generation failed"
+
+
+def record_image_failure(
+    access_token: str,
+    reason: str,
+    event: str,
+    verify_free_account: bool = True,
+    force_free_cleanup: bool = False,
+) -> None:
+    account_service.mark_image_result(access_token, False)
+    if not verify_free_account:
+        account_service.update_account(access_token, {"consecutive_image_failures": 0}, quiet=True)
+        return
+    try:
+        account_service.verify_free_account_after_image_failure(
+            access_token,
+            event,
+            reason,
+            force=force_free_cleanup,
+        )
+    except Exception as exc:
+        logger.warning({
+            "event": "free_account_cleanup_check_failed",
+            "request_token": access_token,
+            "source": event,
+            "error": str(exc)[:300],
+        })
 
 
 REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
@@ -233,20 +265,63 @@ def encoding_for_model(model: str):
             return tiktoken.get_encoding("cl100k_base")
 
 
+_token_encoding_warning_lock = threading.Lock()
+_token_encoding_warning_logged = False
+
+
+def _estimated_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    ascii_count = sum(1 for char in text if ord(char) < 128)
+    non_ascii_count = len(text) - ascii_count
+    return non_ascii_count + (ascii_count + 3) // 4
+
+
+def _log_token_encoding_fallback(exc: Exception) -> None:
+    global _token_encoding_warning_logged
+    with _token_encoding_warning_lock:
+        if _token_encoding_warning_logged:
+            return
+        _token_encoding_warning_logged = True
+    logger.warning({
+        "event": "token_encoding_fallback",
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    })
+
+
+def _safe_encoding_for_model(model: str):
+    try:
+        return encoding_for_model(model)
+    except Exception as exc:
+        _log_token_encoding_fallback(exc)
+        return None
+
+
+def _encoded_text_tokens(text: str, encoding: Any) -> int:
+    if encoding is None:
+        return _estimated_text_tokens(text)
+    try:
+        return len(encoding.encode(text))
+    except Exception as exc:
+        _log_token_encoding_fallback(exc)
+        return _estimated_text_tokens(text)
+
+
 def count_message_image_tokens(messages: list[dict[str, Any]], model: str) -> int:
     return sum(count_image_content_tokens(message.get("content"), model) for message in messages)
 
 
 def count_message_text_tokens(messages: list[dict[str, Any]], model: str) -> int:
-    encoding = encoding_for_model(model)
+    encoding = _safe_encoding_for_model(model)
     total = 0
     for message in messages:
         total += 3
         for key, value in message.items():
             if key == "content" and isinstance(value, list):
-                total += len(encoding.encode(message_text(value)))
+                total += _encoded_text_tokens(message_text(value), encoding)
             elif isinstance(value, str):
-                total += len(encoding.encode(value))
+                total += _encoded_text_tokens(value, encoding)
             else:
                 continue
             if key == "name":
@@ -259,7 +334,7 @@ def count_message_tokens(messages: list[dict[str, Any]], model: str) -> int:
 
 
 def count_text_tokens(text: str, model: str) -> int:
-    return len(encoding_for_model(model).encode(text))
+    return _encoded_text_tokens(text, _safe_encoding_for_model(model))
 
 
 def format_image_result(
@@ -307,6 +382,29 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    task_deadline_ts: float | None = None
+    task_timeout_secs: float | None = None
+    client_task_id: str = ""
+    cancel_event: Any = None  # threading.Event | None
+
+
+def _image_task_timeout_secs(request: ConversationRequest) -> float:
+    try:
+        if request.task_timeout_secs is not None:
+            return max(0.01, float(request.task_timeout_secs))
+    except (TypeError, ValueError):
+        pass
+    return max(0.01, float(config.image_task_timeout_secs))
+
+
+def image_task_timing(body: dict[str, Any]) -> tuple[float | None, float | None]:
+    def optional_float(value: object) -> float | None:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return optional_float(body.get("task_deadline_ts")), optional_float(body.get("task_timeout_secs"))
 
 
 @dataclass
@@ -658,6 +756,8 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    task_deadline_ts: float | None = None,
+    cancel_event: Any = None,
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -671,6 +771,8 @@ def conversation_events(
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
+        task_deadline_ts=task_deadline_ts,
+        cancel_event=cancel_event,
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
@@ -683,14 +785,15 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    active_backend: OpenAIBackendAPI | None = backend
     while True:
         if token and token in attempted_tokens:
             raise RuntimeError("no available text account")
         if token:
             attempted_tokens.add(token)
-        active_backend = None
         try:
-            active_backend = OpenAIBackendAPI(access_token=token)
+            if active_backend is None:
+                active_backend = OpenAIBackendAPI(access_token=token)
             for event in conversation_events(
                 active_backend,
                 messages=request.messages,
@@ -721,6 +824,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         finally:
             if active_backend is not None:
                 active_backend.close()
+                active_backend = None
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
@@ -776,22 +880,32 @@ def _get_detailed_error_from_tasks(
         return ""
 
 
-def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id: str) -> None:
-    if not config.image_remove_conversation_after_result or not conversation_id:
+def _remove_image_conversation(access_token: str, conversation_id: str) -> None:
+    backend: OpenAIBackendAPI | None = None
+    try:
+        backend = OpenAIBackendAPI(access_token=access_token)
+        backend.delete_conversation(conversation_id)
+        logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
+    except Exception as exc:
+        logger.warning({
+            "event": "image_conversation_remove_failed",
+            "conversation_id": conversation_id,
+            "error": str(exc),
+        })
+    finally:
+        if backend is not None:
+            backend.close()
+
+
+def _remove_image_conversation_later(access_token: str, conversation_id: str) -> None:
+    if not config.image_remove_conversation_after_result or not access_token or not conversation_id:
         return
-
-    def _run() -> None:
-        try:
-            backend.delete_conversation(conversation_id)
-            logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
-        except Exception as exc:
-            logger.warning({
-                "event": "image_conversation_remove_failed",
-                "conversation_id": conversation_id,
-                "error": str(exc),
-            })
-
-    threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
+    threading.Thread(
+        target=_remove_image_conversation,
+        args=(access_token, conversation_id),
+        name=f"remove-image-conversation-{conversation_id}",
+        daemon=True,
+    ).start()
 
 
 def stream_image_outputs(
@@ -808,6 +922,8 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            task_deadline_ts=request.task_deadline_ts,
+            cancel_event=request.cancel_event,
     ):
         last = event
         if event.get("type") == "conversation.delta":
@@ -916,10 +1032,9 @@ def stream_image_outputs(
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
     # 导致对话文档中尚未写入图片工具的响应记录。
-    poll_timeout = config.image_poll_timeout_secs
+    poll_timeout = _image_task_timeout_secs(request)
     if is_text_reply and conversation_id:
-        # 文本回复场景下图片可能仍在异步生成，使用更长超时（默认 120s → 额外 180s = 300s）
-        poll_timeout = max(poll_timeout, 300)
+        # 文本回复场景使用当前请求的总时限，普通用户密钥固定为 180 秒。
         logger.info({
             "event": "image_text_reply_extended_poll",
             "conversation_id": conversation_id,
@@ -970,7 +1085,6 @@ def stream_image_outputs(
             int(time.time()),
         )["data"]
         if data:
-            _remove_image_conversation_later(backend, conversation_id)
             yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
         return
 
@@ -1003,9 +1117,8 @@ def stream_image_outputs(
                 "conversation_id": conversation_id,
                 "message_preview": message[:200],
             })
-            # 文本回复场景下，图片可能需要 4-5 分钟才能异步生成完成。
-            # 使用 300s 超时并允许多次重试，避免因临时网络问题提前退出。
-            retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+            # 文本回复场景仍按当前请求时限轮询，并允许短暂重试来处理临时网络问题。
+            retry_poll_timeout = _image_task_timeout_secs(request)
             MAX_POLL_RETRIES = 3
             for poll_attempt in range(1, MAX_POLL_RETRIES + 1):
                 try:
@@ -1068,7 +1181,6 @@ def stream_image_outputs(
                         int(time.time()),
                     )["data"]
                     if data:
-                        _remove_image_conversation_later(backend, conversation_id)
                         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                         return
         elif is_text_reply:
@@ -1109,8 +1221,8 @@ def stream_image_outputs(
             })
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
-        # 使用 300s 超时并允许多次重试，避免因临时网络问题或图片尚未提交而提前退出。
-        retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+        # 按当前请求时限轮询，并允许短暂重试来处理临时网络问题或图片尚未提交的情况。
+        retry_poll_timeout = _image_task_timeout_secs(request)
         MAX_FALLBACK_POLL_RETRIES = 3
         for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
             retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
@@ -1181,7 +1293,6 @@ def stream_image_outputs(
                     int(time.time()),
                 )["data"]
                 if data:
-                    _remove_image_conversation_later(backend, conversation_id)
                     yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                     return
         
@@ -1291,8 +1402,11 @@ def _generate_single_image(
         returned_result = False
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
+        if account_email and request.progress_callback:
+            request.progress_callback(f"account_email:{account_email}")
         logger.debug({
             "event": "image_account_lookup",
+            "client_task_id": request.client_task_id,
             "token_prefix": token[:12] + "..." if len(token) > 12 else token,
             "account_email": account_email,
             "account_found": bool(account),
@@ -1301,6 +1415,10 @@ def _generate_single_image(
         backend = None
         try:
             backend = OpenAIBackendAPI(access_token=token)
+            backend.image_deadline_ts = request.task_deadline_ts
+            backend.image_task_timeout_secs = _image_task_timeout_secs(request)
+            backend.image_client_task_id = request.client_task_id
+            backend.image_cancel_event = request.cancel_event
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1317,15 +1435,15 @@ def _generate_single_image(
                         account_email=account_email,
                         conversation_id=output.conversation_id,
                     )
-                emitted_for_token = True
-                returned_message = output.kind == "message"
+                emitted_for_token = emitted_for_token or output.kind in {"message", "result"}
+                returned_message = returned_message or output.kind == "message"
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
-                account_service.mark_image_result(token, False)
+                record_image_failure(token, "upstream returned text instead of image", "image_stream_text_reply")
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False)
+                record_image_failure(token, "upstream completed without generating images", "image_stream_no_image")
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -1338,9 +1456,27 @@ def _generate_single_image(
                     )
                 return outputs
             account_service.mark_image_result(token, True)
+            result_conversation_id = next(
+                (
+                    output.conversation_id
+                    for output in reversed(outputs)
+                    if output.kind == "result" and output.conversation_id
+                ),
+                "",
+            )
+            _remove_image_conversation_later(token, result_conversation_id)
             return outputs
+        except ImageTaskDeadlineError as exc:
+            account_service.release_image_slot(token)
+            raise ImageGenerationError(
+                str(exc),
+                status_code=504,
+                error_type="server_error",
+                code="image_task_timeout",
+                account_email=account_email,
+            ) from exc
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
+            record_image_failure(token, str(exc), "image_poll_timeout")
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
@@ -1366,7 +1502,7 @@ def _generate_single_image(
                 raise
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False)
+            record_image_failure(token, str(exc), "image_content_policy", verify_free_account=False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,
@@ -1383,7 +1519,12 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
+            record_image_failure(
+                token,
+                str(exc),
+                "image_generation_error",
+                verify_free_account=getattr(exc, "code", "") != "content_policy_violation",
+            )
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
@@ -1425,7 +1566,6 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            account_service.mark_image_result(token, False)
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1435,14 +1575,23 @@ def _generate_single_image(
                 "index": index,
             })
             if not emitted_for_token and is_token_invalid_error(last_error):
+                record_image_failure(token, last_error, "image_stream_invalid_token", verify_free_account=False)
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
                     continue
-                account_service.remove_invalid_token(token, "image_stream")
+                cleanup_result = account_service.verify_free_account_after_image_failure(
+                    token,
+                    "image_stream",
+                    last_error,
+                    force=True,
+                )
+                if not cleanup_result.get("checked"):
+                    account_service.remove_invalid_token(token, "image_stream")
                 continue
             # TLS/SSL 连接错误：自动重试
             if not emitted_for_token and is_tls_connection_error(last_error):
+                record_image_failure(token, last_error, "image_stream_tls", verify_free_account=False)
                 tls_retry_count += 1
                 if tls_retry_count <= MAX_TLS_RETRIES:
                     logger.warning({
@@ -1457,6 +1606,7 @@ def _generate_single_image(
                     continue
             # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
+                record_image_failure(token, last_error, "image_stream_timeout", verify_free_account=False)
                 conn_timeout_retry_count += 1
                 if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
                     wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
@@ -1471,6 +1621,8 @@ def _generate_single_image(
                     })
                     time.sleep(wait_secs)
                     continue
+            if not is_tls_connection_error(last_error) and not is_connection_timeout_error(last_error):
+                record_image_failure(token, last_error, "image_stream")
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
             if backend is not None:
@@ -1481,6 +1633,9 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
+
+    if request.task_deadline_ts is None:
+        request.task_deadline_ts = time.time() + config.image_task_timeout_secs
 
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）

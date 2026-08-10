@@ -50,14 +50,26 @@ def _parse_bool(value: object) -> bool | None:
 
 
 def _parse_count(value: object) -> int:
-    """解析生成数量：保持图片接口的 1 到 4 限制。"""
+    """Parse an image count; per-key policy is enforced after authentication."""
     try:
         count = int(value or 1)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if count < 1 or count > 4:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
+    if count < 1 or count > 100:
+        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 100"})
     return count
+
+
+def _parse_timeout(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail={"error": "timeout_secs must be a number"}) from exc
+    if timeout < 30 or timeout > 600:
+        raise HTTPException(status_code=400, detail={"error": "timeout_secs must be between 30 and 600"})
+    return timeout
 
 
 def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
@@ -76,6 +88,8 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     }
     if "client_task_id" in fields:
         payload["client_task_id"] = _clean(fields.get("client_task_id"))
+    if "timeout_secs" in fields:
+        payload["timeout_secs"] = _parse_timeout(fields.get("timeout_secs"))
     return payload
 
 
@@ -183,7 +197,7 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
+    for key in ("client_task_id", "timeout_secs", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value

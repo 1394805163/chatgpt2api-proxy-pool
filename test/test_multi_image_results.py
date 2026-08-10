@@ -4,9 +4,17 @@ import base64
 import unittest
 from unittest import mock
 
+from services.account_service import account_service
 from services.config import config
-from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ImageOutput, extract_conversation_ids
+from services.openai_backend_api import ImagePollTimeoutError, ImageTaskDeadlineError, OpenAIBackendAPI
+from services.protocol.conversation import (
+    ConversationRequest,
+    ImageGenerationError,
+    ImageOutput,
+    _generate_single_image,
+    extract_conversation_ids,
+    stream_image_outputs,
+)
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -49,7 +57,123 @@ class FakeBackend(OpenAIBackendAPI):
         return self.sediment_urls.get(attachment_id, "")
 
 
+class FakeStreamingResponse:
+    def __init__(
+        self,
+        close_error: Exception | None = None,
+        iter_error: Exception | None = None,
+        before_iter_error=None,
+    ) -> None:
+        self.close_error = close_error
+        self.iter_error = iter_error
+        self.before_iter_error = before_iter_error
+        self.close_calls = 0
+
+    def iter_lines(self):
+        if self.iter_error is not None:
+            if self.before_iter_error is not None:
+                self.before_iter_error()
+            raise self.iter_error
+        yield b"data: [DONE]\n"
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
 class MultiImageResultTests(unittest.TestCase):
+    def test_deadline_error_uses_request_timeout_label(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.image_task_timeout_secs = 180.0
+        backend.image_cancel_event = mock.Mock(is_set=mock.Mock(return_value=True))
+
+        with self.assertRaisesRegex(ImageTaskDeadlineError, "180 秒总时限"):
+            backend._ensure_image_task_active()
+
+    def _picture_stream_backend(self, response: FakeStreamingResponse) -> OpenAIBackendAPI:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "token-1"
+        backend.progress_callback = None
+        backend._ensure_image_task_active = mock.Mock()
+        backend._upload_image = mock.Mock(return_value={})
+        backend._bootstrap = mock.Mock()
+        backend._get_chat_requirements = mock.Mock(return_value=mock.Mock())
+        backend._prepare_image_conversation = mock.Mock(return_value="conduit-token")
+        backend._start_image_generation = mock.Mock(return_value=response)
+        return backend
+
+    def test_picture_stream_suppresses_curl_write_error_caused_by_close(self) -> None:
+        response = FakeStreamingResponse(RuntimeError(
+            "Failed to perform, curl: (23) client returned ERROR on write of 45 bytes."
+        ))
+        backend = self._picture_stream_backend(response)
+
+        payloads = list(backend._stream_picture_conversation("cat", "gpt-image-2", []))
+
+        self.assertEqual(payloads, ["[DONE]"])
+        self.assertEqual(response.close_calls, 1)
+
+    def test_picture_stream_keeps_unexpected_close_errors(self) -> None:
+        response = FakeStreamingResponse(RuntimeError("unexpected close failure"))
+        backend = self._picture_stream_backend(response)
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected close failure"):
+            list(backend._stream_picture_conversation("cat", "gpt-image-2", []))
+
+    def test_picture_stream_maps_deadline_iter_write_error_to_task_timeout(self) -> None:
+        deadline_reached = False
+
+        def reach_deadline() -> None:
+            nonlocal deadline_reached
+            deadline_reached = True
+
+        def ensure_active() -> None:
+            if deadline_reached:
+                raise ImageTaskDeadlineError("图片任务已达到 180 秒总时限；已停止等待，请重新提交")
+
+        response = FakeStreamingResponse(
+            iter_error=RuntimeError(
+                "Failed to perform, curl: (23) client returned ERROR on write of 45 bytes."
+            ),
+            before_iter_error=reach_deadline,
+        )
+        backend = self._picture_stream_backend(response)
+        backend._ensure_image_task_active = mock.Mock(side_effect=ensure_active)
+
+        with self.assertRaisesRegex(ImageTaskDeadlineError, "180 秒总时限"):
+            list(backend._stream_picture_conversation("cat", "gpt-image-2", []))
+
+        self.assertEqual(response.close_calls, 1)
+
+    def test_picture_stream_keeps_active_iter_write_error(self) -> None:
+        response = FakeStreamingResponse(iter_error=RuntimeError(
+            "Failed to perform, curl: (23) client returned ERROR on write of 45 bytes."
+        ))
+        backend = self._picture_stream_backend(response)
+
+        with self.assertRaisesRegex(RuntimeError, r"curl: \(23\)"):
+            list(backend._stream_picture_conversation("cat", "gpt-image-2", []))
+
+        self.assertEqual(response.close_calls, 1)
+
+    def test_task_deadline_releases_account_slot_without_marking_failure(self) -> None:
+        with (
+            mock.patch.object(account_service, "get_available_access_token", return_value="token-1"),
+            mock.patch.object(account_service, "get_account", return_value={"email": "test@example.com"}),
+            mock.patch.object(account_service, "release_image_slot") as release_slot,
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+            mock.patch(
+                "services.protocol.conversation.stream_image_outputs",
+                side_effect=ImageTaskDeadlineError("deadline reached"),
+            ),
+        ):
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
+
+        self.assertEqual(raised.exception.code, "image_task_timeout")
+        release_slot.assert_called_once_with("token-1")
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '
@@ -153,6 +277,87 @@ class MultiImageResultTests(unittest.TestCase):
             urls = backend.resolve_conversation_image_urls("conv-1", ["file-one"], [], poll=True)
 
         self.assertEqual(urls, ["https://files.test/one.png"])
+
+    def test_text_reply_poll_uses_total_task_timeout(self) -> None:
+        backend = FakeBackend()
+        backend.resolve_conversation_image_urls = mock.Mock(return_value=["https://files.test/one.png"])
+        backend.download_image_bytes = mock.Mock(return_value=[b"image-bytes"])
+        events = [
+            {
+                "type": "conversation.completed",
+                "conversation_id": "conv-1",
+                "file_ids": [],
+                "sediment_ids": [],
+                "text": '{"size":"1024x1024","n":1}',
+                "turn_use_case": "image gen",
+            }
+        ]
+
+        with (
+            mock.patch.dict(config.data, {"image_poll_timeout_secs": 70, "image_task_timeout_secs": 150}),
+            mock.patch("services.protocol.conversation.conversation_events", return_value=iter(events)),
+            mock.patch("services.protocol.conversation._get_detailed_error_from_tasks", return_value=""),
+            mock.patch("services.protocol.conversation.save_image_bytes", return_value="http://local.test/one.png"),
+        ):
+            outputs = list(stream_image_outputs(
+                backend,
+                ConversationRequest(model="gpt-image-2", prompt="draw a cat", response_format="b64_json"),
+            ))
+
+        backend.resolve_conversation_image_urls.assert_called_once()
+        self.assertEqual(backend.resolve_conversation_image_urls.call_args.kwargs["poll_timeout_secs"], 150)
+        self.assertTrue(any(output.kind == "result" for output in outputs))
+
+    def test_user_request_timeout_overrides_persisted_poll_timeout(self) -> None:
+        backend = FakeBackend()
+        backend.resolve_conversation_image_urls = mock.Mock(return_value=[])
+        events = [{"type": "conversation.completed", "conversation_id": "conv-1", "text": ""}]
+
+        with (
+            mock.patch.dict(config.data, {"image_task_timeout_secs": 70}),
+            mock.patch("services.protocol.conversation.conversation_events", return_value=iter(events)),
+            mock.patch("services.protocol.conversation._get_detailed_error_from_tasks", return_value=""),
+        ):
+            list(stream_image_outputs(
+                backend,
+                ConversationRequest(
+                    model="gpt-image-2",
+                    prompt="draw a cat",
+                    task_timeout_secs=180,
+                ),
+            ))
+
+        self.assertEqual(backend.resolve_conversation_image_urls.call_args.kwargs["poll_timeout_secs"], 180)
+
+    def test_progress_event_does_not_block_poll_timeout_retry(self) -> None:
+        attempts = 0
+
+        def stream_outputs(_backend, _request, index, total):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                yield ImageOutput(kind="progress", model="gpt-image-2", index=index, total=total)
+                raise ImagePollTimeoutError("poll timed out")
+            yield ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=index,
+                total=total,
+                data=[{"url": "http://example.test/image.png"}],
+            )
+
+        with (
+            mock.patch.object(account_service, "get_available_access_token", side_effect=["token-1", "token-2"]),
+            mock.patch.object(account_service, "get_account", return_value={"email": "test@example.com"}),
+            mock.patch.object(account_service, "mark_image_result"),
+            mock.patch("services.protocol.conversation.record_image_failure"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream_outputs),
+        ):
+            outputs = _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
+
+        self.assertEqual(attempts, 2)
+        self.assertTrue(any(output.kind == "result" for output in outputs))
 
     def test_responses_stream_emits_all_image_output_items(self) -> None:
         first = base64.b64encode(b"first").decode("ascii")

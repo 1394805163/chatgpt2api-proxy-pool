@@ -16,6 +16,7 @@ edit
 docker-compose-local.yml
 
 .claude/settings.local.json
+.learnings/
 
 # Environment variables
 .env
@@ -33,3 +34,4 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+data-e2e-*/

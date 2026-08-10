@@ -17,6 +17,8 @@ from services.image_tags_service import load_tags, remove_tags
 from utils.log import logger
 
 THUMBNAIL_SIZE = (320, 320)
+MIN_IMAGE_RETENTION_SECONDS = 2 * 60 * 60
+IMAGE_CACHE_CONTROL = f"public, max-age={MIN_IMAGE_RETENTION_SECONDS}, immutable"
 
 
 def _cleanup_empty_dirs(root: Path) -> None:
@@ -55,6 +57,7 @@ def get_image_response(relative_path: str) -> FileResponse | Response:
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
+        "Cache-Control": IMAGE_CACHE_CONTROL,
     }
     if image_storage_service.has_local(relative_path):
         return FileResponse(_safe_image_path(relative_path), headers=headers)
@@ -109,6 +112,7 @@ def get_thumbnail_response(relative_path: str) -> FileResponse:
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
+        "Cache-Control": IMAGE_CACHE_CONTROL,
     }
     return FileResponse(ensure_thumbnail(relative_path), headers=headers)
 
@@ -283,10 +287,13 @@ def delete_to_target(target_free_mb: int, dry_run: bool = False) -> dict:
     if current_free >= target_free_mb and not dry_run:
         return {"removed": 0, "current_free_mb": current_free, "target_free_mb": target_free_mb, "done": True}
 
+    cutoff = time.time() - MIN_IMAGE_RETENTION_SECONDS
+    all_files = [p for p in config.images_dir.rglob("*.png") if p.is_file()]
     files = sorted(
-        (p for p in config.images_dir.rglob("*.png") if p.is_file()),
+        (p for p in all_files if p.stat().st_mtime <= cutoff),
         key=lambda p: p.stat().st_mtime,
     )
+    protected = len(all_files) - len(files)
     removed = 0
     freed = 0
     for p in files:
@@ -314,6 +321,7 @@ def delete_to_target(target_free_mb: int, dry_run: bool = False) -> dict:
         "current_free_mb": current_free + (freed // (1024 * 1024)),
         "done": (current_free + freed // (1024 * 1024)) >= target_free_mb,
         "dry_run": dry_run,
+        "protected": protected,
     }
 
 

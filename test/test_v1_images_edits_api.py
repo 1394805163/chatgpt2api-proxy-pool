@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import time
 import unittest
 from unittest import mock
 
@@ -8,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
+from services.config import config
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -26,6 +28,13 @@ class ImagesEditsApiTests(unittest.TestCase):
         self.handler_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
         self.handler_patcher.start()
         self.addCleanup(self.handler_patcher.stop)
+        self.identity_patcher = mock.patch.object(
+            ai_module,
+            "require_identity",
+            return_value={"id": "admin", "role": "admin"},
+        )
+        self.identity_patcher.start()
+        self.addCleanup(self.identity_patcher.stop)
         app = FastAPI()
         app.include_router(ai_module.create_router())
         self.client = TestClient(app)
@@ -66,6 +75,27 @@ class ImagesEditsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("file_id image references are not supported", response.text)
         self.assertEqual(self.handle_calls, [])
+
+    def test_edit_forwards_requested_timeout_and_client_task_id(self):
+        started = time.time()
+        with mock.patch.dict(config.data, {"image_task_timeout_secs": 180}):
+            response = self.client.post(
+                "/v1/images/edits",
+                headers=AUTH_HEADERS,
+                data={
+                    "prompt": "edit",
+                    "model": "gpt-image-2",
+                    "timeout_secs": "300",
+                    "client_task_id": "ximage-edit-1",
+                },
+                files={"image": ("source.png", PNG_BYTES, "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = self.handle_calls[-1]
+        self.assertEqual(payload["task_timeout_secs"], 300.0)
+        self.assertEqual(payload["client_task_id"], "ximage-edit-1")
+        self.assertGreaterEqual(payload["task_deadline_ts"], started + 299.0)
 
 
 if __name__ == "__main__":

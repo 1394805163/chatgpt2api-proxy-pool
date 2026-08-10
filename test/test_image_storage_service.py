@@ -8,6 +8,7 @@ from unittest import mock
 from PIL import Image
 
 from services.image_storage_service import ImageStorageService
+from services.image_service import IMAGE_CACHE_CONTROL, delete_to_target, get_image_response
 
 
 def png_bytes() -> bytes:
@@ -134,6 +135,32 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn(".chatgpt2api_webdav_test.txt", FakeWebDAVClient.deleted)
 
+    def test_image_response_is_browser_cacheable_for_two_hours(self):
+        image_path = self.images_dir / "cached.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_bytes(png_bytes())
+        with mock.patch("services.image_service.image_storage_service.has_local", return_value=True), mock.patch(
+            "services.image_service._safe_image_path", return_value=image_path
+        ):
+            response = get_image_response("cached.png")
+
+        self.assertEqual(response.headers["cache-control"], IMAGE_CACHE_CONTROL)
+
+    def test_low_disk_cleanup_keeps_images_younger_than_two_hours(self):
+        image_path = self.images_dir / "recent.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_bytes(png_bytes())
+        with mock.patch("services.image_service.config") as image_config, mock.patch(
+            "services.image_service.shutil.disk_usage",
+            return_value=mock.Mock(total=1024, used=1024, free=0),
+        ):
+            image_config.images_dir = self.images_dir
+            image_config.image_thumbnails_dir = self.data_dir / "thumbnails"
+            result = delete_to_target(100)
+
+        self.assertTrue(image_path.exists())
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["protected"], 1)
 
 if __name__ == "__main__":
     unittest.main()

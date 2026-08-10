@@ -41,6 +41,8 @@ def create_app() -> FastAPI:
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_private_network=True,
+        max_age=86400,
     )
     app.include_router(ai.create_router())
     app.include_router(accounts.create_router())

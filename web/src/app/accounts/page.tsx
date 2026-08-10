@@ -58,7 +58,9 @@ import {
   type Model,
   type RefreshProgressResponse,
 } from "@/lib/api";
+import { formatDisplayDateTime, formatDisplayShortDateTime, parseDisplayDate } from "@/lib/display-time";
 import { useAuthGuard } from "@/lib/use-auth-guard";
+import { useDisplayTimezone } from "@/lib/use-display-timezone";
 import { cn } from "@/lib/utils";
 
 import { AccountImportDialog } from "./components/account-import-dialog";
@@ -93,6 +95,18 @@ const metricCards = [
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
+function isProgressUnavailable(error: unknown) {
+  return error instanceof Error && error.message.toLowerCase().includes("progress not found");
+}
+
+function isUnlimitedImageQuotaAccount(account: Account) {
+  return account.type === "pro" || account.type === "prolite";
+}
+
+function imageQuotaUnknown(account: Account) {
+  return Boolean(account.image_quota_unknown);
+}
+
 function formatCompact(value: number) {
   if (value >= 1000) {
     return `${(value / 1000).toFixed(1)}k`;
@@ -101,16 +115,22 @@ function formatCompact(value: number) {
 }
 
 function formatQuota(account: Account) {
+  if (isUnlimitedImageQuotaAccount(account)) {
+    return "∞";
+  }
+  if (imageQuotaUnknown(account)) {
+    return "未知";
+  }
   return String(Math.max(0, account.quota));
 }
 
-function formatRestoreAt(value?: string | null) {
+function formatRestoreAt(value: string | null | undefined, timezone: string) {
   if (!value) {
     return { absolute: "—", relative: "" };
   }
 
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
+  const date = parseDisplayDate(value);
+  if (!date) {
     return { absolute: value, relative: "" };
   }
 
@@ -120,16 +140,19 @@ function formatRestoreAt(value?: string | null) {
   const hours = totalHours % 24;
   const relative = diffMs > 0 ? `剩余 ${days}d ${hours}h` : "已到恢复时间";
 
-  const pad = (num: number) => String(num).padStart(2, "0");
-  const absolute = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
-    date.getHours(),
-  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  const absolute = formatDisplayDateTime(value, timezone, value);
 
   return { absolute, relative };
 }
 
 function formatQuotaSummary(accounts: Account[]) {
   const availableAccounts = accounts.filter((account) => account.status === "正常");
+  if (availableAccounts.some(isUnlimitedImageQuotaAccount)) {
+    return "∞";
+  }
+  if (availableAccounts.some(imageQuotaUnknown)) {
+    return "未知";
+  }
   return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
 }
 
@@ -167,6 +190,7 @@ function displayAccountSource(account: Account) {
 
 function AccountsPageContent() {
   const didLoadRef = useRef(false);
+  const displayTimezone = useDisplayTimezone();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -345,6 +369,11 @@ function AccountsPageContent() {
           }
         });
       } catch (error) {
+        if (isProgressUnavailable(error)) {
+          await loadAccounts(true);
+          toast.info("服务重启导致刷新进度中断，已重新读取账号信息");
+          return;
+        }
         const message = error instanceof Error ? error.message : "刷新账户失败";
         toast.error(message);
       } finally {
@@ -367,6 +396,8 @@ function AccountsPageContent() {
     const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
     const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
     const baseNormalAccounts = baseAccountsList.filter((a) => a.status === "正常");
+    const baseHasUnlimited = baseNormalAccounts.some(isUnlimitedImageQuotaAccount);
+    const baseHasUnknown = baseNormalAccounts.some(imageQuotaUnknown);
     const baseQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, a.quota), 0);
 
     // 显示进度条（只显示当前任务，不含分类统计）
@@ -417,13 +448,21 @@ function AccountsPageContent() {
               const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
               const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
               const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
+              let runningQuota: string | number;
+              if (baseHasUnlimited) {
+                runningQuota = "∞";
+              } else if (baseHasUnknown) {
+                runningQuota = "未知";
+              } else {
+                runningQuota = formatCompact(baseQuotaNum + (p.total_quota ?? 0));
+              }
               setRefreshSummary({
                 total: accounts.length,
                 active: runningActive,
                 limited: runningLimited,
                 abnormal: runningAbnormal,
                 disabled: runningDisabled,
-                quota: formatCompact(baseQuotaNum + (p.total_quota ?? 0)),
+                quota: runningQuota,
               });
             }
           } catch (err) {
@@ -492,6 +531,11 @@ function AccountsPageContent() {
     } catch (error) {
       setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
       setRefreshSummary(null);
+      if (isProgressUnavailable(error)) {
+        await loadAccounts(true);
+        toast.info("服务重启导致刷新进度中断，已重新读取账号信息");
+        return;
+      }
       const message = error instanceof Error ? error.message : "刷新账户失败";
       toast.error(message);
     } finally {
@@ -507,12 +551,12 @@ function AccountsPageContent() {
       const timer = setInterval(async () => {
         try {
           const p = await fetchRefreshProgress(progressId);
+          onUpdate(p);
           if (p.done) {
             clearInterval(timer);
             if (p.error) {
               reject(new Error(p.error));
             } else {
-              onUpdate(p);
               resolve();
             }
           }
@@ -736,10 +780,49 @@ function AccountsPageContent() {
           </Button>
           <AccountImportDialog
             disabled={isLoading || isRefreshing || isDeleting}
-            onImported={(items) => {
+            onImported={(items, refreshProgressId, refreshing = 0) => {
               setAccounts(items);
               setSelectedIds([]);
               setPage(1);
+              if (!refreshProgressId) return;
+
+              setIsRefreshing(true);
+              setProgress({
+                visible: true,
+                current: 0,
+                total: refreshing,
+                message: "正在后台刷新导入账号...",
+                email: "",
+              });
+              void pollRefreshProgress(refreshProgressId, (refreshProgress) => {
+                setProgress((previous) => ({
+                  ...previous,
+                  current: refreshProgress.processed,
+                  total: refreshProgress.total,
+                }));
+                if (refreshProgress.done && refreshProgress.result) {
+                  setAccounts(refreshProgress.result.items);
+                  const failed = refreshProgress.result.errors?.length ?? 0;
+                  if (failed > 0) {
+                    toast.error(`导入账号刷新完成，成功 ${refreshProgress.result.refreshed} 个，失败 ${failed} 个`);
+                  } else {
+                    toast.success(`导入账号刷新完成，共刷新 ${refreshProgress.result.refreshed} 个`);
+                  }
+                }
+              })
+                .catch(async (error) => {
+                  const message = error instanceof Error ? error.message : "导入账号后台刷新失败";
+                  if (isProgressUnavailable(error)) {
+                    await loadAccounts(true);
+                    toast.info("账号已导入；服务重启导致刷新进度不可用，已重新读取号池");
+                    return;
+                  }
+                  toast.error(message);
+                })
+                .finally(() => {
+                  setIsRefreshing(false);
+                  setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
+                });
             }}
           />
           <Button
@@ -1120,15 +1203,7 @@ function AccountsPageContent() {
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
-                          {(() => {
-                            const raw = (account as any).created_at;
-                            if (!raw) return "—";
-                            try {
-                              const d = new Date(raw + "Z");
-                              if (isNaN(d.getTime())) return String(raw).slice(0, 10);
-                              return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-                            } catch { return String(raw).slice(0, 10); }
-                          })()}
+                          {formatDisplayShortDateTime(account.created_at, displayTimezone, "—")}
                         </td>
                         <td className="px-4 py-3">
                           <Badge variant="info" className="rounded-md">
@@ -1137,7 +1212,7 @@ function AccountsPageContent() {
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
                           {(() => {
-                            const restore = formatRestoreAt(account.restore_at);
+                            const restore = formatRestoreAt(account.restore_at, displayTimezone);
                             return (
                               <div className="space-y-0.5">
                                 {restore.relative ? <div className="font-medium text-stone-700">{restore.relative}</div> : null}

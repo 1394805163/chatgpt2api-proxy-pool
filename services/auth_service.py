@@ -5,13 +5,26 @@ import hmac
 import secrets
 import uuid
 from datetime import datetime, timezone
-from threading import Lock
+from threading import RLock
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from services.config import config
 from services.storage.base import StorageBackend
 
 AuthRole = Literal["admin", "user"]
+DEFAULT_IMAGE_REQUEST_LIMIT = 5
+MAX_IMAGE_REQUEST_LIMIT = 100
+
+
+class DailyRequestQuotaExceeded(ValueError):
+    pass
+
+
+class ImageRequestLimitExceeded(ValueError):
+    def __init__(self, limit: int):
+        self.limit = limit
+        super().__init__(f"single image request exceeds the configured limit of {limit}")
 
 
 def _now_iso() -> str:
@@ -25,13 +38,33 @@ def _hash_key(value: str) -> str:
 class AuthService:
     def __init__(self, storage: StorageBackend):
         self.storage = storage
-        self._lock = Lock()
+        self._lock = RLock()
         self._items = self._load()
         self._last_used_flush_at: dict[str, datetime] = {}
+        self._daily_reservations: dict[str, set[str]] = {}
 
     @staticmethod
     def _clean(value: object) -> str:
         return str(value or "").strip()
+
+    @staticmethod
+    def _non_negative_int(value: object, default: int = 0) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _image_request_limit(value: object) -> int:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            normalized = DEFAULT_IMAGE_REQUEST_LIMIT
+        return min(MAX_IMAGE_REQUEST_LIMIT, max(1, normalized))
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(ZoneInfo(config.display_timezone)).date().isoformat()
 
     @staticmethod
     def _default_name(role: object) -> str:
@@ -50,6 +83,12 @@ class AuthService:
         name = self._clean(raw.get("name")) or self._default_name(role)
         created_at = self._clean(raw.get("created_at")) or _now_iso()
         last_used_at = self._clean(raw.get("last_used_at")) or None
+        daily_request_limit = self._non_negative_int(raw.get("daily_request_limit"))
+        daily_request_date = self._clean(raw.get("daily_request_date")) or self._today()
+        daily_request_used = self._non_negative_int(raw.get("daily_request_used"))
+        if daily_request_date != self._today():
+            daily_request_date = self._today()
+            daily_request_used = 0
         return {
             "id": item_id,
             "name": name,
@@ -58,6 +97,10 @@ class AuthService:
             "enabled": bool(raw.get("enabled", True)),
             "created_at": created_at,
             "last_used_at": last_used_at,
+            "daily_request_limit": daily_request_limit,
+            "daily_request_used": daily_request_used,
+            "daily_request_date": daily_request_date,
+            "image_request_limit": self._image_request_limit(raw.get("image_request_limit")),
         }
 
     def _load(self) -> list[dict[str, object]]:
@@ -72,11 +115,17 @@ class AuthService:
     def _save(self) -> None:
         self.storage.save_auth_keys(self._items)
 
+    def _save_item_locked(self, item: dict[str, object]) -> None:
+        if not self.storage.save_auth_key(item):
+            self._save()
+
     def _reload_locked(self) -> None:
         self._items = self._load()
 
     @staticmethod
     def _public_item(item: dict[str, object]) -> dict[str, object]:
+        daily_request_limit = AuthService._non_negative_int(item.get("daily_request_limit"))
+        daily_request_used = AuthService._non_negative_int(item.get("daily_request_used"))
         return {
             "id": item.get("id"),
             "name": item.get("name"),
@@ -84,7 +133,32 @@ class AuthService:
             "enabled": bool(item.get("enabled", True)),
             "created_at": item.get("created_at"),
             "last_used_at": item.get("last_used_at"),
+            "daily_request_limit": daily_request_limit,
+            "daily_request_used": daily_request_used,
+            "daily_request_remaining": (
+                max(0, daily_request_limit - daily_request_used)
+                if daily_request_limit > 0
+                else None
+            ),
+            "daily_request_date": item.get("daily_request_date"),
+            "image_request_limit": AuthService._image_request_limit(item.get("image_request_limit")),
         }
+
+    def _find_item_locked(self, key_id: str) -> tuple[int, dict[str, object]] | None:
+        for index, item in enumerate(self._items):
+            if self._clean(item.get("id")) == key_id:
+                return index, item
+        return None
+
+    def _reset_daily_if_needed_locked(self, index: int, item: dict[str, object]) -> bool:
+        today = self._today()
+        if self._clean(item.get("daily_request_date")) == today:
+            return False
+        next_item = dict(item)
+        next_item["daily_request_date"] = today
+        next_item["daily_request_used"] = 0
+        self._items[index] = next_item
+        return True
 
     def list_keys(self, role: AuthRole | None = None) -> list[dict[str, object]]:
         with self._lock:
@@ -147,7 +221,14 @@ class AuthService:
             raise ValueError("这个名称已经在使用中了，换一个更容易区分的名称吧")
         return candidate
 
-    def create_key(self, *, role: AuthRole, name: str = "") -> tuple[dict[str, object], str]:
+    def create_key(
+        self,
+        *,
+        role: AuthRole,
+        name: str = "",
+        daily_request_limit: int = 0,
+        image_request_limit: int = DEFAULT_IMAGE_REQUEST_LIMIT,
+    ) -> tuple[dict[str, object], str]:
         with self._lock:
             self._reload_locked()
             normalized_name = self._build_name_locked(name, role=role)
@@ -166,6 +247,10 @@ class AuthService:
                 "enabled": True,
                 "created_at": _now_iso(),
                 "last_used_at": None,
+                "daily_request_limit": self._non_negative_int(daily_request_limit),
+                "daily_request_used": 0,
+                "daily_request_date": self._today(),
+                "image_request_limit": self._image_request_limit(image_request_limit),
             }
             self._items.append(item)
             self._save()
@@ -200,6 +285,13 @@ class AuthService:
                     next_item["enabled"] = bool(updates.get("enabled"))
                 if "key" in updates and updates.get("key") is not None:
                     next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
+                if "daily_request_limit" in updates and updates.get("daily_request_limit") is not None:
+                    next_item["daily_request_limit"] = self._non_negative_int(updates.get("daily_request_limit"))
+                if "image_request_limit" in updates and updates.get("image_request_limit") is not None:
+                    next_item["image_request_limit"] = self._image_request_limit(updates.get("image_request_limit"))
+                if bool(updates.get("reset_daily_usage")):
+                    next_item["daily_request_used"] = 0
+                    next_item["daily_request_date"] = self._today()
                 self._items[index] = next_item
                 self._save()
                 return self._public_item(next_item)
@@ -219,8 +311,105 @@ class AuthService:
             ]
             if len(self._items) == before:
                 return False
+            self._daily_reservations.pop(normalized_id, None)
             self._save()
             return True
+
+    def reserve_daily_request(self, identity: dict[str, object], reservation_id: str) -> bool:
+        if identity.get("role") != "user":
+            return False
+        key_id = self._clean(identity.get("id"))
+        normalized_reservation_id = self._clean(reservation_id)
+        if not key_id or not normalized_reservation_id:
+            raise ValueError("user key and reservation id are required")
+        with self._lock:
+            found = self._find_item_locked(key_id)
+            if found is None:
+                raise DailyRequestQuotaExceeded("user key is no longer available")
+            index, item = found
+            previous_item = dict(item)
+            reset = self._reset_daily_if_needed_locked(index, item)
+            item = self._items[index]
+            reservations = self._daily_reservations.setdefault(key_id, set())
+            if normalized_reservation_id in reservations:
+                return True
+            limit = self._non_negative_int(item.get("daily_request_limit"))
+            used = self._non_negative_int(item.get("daily_request_used"))
+            if limit > 0 and used + len(reservations) >= limit:
+                if reset:
+                    try:
+                        self._save_item_locked(item)
+                    except Exception:
+                        self._items[index] = previous_item
+                        if not reservations:
+                            self._daily_reservations.pop(key_id, None)
+                        raise
+                raise DailyRequestQuotaExceeded("daily request quota exhausted")
+            if reset:
+                try:
+                    self._save_item_locked(item)
+                except Exception:
+                    self._items[index] = previous_item
+                    if not reservations:
+                        self._daily_reservations.pop(key_id, None)
+                    raise
+            reservations.add(normalized_reservation_id)
+            return True
+
+    def finish_daily_request(
+        self,
+        identity: dict[str, object],
+        reservation_id: str,
+        *,
+        success: bool,
+    ) -> bool:
+        if identity.get("role") != "user":
+            return False
+        key_id = self._clean(identity.get("id"))
+        normalized_reservation_id = self._clean(reservation_id)
+        with self._lock:
+            reservations = self._daily_reservations.get(key_id)
+            if not reservations or normalized_reservation_id not in reservations:
+                return False
+            if not success:
+                reservations.discard(normalized_reservation_id)
+                if not reservations:
+                    self._daily_reservations.pop(key_id, None)
+                return False
+            found = self._find_item_locked(key_id)
+            if found is None:
+                reservations.discard(normalized_reservation_id)
+                if not reservations:
+                    self._daily_reservations.pop(key_id, None)
+                return False
+            index, item = found
+            previous_item = dict(item)
+            self._reset_daily_if_needed_locked(index, item)
+            next_item = dict(self._items[index])
+            next_item["daily_request_used"] = self._non_negative_int(next_item.get("daily_request_used")) + 1
+            self._items[index] = next_item
+            try:
+                self._save_item_locked(next_item)
+            except Exception:
+                self._items[index] = previous_item
+                raise
+            reservations.discard(normalized_reservation_id)
+            if not reservations:
+                self._daily_reservations.pop(key_id, None)
+            return True
+
+    def validate_image_request(self, identity: dict[str, object], count: int) -> None:
+        if identity.get("role") != "user":
+            return
+        key_id = self._clean(identity.get("id"))
+        with self._lock:
+            found = self._find_item_locked(key_id)
+            if found is None:
+                raise ImageRequestLimitExceeded(DEFAULT_IMAGE_REQUEST_LIMIT)
+            _, item = found
+            limit = self._image_request_limit(item.get("image_request_limit"))
+        if count > limit:
+            raise ImageRequestLimitExceeded(limit)
 
     def authenticate(self, raw_key: str) -> dict[str, object] | None:
         candidate = self._clean(raw_key)
@@ -236,13 +425,16 @@ class AuthService:
                     continue
                 next_item = dict(item)
                 now = datetime.now(timezone.utc)
+                reset = self._reset_daily_if_needed_locked(index, next_item)
+                if reset:
+                    next_item = dict(self._items[index])
                 next_item["last_used_at"] = now.isoformat()
                 self._items[index] = next_item
                 item_id = self._clean(next_item.get("id"))
                 last_flush_at = self._last_used_flush_at.get(item_id)
-                if last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
+                if reset or last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
                     try:
-                        self._save()
+                        self._save_item_locked(next_item)
                         self._last_used_flush_at[item_id] = now
                     except Exception:
                         pass

@@ -17,6 +17,36 @@
 
 ## 快速开始
 
+### v1.7 运行整合版说明
+
+本分支以官方 `v1.7.0` 为底座，只承担账号池、生图和 OpenAI 兼容 API。注册机独立运行，测活成功后使用管理员接口推送完整账号对象，避免运行容器携带 Chromium、Playwright 或 CloakBrowser。
+
+- 默认存储：`SQLite`，数据库位于 `./data/accounts.db`，已启用 WAL。
+- 数据持久化：Compose 挂载 `./data:/app/data` 和 `./config.json:/app/config.json`。
+- 账号导入：`POST /api/accounts`，请求体带 `refresh_after_import=false` 时不触发整池刷新。
+- 清理策略：确认失效账号自动删除；限流、429、超时、代理错误和 5xx 只保留状态或等待重试。
+
+注册机推送示例：
+
+```http
+POST /api/accounts
+Authorization: Bearer <ADMIN_KEY>
+Content-Type: application/json
+
+{
+  "accounts": [
+    {
+      "access_token": "<ACCESS_TOKEN>",
+      "email": "user@example.com",
+      "user_id": "<USER_ID>",
+      "type": "free",
+      "source_type": "register"
+    }
+  ],
+  "refresh_after_import": false
+}
+```
+
 ### Docker 运行
 
 ```bash
@@ -88,6 +118,26 @@ docker-compose up -d
 - `sqlite` - 本地 SQLite 数据库
 - `postgres` - 外部 PostgreSQL（需配置 `DATABASE_URL`）
 - `git` - Git 私有仓库（需配置 `GIT_REPO_URL` 和 `GIT_TOKEN`）
+
+#### SQLite 在线备份
+
+运行中的 SQLite 使用 WAL，备份时不要只复制 `accounts.db` 主文件。可在宿主机使用 SQLite Backup API 生成一致性快照：
+
+```bash
+python - <<'PY'
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+data = Path("data")
+target = data / f"accounts-backup-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.db"
+with sqlite3.connect(data / "accounts.db") as source, sqlite3.connect(target) as backup:
+    source.backup(backup)
+print(target)
+PY
+```
+
+快照完成后再复制或上传生成的 `accounts-backup-*.db`。管理后台的 R2 备份功能也会通过存储抽象导出账号与用户密钥逻辑快照。
 
 示例：使用 PostgreSQL
 

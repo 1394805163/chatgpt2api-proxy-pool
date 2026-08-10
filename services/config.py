@@ -4,6 +4,7 @@ import copy
 from dataclasses import dataclass
 import json
 import os
+import re
 import sys
 from pathlib import Path
 import time
@@ -15,6 +16,8 @@ DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
+DEFAULT_DISPLAY_TIMEZONE = "Asia/Shanghai"
+DISPLAY_TIMEZONE_PATTERN = re.compile(r"^[A-Za-z0-9_+\-./]{1,80}$")
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
@@ -82,6 +85,13 @@ DEFAULT_THIRD_PARTY_APPS = {
     },
 }
 
+DEFAULT_FREE_ACCOUNT_CLEANUP = {
+    "enabled": False,
+    "interval_minutes": 10,
+    "failure_threshold": 2,
+    "action": "mark_abnormal",
+}
+
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
@@ -102,6 +112,13 @@ def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> in
     except (OverflowError, TypeError, ValueError):
         normalized = default
     return max(minimum, normalized)
+
+
+def _normalize_display_timezone(value: object) -> str:
+    timezone_name = str(value or DEFAULT_DISPLAY_TIMEZONE).strip()
+    if not timezone_name or not DISPLAY_TIMEZONE_PATTERN.fullmatch(timezone_name):
+        return DEFAULT_DISPLAY_TIMEZONE
+    return timezone_name
 
 
 def _normalize_backup_include(value: object) -> dict[str, bool]:
@@ -287,6 +304,27 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
     }
 
 
+def _normalize_free_account_cleanup_settings(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    action = str(source.get("action") or DEFAULT_FREE_ACCOUNT_CLEANUP["action"]).strip().lower()
+    if action not in {"mark_abnormal", "delete"}:
+        action = str(DEFAULT_FREE_ACCOUNT_CLEANUP["action"])
+    return {
+        "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_FREE_ACCOUNT_CLEANUP["enabled"])),
+        "interval_minutes": _normalize_positive_int(
+            source.get("interval_minutes"),
+            int(DEFAULT_FREE_ACCOUNT_CLEANUP["interval_minutes"]),
+            1,
+        ),
+        "failure_threshold": _normalize_positive_int(
+            source.get("failure_threshold"),
+            int(DEFAULT_FREE_ACCOUNT_CLEANUP["failure_threshold"]),
+            1,
+        ),
+        "action": action,
+    }
+
+
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
     if not _normalize_bool(settings.get("enabled"), False):
         return
@@ -369,6 +407,18 @@ class ConfigStore:
     def _save(self) -> None:
         self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    @staticmethod
+    def _persistent_data(data: dict[str, object]) -> dict[str, object]:
+        persisted = copy.deepcopy(data)
+        persisted.pop("auth-key", None)
+        return persisted
+
+    def _restore_persisted_settings(self, backend: StorageBackend) -> None:
+        persisted = backend.load_settings()
+        if not isinstance(persisted, dict) or not persisted:
+            return
+        self.data = {**self.data, **persisted}
+
     @property
     def auth_key(self) -> str:
         return _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or self.data.get("auth-key"))
@@ -385,6 +435,10 @@ class ConfigStore:
             return 5
 
     @property
+    def display_timezone(self) -> str:
+        return _normalize_display_timezone(self.data.get("display_timezone"))
+
+    @property
     def image_retention_days(self) -> int:
         try:
             return max(1, int(self.data.get("image_retention_days", 30)))
@@ -393,10 +447,46 @@ class ConfigStore:
 
     @property
     def image_poll_timeout_secs(self) -> int:
+        """Compatibility alias for the single image task timeout setting."""
+        return max(1, int(self.image_task_timeout_secs))
+
+    @property
+    def image_task_timeout_secs(self) -> float:
         try:
-            return max(1, int(self.data.get("image_poll_timeout_secs", 120)))
+            raw_value = self.data.get("image_task_timeout_secs")
+            if raw_value is None:
+                raw_value = self.data.get("image_poll_timeout_secs", 150.0)
+            return max(1.0, float(raw_value))
         except (TypeError, ValueError):
-            return 120
+            return 150.0
+
+    @property
+    def user_image_task_timeout_secs(self) -> float:
+        try:
+            return max(1.0, float(self.data.get("user_image_task_timeout_secs", 180.0)))
+        except (TypeError, ValueError):
+            return 180.0
+
+    @property
+    def image_global_concurrency(self) -> int:
+        try:
+            return max(1, min(100, int(self.data.get("image_global_concurrency", 10))))
+        except (TypeError, ValueError):
+            return 10
+
+    @property
+    def image_user_concurrency(self) -> int:
+        try:
+            return max(1, min(self.image_global_concurrency, int(self.data.get("image_user_concurrency", 2))))
+        except (TypeError, ValueError):
+            return min(2, self.image_global_concurrency)
+
+    @property
+    def image_queue_timeout_secs(self) -> float:
+        try:
+            return max(30.0, float(self.data.get("image_queue_timeout_secs", 600.0)))
+        except (TypeError, ValueError):
+            return 600.0
 
     @property
     def image_poll_interval_secs(self) -> float:
@@ -414,6 +504,13 @@ class ConfigStore:
             return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 10.0)))
         except (TypeError, ValueError):
             return 10.0
+
+    @property
+    def image_timeout_retry_secs(self) -> float:
+        try:
+            return max(1.0, float(self.data.get("image_timeout_retry_secs", 30.0)))
+        except (TypeError, ValueError):
+            return 30.0
 
     @property
     def image_account_concurrency(self) -> int:
@@ -447,7 +544,7 @@ class ConfigStore:
 
     @property
     def image_remove_conversation_after_result(self) -> bool:
-        """出图成功后异步隐藏 ChatGPT 本地对话记录。"""
+        """Hide the ChatGPT upstream conversation after an image result is saved."""
         value = self.data.get("image_remove_conversation_after_result", False)
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -549,10 +646,17 @@ class ConfigStore:
     def get(self) -> dict[str, object]:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
+        data["display_timezone"] = self.display_timezone
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
+        data["image_task_timeout_secs"] = self.image_task_timeout_secs
+        data["user_image_task_timeout_secs"] = self.user_image_task_timeout_secs
+        data["image_global_concurrency"] = self.image_global_concurrency
+        data["image_user_concurrency"] = self.image_user_concurrency
+        data["image_queue_timeout_secs"] = self.image_queue_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
+        data["image_timeout_retry_secs"] = self.image_timeout_retry_secs
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
@@ -568,6 +672,7 @@ class ConfigStore:
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
+        data["free_account_cleanup"] = self.get_free_account_cleanup_settings()
         data.pop("auth-key", None)
         return data
 
@@ -592,9 +697,43 @@ class ConfigStore:
     def get_third_party_apps_settings(self) -> dict[str, object]:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
+    def get_free_account_cleanup_settings(self) -> dict[str, object]:
+        return _normalize_free_account_cleanup_settings(self.data.get("free_account_cleanup"))
+
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        try:
+            image_task_timeout = max(1.0, float(next_data.get("image_task_timeout_secs", 150.0)))
+        except (TypeError, ValueError):
+            image_task_timeout = 150.0
+        next_data["image_task_timeout_secs"] = image_task_timeout
+        # Keep the old key synchronized for cached/older frontends, but do not
+        # allow it to create a second independent timeout policy.
+        next_data["image_poll_timeout_secs"] = image_task_timeout
+        try:
+            user_image_task_timeout = max(1.0, float(next_data.get("user_image_task_timeout_secs", 180.0)))
+        except (TypeError, ValueError):
+            user_image_task_timeout = 180.0
+        next_data["user_image_task_timeout_secs"] = user_image_task_timeout
+        try:
+            image_global_concurrency = max(1, min(100, int(next_data.get("image_global_concurrency", 10))))
+        except (TypeError, ValueError):
+            image_global_concurrency = 10
+        next_data["image_global_concurrency"] = image_global_concurrency
+        try:
+            image_user_concurrency = max(
+                1,
+                min(image_global_concurrency, int(next_data.get("image_user_concurrency", 2))),
+            )
+        except (TypeError, ValueError):
+            image_user_concurrency = min(2, image_global_concurrency)
+        next_data["image_user_concurrency"] = image_user_concurrency
+        try:
+            image_queue_timeout_secs = max(30.0, float(next_data.get("image_queue_timeout_secs", 600.0)))
+        except (TypeError, ValueError):
+            image_queue_timeout_secs = 600.0
+        next_data["image_queue_timeout_secs"] = image_queue_timeout_secs
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:
@@ -606,6 +745,12 @@ class ConfigStore:
             )
         if "third_party_apps" in next_data:
             next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
+        if "free_account_cleanup" in next_data:
+            next_data["free_account_cleanup"] = _normalize_free_account_cleanup_settings(
+                next_data.get("free_account_cleanup")
+            )
+        if "display_timezone" in next_data:
+            next_data["display_timezone"] = _normalize_display_timezone(next_data.get("display_timezone"))
         if "proxy_runtime" in next_data:
             incoming_runtime = next_data.get("proxy_runtime")
             if isinstance(incoming_runtime, dict):
@@ -616,6 +761,9 @@ class ConfigStore:
                     incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
             next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
         next_data.pop("backup_state", None)
+        backend = self._storage_backend
+        if backend is not None:
+            backend.save_settings(self._persistent_data(next_data))
         self.data = next_data
         self._save()
         return self.get()
@@ -634,6 +782,7 @@ class ConfigStore:
         if self._storage_backend is None:
             from services.storage.factory import create_storage_backend
             self._storage_backend = create_storage_backend(DATA_DIR)
+            self._restore_persisted_settings(self._storage_backend)
         return self._storage_backend
 
 

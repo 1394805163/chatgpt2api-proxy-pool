@@ -10,8 +10,9 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type { ImageStorageMode } from "@/lib/api";
+import type { FreeAccountCleanupAction, ImageStorageMode } from "@/lib/api";
 import { testProxy, type ProxyTestResult } from "@/lib/api";
+import { DISPLAY_TIMEZONE_CHOICES, DEFAULT_DISPLAY_TIMEZONE } from "@/lib/display-time";
 
 import { useSettingsStore } from "../store";
 
@@ -24,7 +25,8 @@ export function ConfigCard() {
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
-  const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
+  const setImageTaskTimeoutSecs = useSettingsStore((state) => state.setImageTaskTimeoutSecs);
+  const setUserImageTaskTimeoutSecs = useSettingsStore((state) => state.setUserImageTaskTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageRemoveConversationAfterResult = useSettingsStore((state) => state.setImageRemoveConversationAfterResult);
@@ -33,6 +35,7 @@ export function ConfigCard() {
   const setAutoRemoveInvalidAccounts = useSettingsStore((state) => state.setAutoRemoveInvalidAccounts);
   const setAutoRemoveRateLimitedAccounts = useSettingsStore((state) => state.setAutoRemoveRateLimitedAccounts);
   const setAutoReloginAfterRefresh = useSettingsStore((state) => state.setAutoReloginAfterRefresh);
+  const setFreeAccountCleanupField = useSettingsStore((state) => state.setFreeAccountCleanupField);
   const setLogLevel = useSettingsStore((state) => state.setLogLevel);
   const setProxy = useSettingsStore((state) => state.setProxy);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
@@ -45,6 +48,7 @@ export function ConfigCard() {
   const isTestingImageStorage = useSettingsStore((state) => state.isTestingImageStorage);
   const isSyncingImageStorage = useSettingsStore((state) => state.isSyncingImageStorage);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
+  const setDisplayTimezone = useSettingsStore((state) => state.setDisplayTimezone);
 
   const handleTestProxy = async () => {
     const candidate = String(config?.proxy || "").trim();
@@ -79,11 +83,18 @@ export function ConfigCard() {
     );
   }
 
+  const displayTimezone = String(config?.display_timezone || DEFAULT_DISPLAY_TIMEZONE);
+  const timezoneChoices: Array<{ value: string; label: string }> = DISPLAY_TIMEZONE_CHOICES.some(
+    (item) => item.value === displayTimezone,
+  )
+    ? [...DISPLAY_TIMEZONE_CHOICES]
+    : [{ value: displayTimezone, label: "当前自定义时区" }, ...DISPLAY_TIMEZONE_CHOICES];
+
   return (
     <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
       <CardContent className="space-y-4 p-6">
         <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm leading-6 text-stone-600">
-          管理员登录密钥继续从部署配置读取，不再在此页面展示；如需分发给其他人，请在下方创建普通用户密钥。
+          此处是服务端设置：使用 PostgreSQL 时会写入数据库，重启或重新部署后仍然保留，并约束所有 API 请求。主题、布局等浏览器本地偏好不会写入这里。管理员登录密钥继续从部署配置读取；如需分发给其他人，请在下方创建普通用户密钥。
         </div>
         <div className="grid gap-4 md:grid-cols-2">
           <div className="space-y-2">
@@ -95,6 +106,24 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">单位分钟，控制账号自动刷新频率。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">显示时区</label>
+            <Select value={displayTimezone} onValueChange={setDisplayTimezone}>
+              <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                <SelectValue placeholder={DEFAULT_DISPLAY_TIMEZONE} />
+              </SelectTrigger>
+              <SelectContent className="max-h-72">
+                {timezoneChoices.map((item) => (
+                  <SelectItem key={item.value} value={item.value}>
+                    {item.label} · {item.value}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-stone-500">
+              选择常用 IANA 时区，只影响页面时间展示，不改变上游请求。
+            </p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">全局代理</label>
@@ -157,14 +186,24 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">自动删除多少天前的本地图片。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">图片轮询超时</label>
+            <label className="text-sm text-stone-700">管理员密钥图片等待时限</label>
             <Input
-              value={String(config?.image_poll_timeout_secs || "")}
-              onChange={(event) => setImagePollTimeoutSecs(event.target.value)}
-              placeholder="120"
+              value={String(config?.image_task_timeout_secs || "")}
+              onChange={(event) => setImageTaskTimeoutSecs(event.target.value)}
+              placeholder="150"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
+            <p className="text-xs text-stone-500">管理员密钥发起生图时使用，单位秒；达到时限后停止等待并标记失败。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">普通用户密钥图片等待时限</label>
+            <Input
+              value={String(config?.user_image_task_timeout_secs || "")}
+              onChange={(event) => setUserImageTaskTimeoutSecs(event.target.value)}
+              placeholder="180"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">所有普通用户密钥共用此服务端时限，接口调用无法绕过。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">单账号图片并发</label>
@@ -202,9 +241,9 @@ export function ConfigCard() {
                 checked={Boolean(config?.image_remove_conversation_after_result)}
                 onCheckedChange={(checked) => setImageRemoveConversationAfterResult(Boolean(checked))}
               />
-              <span className="text-sm text-stone-700">出图后移除本地对话</span>
+              <span className="text-sm text-stone-700">出图后隐藏上游对话</span>
             </div>
-            <p className="text-xs text-stone-500">成功拿到图片后，异步隐藏 ChatGPT 侧对应的本地对话记录。</p>
+            <p className="text-xs text-stone-500">成功保存图片后隐藏 ChatGPT 侧会话，不影响本地图片、日志和历史记录。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片超时继续等待时间</label>
@@ -247,6 +286,62 @@ export function ConfigCard() {
             />
             自动移除限流账号
           </label>
+          <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <label className="flex items-center gap-3 text-sm text-stone-700">
+                <Checkbox
+                  checked={Boolean(config?.free_account_cleanup?.enabled)}
+                  onCheckedChange={(checked) => setFreeAccountCleanupField("enabled", Boolean(checked))}
+                />
+                启用 Free 号池死号清理
+              </label>
+              <span className="rounded-lg bg-stone-100 px-2.5 py-1 text-xs text-stone-500">默认关闭</span>
+            </div>
+            <p className="text-xs leading-6 text-stone-500">
+              只处理 Free 账号：生图连续失败后强验证，注册补号判断前按间隔校准号池，避免死号继续占额度或被分配去生图。
+            </p>
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">定期强校验间隔</label>
+                <Input
+                  value={String(config?.free_account_cleanup?.interval_minutes || "10")}
+                  onChange={(event) => setFreeAccountCleanupField("interval_minutes", event.target.value)}
+                  placeholder="10"
+                  className="h-10 rounded-xl border-stone-200 bg-white disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!config?.free_account_cleanup?.enabled}
+                />
+                <p className="text-xs text-stone-500">单位分钟，后台对正常 Free 账号做强刷新。</p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">生图失败阈值</label>
+                <Input
+                  value={String(config?.free_account_cleanup?.failure_threshold || "2")}
+                  onChange={(event) => setFreeAccountCleanupField("failure_threshold", event.target.value)}
+                  placeholder="2"
+                  className="h-10 rounded-xl border-stone-200 bg-white disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!config?.free_account_cleanup?.enabled}
+                />
+                <p className="text-xs text-stone-500">连续失败达到阈值后强验证该账号。</p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">清理方式</label>
+                <Select
+                  value={String(config?.free_account_cleanup?.action || "mark_abnormal")}
+                  onValueChange={(value) => setFreeAccountCleanupField("action", value as FreeAccountCleanupAction)}
+                  disabled={!config?.free_account_cleanup?.enabled}
+                >
+                  <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white shadow-none disabled:cursor-not-allowed disabled:opacity-50">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="mark_abnormal">标记异常并额度归零</SelectItem>
+                    <SelectItem value="delete">直接删除</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-stone-500">直接删除适合一次性 Free 池。</p>
+              </div>
+            </div>
+          </div>
           <div className="space-y-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
             <div>
               <label className="text-sm text-stone-700">控制台日志级别</label>

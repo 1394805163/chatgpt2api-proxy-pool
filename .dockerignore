@@ -12,3 +12,8 @@ web/node_modules
 
 assets
 README.md
+data
+.env
+.env.*
+.learnings
+.learnings/

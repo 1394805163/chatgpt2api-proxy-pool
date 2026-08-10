@@ -3,30 +3,120 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from services.config import DATA_DIR
+from services.config import DATA_DIR, DEFAULT_DISPLAY_TIMEZONE
 from services.protocol.error_response import anthropic_error_response, openai_error_response
+from services.storage.base import DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_LOG_ITEMS
+from services.time_utils import utc_now_iso, utc_timestamp_iso
 from utils.helper import anthropic_sse_stream, sse_json_stream
+from utils.log import logger
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+LOG_FILE_PRUNE_INTERVAL = 100
 
 
 class LogService:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, storage_backend: object | None = None, use_config_storage: bool = False):
         self.path = path
+        self.storage_backend = storage_backend
+        self.use_config_storage = use_config_storage
+        self._lock = threading.RLock()
+        self._writes_since_file_prune = LOG_FILE_PRUNE_INTERVAL - 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _storage(self):
+        if self.storage_backend is not None:
+            return self.storage_backend
+        if not self.use_config_storage:
+            return None
+        try:
+            from services.config import config
+
+            return config.get_storage_backend()
+        except Exception:
+            return None
+
+    def _file_items(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        return [
+            item
+            for line_number, raw_line in enumerate(lines)
+            if (item := self._parse_line(raw_line, line_number)) is not None
+        ]
+
+    @staticmethod
+    def _item_timestamp(item: dict[str, Any]) -> float | None:
+        raw = str(item.get("time") or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.timestamp()
+
+    def _prune_file(
+        self,
+        *,
+        retention_days: int = DEFAULT_LOG_RETENTION_DAYS,
+        max_items: int = DEFAULT_MAX_LOG_ITEMS,
+    ) -> int:
+        with self._lock:
+            items = self._file_items()
+            original_count = len(items)
+            if retention_days >= 0:
+                cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).timestamp()
+                items = [
+                    item
+                    for item in items
+                    if (timestamp := self._item_timestamp(item)) is None or timestamp >= cutoff
+                ]
+            items = items[-max(0, max_items):] if max_items > 0 else []
+            content = "\n".join(self._serialize_item(item) for item in items)
+            self.path.write_text(f"{content}\n" if content else "", encoding="utf-8")
+            return original_count - len(items)
+
+    def _all_items(self, *, type: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            file_items = [
+                item
+                for item in reversed(self._file_items())
+                if not type or item.get("type") == type
+            ]
+            if limit is not None:
+                file_items = file_items[:limit]
+        storage = self._storage()
+        persistent_items: list[dict[str, Any]] = []
+        if storage is not None:
+            try:
+                persistent_items = storage.load_logs(limit=limit, type=type)
+            except Exception as exc:
+                logger.error(f"Failed to load logs from storage backend: {exc}")
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in [*file_items, *persistent_items]:
+            item_id = str(item.get("id") or "").strip()
+            if item_id and item_id not in deduped:
+                deduped[item_id] = item
+        items = list(deduped.values())
+        return items[:limit] if limit is not None else items
 
     @staticmethod
     def _legacy_id(raw_line: str, line_number: int) -> str:
@@ -49,9 +139,32 @@ class LogService:
         return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
-    def _matches_filters(item: dict[str, Any], *, type: str = "", start_date: str = "", end_date: str = "") -> bool:
-        t = str(item.get("time") or "")
-        day = t[:10]
+    def _display_day(item: dict[str, Any], display_timezone: str = DEFAULT_DISPLAY_TIMEZONE) -> str:
+        raw = str(item.get("time") or "").strip()
+        if not raw:
+            return ""
+        try:
+            timezone = ZoneInfo(str(display_timezone or DEFAULT_DISPLAY_TIMEZONE))
+        except ZoneInfoNotFoundError:
+            timezone = ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw[:10]
+        if parsed.tzinfo is None:
+            return raw[:10]
+        return parsed.astimezone(timezone).date().isoformat()
+
+    @staticmethod
+    def _matches_filters(
+        item: dict[str, Any],
+        *,
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        display_timezone: str = DEFAULT_DISPLAY_TIMEZONE,
+    ) -> bool:
+        day = LogService._display_day(item, display_timezone)
         if type and item.get("type") != type:
             return False
         if start_date and day < start_date:
@@ -60,57 +173,184 @@ class LogService:
             return False
         return True
 
+    @staticmethod
+    def _failed_image_group_key(item: dict[str, Any]) -> tuple[str, str, str, str] | None:
+        if item.get("type") != LOG_TYPE_CALL:
+            return None
+        detail = item.get("detail")
+        if not isinstance(detail, dict):
+            return None
+        if detail.get("status") != "failed":
+            return None
+        endpoint = str(detail.get("endpoint") or "").strip()
+        if not endpoint.startswith("/v1/images"):
+            return None
+        request_text = " ".join(str(detail.get("request_text") or "").split())
+        if not request_text:
+            return None
+        model = str(detail.get("model") or "").strip()
+        return ("prompt", endpoint, model, request_text)
+
+    @staticmethod
+    def _failed_image_group_id(group_key: tuple[str, str, str, str]) -> str:
+        group_token = hashlib.sha1(
+            json.dumps(group_key, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"group:{group_token}"
+
+    @staticmethod
+    def _collapse_failed_image_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        ordered: list[dict[str, Any]] = []
+        for item in items:
+            key = LogService._failed_image_group_key(item)
+            if key is None:
+                ordered.append(item)
+                continue
+            group = groups.get(key)
+            if group is None:
+                group = {"key": key, "items": []}
+                groups[key] = group
+                ordered.append(group)
+            group["items"].append(item)
+
+        collapsed: list[dict[str, Any]] = []
+        for entry in ordered:
+            group_items = entry.get("items") if "items" in entry else None
+            if not isinstance(group_items, list):
+                collapsed.append(entry)
+                continue
+            if len(group_items) <= 1:
+                collapsed.append(group_items[0])
+                continue
+
+            representative = dict(group_items[0])
+            detail = dict(representative.get("detail") or {})
+            group_key = entry.get("key")
+            ids = [str(item.get("id") or "") for item in group_items if item.get("id")]
+            errors = []
+            for item in group_items:
+                item_detail = item.get("detail")
+                error = str(item_detail.get("error") or "").strip() if isinstance(item_detail, dict) else ""
+                if error and error not in errors:
+                    errors.append(error)
+            detail.update({
+                "failure_count": len(group_items),
+                "grouped_log_ids": ids,
+                "grouped_latest_time": group_items[0].get("time"),
+                "grouped_earliest_time": group_items[-1].get("time"),
+            })
+            if errors:
+                detail["grouped_errors"] = errors
+            representative["id"] = LogService._failed_image_group_id(group_key)
+            representative["summary"] = f"{representative.get('summary') or 'image generation failed'}（失败 {len(group_items)} 次）"
+            representative["detail"] = detail
+            collapsed.append(representative)
+        return collapsed
+
+    @staticmethod
+    def _expand_group_delete_ids(items: list[dict[str, Any]], target_ids: set[str]) -> set[str]:
+        if not any(target_id.startswith("group:") for target_id in target_ids):
+            return target_ids
+        expanded = set(target_ids)
+        groups: dict[tuple[str, str, str, str], list[str]] = {}
+        for item in items:
+            key = LogService._failed_image_group_key(item)
+            if key is None:
+                continue
+            item_id = str(item.get("id") or "").strip()
+            if not item_id:
+                continue
+            groups.setdefault(key, []).append(item_id)
+        for group_key, group_item_ids in groups.items():
+            if len(group_item_ids) <= 1:
+                continue
+            if LogService._failed_image_group_id(group_key) in target_ids:
+                expanded.update(group_item_ids)
+        return expanded
+
     def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
         item = {
             "id": uuid4().hex,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time": utc_now_iso(),
             "type": type,
             "summary": summary,
             "detail": detail or data,
         }
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(self._serialize_item(item) + "\n")
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(self._serialize_item(item) + "\n")
+            self._writes_since_file_prune += 1
+            if self._writes_since_file_prune >= LOG_FILE_PRUNE_INTERVAL:
+                self._writes_since_file_prune = 0
+                self._prune_file()
+        storage = self._storage()
+        if storage is not None:
+            try:
+                storage.save_log(item)
+            except Exception as exc:
+                logger.error(f"Failed to persist log {item['id']} to storage backend: {exc}")
 
-    def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
+    def list(
+        self,
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        limit: int | None = 200,
+        collapse_image_failures: bool = False,
+        display_timezone: str = DEFAULT_DISPLAY_TIMEZONE,
+    ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
-            if item is None:
-                continue
-            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
+        for item in self._all_items(type=type, limit=limit):
+            if not self._matches_filters(
+                item,
+                type=type,
+                start_date=start_date,
+                end_date=end_date,
+                display_timezone=display_timezone,
+            ):
                 continue
             items.append(item)
-            if len(items) >= limit:
+            if limit is not None and len(items) >= limit:
                 break
+        if collapse_image_failures:
+            return self._collapse_failed_image_items(items)
         return items
 
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
-        if not self.path.exists() or not target_ids:
+        if not target_ids:
             return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
-        removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
-        return {"removed": removed}
+        parsed_items = self._all_items()
+        target_ids = self._expand_group_delete_ids(parsed_items, target_ids)
+        file_removed = 0
+        with self._lock:
+            lines = self.path.read_text(encoding="utf-8").splitlines() if self.path.exists() else []
+            parsed_lines = [(raw_line, self._parse_line(raw_line, line_number)) for line_number, raw_line in enumerate(lines)]
+            kept_lines: list[str] = []
+            for raw_line, item in parsed_lines:
+                if item is None:
+                    kept_lines.append(raw_line)
+                    continue
+                if str(item.get("id") or "") in target_ids:
+                    file_removed += 1
+                    continue
+                kept_lines.append(self._serialize_item(item))
+            content = "\n".join(kept_lines)
+            if content:
+                content += "\n"
+            self.path.write_text(content, encoding="utf-8")
+        database_removed = 0
+        storage = self._storage()
+        if storage is not None:
+            try:
+                database_removed = int(storage.delete_logs(list(target_ids)) or 0)
+            except Exception as exc:
+                logger.error(f"Failed to delete logs from storage backend: {exc}")
+        return {"removed": max(file_removed, database_removed)}
 
 
-log_service = LogService(DATA_DIR / "logs.jsonl")
+log_service = LogService(DATA_DIR / "logs.jsonl", use_config_storage=True)
 
 
 def _collect_urls(value: object) -> list[str]:
@@ -223,26 +463,62 @@ class LoggedCall:
     started: float = field(default_factory=time.time)
     request_text: str = ""
     request_shape: dict[str, int] | None = None
+    client_task_id: str = ""
+    request_timeout_secs: float | None = None
+    quota_reservation_id: str = field(default_factory=lambda: uuid4().hex)
+    _quota_reserved: bool = field(default=False, init=False, repr=False)
+
+    def _reserve_quota(self) -> None:
+        from services.auth_service import auth_service
+
+        self._quota_reserved = auth_service.reserve_daily_request(self.identity, self.quota_reservation_id)
+
+    def _finish_quota(self, success: bool) -> None:
+        if not self._quota_reserved:
+            return
+        try:
+            from services.auth_service import auth_service
+
+            auth_service.finish_daily_request(
+                self.identity,
+                self.quota_reservation_id,
+                success=success,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to update daily request usage: {exc}")
+            return
+        self._quota_reserved = False
 
     async def run(self, handler, *args, sse: str = "openai"):
+        from services.auth_service import DailyRequestQuotaExceeded
         from services.protocol.conversation import ImageGenerationError
+
+        try:
+            self._reserve_quota()
+        except DailyRequestQuotaExceeded as exc:
+            self.log("调用失败", status="failed", error=str(exc))
+            raise HTTPException(status_code=429, detail={"error": "daily request quota exhausted"}) from exc
 
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
+            self._finish_quota(True)
             self.log("调用完成", result)
             response = dict(result)
             response.pop("_account_email", None)
@@ -252,18 +528,22 @@ class LoggedCall:
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
+            self._finish_quota(False)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
+            self._finish_quota(True)
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
@@ -272,15 +552,15 @@ class LoggedCall:
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
-        failed = False
+        completed = False
         try:
             for item in items:
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
                 yield _strip_internal_response_fields(item)
+            completed = True
         except Exception as exc:
-            failed = True
             self.log(
                 "流式调用失败",
                 status="failed",
@@ -295,9 +575,12 @@ class LoggedCall:
                 raise ImageGenerationError(public_image_error_message(str(exc))) from exc
             raise
         finally:
-            if not failed:
+            if completed:
+                self._finish_quota(True)
                 self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          conversation_id=conversation_ids[0] if conversation_ids else "")
+            else:
+                self._finish_quota(False)
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
@@ -307,8 +590,8 @@ class LoggedCall:
             "role": self.identity.get("role"),
             "endpoint": self.endpoint,
             "model": self.model,
-            "started_at": datetime.fromtimestamp(self.started).strftime("%Y-%m-%d %H:%M:%S"),
-            "ended_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "started_at": utc_timestamp_iso(self.started),
+            "ended_at": utc_now_iso(),
             "duration_ms": int((time.time() - self.started) * 1000),
             "status": status,
         }
@@ -317,6 +600,10 @@ class LoggedCall:
             detail["request_text"] = request_excerpt
         if self.request_shape:
             detail["request_shape"] = self.request_shape
+        if self.client_task_id:
+            detail["client_task_id"] = self.client_task_id
+        if self.request_timeout_secs is not None:
+            detail["request_timeout_secs"] = float(self.request_timeout_secs)
         if error:
             detail["error"] = error
         email = str(account_email or "").strip()

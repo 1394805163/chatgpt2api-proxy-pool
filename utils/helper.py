@@ -6,7 +6,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
 from curl_cffi import requests
@@ -226,8 +226,13 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
+def iter_sse_payloads(
+    response: requests.Response,
+    abort_check: Callable[[], None] | None = None,
+) -> Iterator[str]:
     for raw_line in response.iter_lines():
+        if abort_check is not None:
+            abort_check()
         if not raw_line:
             continue
         line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
