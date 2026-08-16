@@ -32,7 +32,9 @@ WORKDIR /app
 COPY --from=uv-bin /uv /usr/local/bin/uv
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+# Keep the test toolchain in the image so verification can run in-container
+# without installing packages into the production host each time.
+RUN uv sync --frozen --no-install-project
 
 
 FROM python:3.13-slim AS app
@@ -52,6 +54,7 @@ COPY api ./api
 COPY services ./services
 COPY utils ./utils
 COPY scripts ./scripts
+COPY test ./test
 COPY --from=web-build /app/web/out ./web_dist
 
 EXPOSE 80

@@ -21,6 +21,22 @@ def make_auth_service(root: Path, *, daily_limit: int = 3) -> tuple[AuthService,
 
 
 class AuthQuotaPersistenceTests(unittest.TestCase):
+    def test_image_reservation_settles_to_actual_returned_units(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, identity = make_auth_service(Path(tmp_dir), daily_limit=10)
+            service.reserve_daily_request(identity, "partial-image", units=10)
+            self.assertTrue(service.finish_daily_request(identity, "partial-image", success=True, units=5))
+            item = service.list_keys(role="user")[0]
+            self.assertEqual(item["daily_request_used"], 5)
+            self.assertEqual(item["daily_request_remaining"], 5)
+
+    def test_image_reservation_blocks_on_reserved_total_units(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, identity = make_auth_service(Path(tmp_dir), daily_limit=10)
+            service.reserve_daily_request(identity, "first-image", units=7)
+            with self.assertRaisesRegex(ValueError, "daily request quota exhausted"):
+                service.reserve_daily_request(identity, "second-image", units=4)
+
     def test_reset_save_failure_rolls_back_state_and_reservation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service, identity = make_auth_service(Path(tmp_dir), daily_limit=1)
@@ -106,6 +122,25 @@ class LoggedCallQuotaTests(unittest.TestCase):
             item = service.list_keys(role="user")[0]
             self.assertEqual(item["daily_request_used"], 1)
             self.assertEqual(item["daily_request_remaining"], 1)
+
+    def test_image_call_counts_actual_data_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, identity = make_auth_service(Path(tmp_dir), daily_limit=10)
+            with mock.patch("services.auth_service.auth_service", service):
+                call = LoggedCall(
+                    identity,
+                    "/v1/images/generations",
+                    "gpt-image-2",
+                    "image",
+                    quota_units=10,
+                    quota_is_image=True,
+                )
+                with mock.patch.object(call, "log"):
+                    result = asyncio.run(
+                        call.run(lambda: {"data": [{"url": "one"}, {"url": "two"}, {"url": "three"}]})
+                    )
+            self.assertEqual(len(result["data"]), 3)
+            self.assertEqual(service.list_keys(role="user")[0]["daily_request_used"], 3)
 
     def test_stream_counts_only_after_full_exhaustion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

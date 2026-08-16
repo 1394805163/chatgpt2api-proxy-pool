@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Iterator
 
 from PIL import Image
@@ -18,9 +19,9 @@ from utils.image_tokens import count_image_inputs_tokens, count_image_output_ite
 
 
 def _composite_mask(
-    images: list[tuple[bytes, str, str]],
-    masks: list[tuple[bytes, str, str]],
-) -> list[tuple[bytes, str, str]]:
+    images: list[tuple[bytes | str, str, str]],
+    masks: list[tuple[bytes | str, str, str]],
+) -> list[tuple[bytes | str, str, str]]:
     """将 mask 的 alpha 通道合成到图片中，标识需要编辑的区域。
     
     mask 的透明区域（低 alpha）= 需要编辑的区域，
@@ -29,9 +30,13 @@ def _composite_mask(
     """
     if not masks:
         return images
-    result: list[tuple[bytes, str, str]] = []
+    result: list[tuple[bytes | str, str, str]] = []
     for i, (data, filename, mime_type) in enumerate(images):
         mask_data = masks[i][0] if i < len(masks) else masks[-1][0]
+        if isinstance(data, str):
+            data = Path(data).read_bytes()
+        if isinstance(mask_data, str):
+            mask_data = Path(mask_data).read_bytes()
         img = Image.open(BytesIO(data)).convert("RGBA")
         mask_img = Image.open(BytesIO(mask_data))
         if mask_img.mode == "RGBA":

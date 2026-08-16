@@ -489,6 +489,20 @@ class ConfigStore:
             return 600.0
 
     @property
+    def image_async_queue_limit(self) -> int:
+        try:
+            return max(0, min(1000, int(self.data.get("image_async_queue_limit", 200))))
+        except (TypeError, ValueError):
+            return 200
+
+    @property
+    def image_async_queue_owner_limit(self) -> int:
+        try:
+            return max(0, min(self.image_async_queue_limit, int(self.data.get("image_async_queue_owner_limit", 150))))
+        except (TypeError, ValueError):
+            return min(self.image_async_queue_limit, 150)
+
+    @property
     def image_poll_interval_secs(self) -> float:
         try:
             return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
@@ -654,6 +668,8 @@ class ConfigStore:
         data["image_global_concurrency"] = self.image_global_concurrency
         data["image_user_concurrency"] = self.image_user_concurrency
         data["image_queue_timeout_secs"] = self.image_queue_timeout_secs
+        data["image_async_queue_limit"] = self.image_async_queue_limit
+        data["image_async_queue_owner_limit"] = self.image_async_queue_owner_limit
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_timeout_retry_secs"] = self.image_timeout_retry_secs
@@ -734,6 +750,19 @@ class ConfigStore:
         except (TypeError, ValueError):
             image_queue_timeout_secs = 600.0
         next_data["image_queue_timeout_secs"] = image_queue_timeout_secs
+        try:
+            image_async_queue_limit = max(0, min(1000, int(next_data.get("image_async_queue_limit", 200))))
+        except (TypeError, ValueError):
+            image_async_queue_limit = 200
+        next_data["image_async_queue_limit"] = image_async_queue_limit
+        try:
+            image_async_queue_owner_limit = max(
+                0,
+                min(image_async_queue_limit, int(next_data.get("image_async_queue_owner_limit", 150))),
+            )
+        except (TypeError, ValueError):
+            image_async_queue_owner_limit = min(image_async_queue_limit, 150)
+        next_data["image_async_queue_owner_limit"] = image_async_queue_owner_limit
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

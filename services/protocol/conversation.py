@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 import tiktoken
@@ -176,8 +177,16 @@ def is_model_text_reply_instead_of_image(message: str) -> bool:
     return False
 
 
-def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
-    return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
+def encode_images(images: Iterable[tuple[bytes | str, str, str]]) -> list[str]:
+    encoded: list[str] = []
+    for data, _, _ in images:
+        if not data:
+            continue
+        if isinstance(data, str) and Path(data).is_file():
+            encoded.append(data)
+        else:
+            encoded.append(base64.b64encode(bytes(data)).decode("ascii"))
+    return encoded
 
 
 def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
@@ -348,18 +357,24 @@ def format_image_result(
     data: list[dict[str, Any]] = []
     for item in items:
         b64_json = str(item.get("b64_json") or "").strip()
-        if not b64_json:
+        raw_image = item.get("image_bytes")
+        image_data = bytes(raw_image) if isinstance(raw_image, (bytes, bytearray, memoryview)) else b""
+        if not image_data and b64_json:
+            image_data = base64.b64decode(b64_json)
+        if not image_data:
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
+            if not b64_json:
+                b64_json = base64.b64encode(image_data).decode("ascii")
             data.append({
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(image_data, base_url),
                 "revised_prompt": revised_prompt,
             })
         else:
             data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(image_data, base_url),
                 "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
@@ -1074,7 +1089,7 @@ def stream_image_outputs(
         if request.progress_callback:
             request.progress_callback("receiving_image")
         image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
+            {"image_bytes": image_data}
             for image_data in backend.download_image_bytes(image_urls)
         ]
         data = format_image_result(
@@ -1170,7 +1185,7 @@ def stream_image_outputs(
                     if request.progress_callback:
                         request.progress_callback("receiving_image")
                     image_items = [
-                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
+                        {"image_bytes": image_data}
                         for image_data in backend.download_image_bytes(image_urls)
                     ]
                     data = format_image_result(
@@ -1282,7 +1297,7 @@ def stream_image_outputs(
                 if request.progress_callback:
                     request.progress_callback("receiving_image")
                 image_items = [
-                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
+                    {"image_bytes": image_data}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
                 data = format_image_result(

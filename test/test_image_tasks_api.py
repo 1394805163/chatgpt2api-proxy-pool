@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
 from services.auth_service import DailyRequestQuotaExceeded, ImageRequestLimitExceeded
+from starlette.requests import ClientDisconnect
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -117,6 +119,7 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(len(self.fake_service.edit_calls), 1)
         images = self.fake_service.edit_calls[0][1]["images"]
         self.assertEqual(len(images), 2)
+        self.assertFalse(Path(images[0][0]).exists())
 
     def test_create_edit_task_accepts_image_url(self):
         """测试图片编辑任务接口支持表单 image_url 引用。"""
@@ -134,7 +137,23 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(self.fake_service.edit_calls), 1)
         images = self.fake_service.edit_calls[0][1]["images"]
-        self.assertEqual(images, [(PNG_BYTES, "image_url.png", "image/png")])
+        self.assertEqual(images[0][1:], ("image_url.png", "image/png"))
+        self.assertFalse(Path(images[0][0]).exists())
+
+    def test_create_edit_task_maps_client_disconnect_without_asgi_error(self):
+        with mock.patch.object(
+            image_tasks_module,
+            "parse_image_edit_request",
+            side_effect=ClientDisconnect(),
+        ):
+            response = self.client.post(
+                "/api/image-tasks/edits",
+                headers=AUTH_HEADERS,
+                data={"client_task_id": "disconnected", "prompt": "edit"},
+            )
+
+        self.assertEqual(response.status_code, 499)
+        self.assertIn("client disconnected", response.json()["detail"]["error"])
 
     def test_list_tasks_reports_missing_ids(self):
         response = self.client.get("/api/image-tasks?ids=task-1,missing", headers=AUTH_HEADERS)

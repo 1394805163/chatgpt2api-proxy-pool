@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import os
 import unittest
+from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "chatgpt2api")
@@ -22,19 +23,22 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         self.calls = []
 
         def fake_handle(payload):
-            self.calls.append(payload)
+            captured = dict(payload)
+            captured["images"] = [
+                (Path(data).read_bytes() if isinstance(data, str) else data, filename, mime_type)
+                for data, filename, mime_type in payload.get("images", [])
+            ]
+            self.calls.append(captured)
             return {"created": 1, "data": [{"b64_json": "ZmFrZQ=="}]}
 
         self.handle_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
         self.filter_patcher = mock.patch.object(ai_module, "filter_or_log", mock.AsyncMock())
-        self.url_patcher = mock.patch(
-            "api.image_inputs.requests.get",
-            return_value=mock.Mock(
-                status_code=200,
-                headers={"content-type": "image/png"},
-                content=b"remote-png",
-            ),
+        remote_response = mock.Mock(
+            status_code=200,
+            headers={"content-type": "image/png"},
         )
+        remote_response.iter_content.return_value = iter([b"remote-png"])
+        self.url_patcher = mock.patch("api.image_inputs.requests.get", return_value=remote_response)
         self.handle_patcher.start()
         self.filter_patcher.start()
         self.url_patcher.start()

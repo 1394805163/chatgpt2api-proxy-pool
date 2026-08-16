@@ -39,6 +39,7 @@ class UserKeyCreateRequest(BaseModel):
     name: str = ""
     daily_request_limit: int = Field(default=0, ge=0, le=1_000_000)
     image_request_limit: int = Field(default=5, ge=1, le=100)
+    image_concurrency_limit: int = Field(default=2, ge=1, le=100)
 
 
 class UserKeyUpdateRequest(BaseModel):
@@ -47,6 +48,7 @@ class UserKeyUpdateRequest(BaseModel):
     key: str | None = None
     daily_request_limit: int | None = Field(default=None, ge=0, le=1_000_000)
     image_request_limit: int | None = Field(default=None, ge=1, le=100)
+    image_concurrency_limit: int | None = Field(default=None, ge=1, le=100)
     reset_daily_usage: bool | None = None
 
 
@@ -180,6 +182,7 @@ def create_router() -> APIRouter:
                 name=body.name,
                 daily_request_limit=body.daily_request_limit,
                 image_request_limit=body.image_request_limit,
+                image_concurrency_limit=body.image_concurrency_limit,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -200,6 +203,7 @@ def create_router() -> APIRouter:
                 "key": body.key,
                 "daily_request_limit": body.daily_request_limit,
                 "image_request_limit": body.image_request_limit,
+                "image_concurrency_limit": body.image_concurrency_limit,
                 "reset_daily_usage": body.reset_daily_usage,
             }.items()
             if value is not None

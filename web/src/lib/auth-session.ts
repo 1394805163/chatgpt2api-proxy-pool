@@ -21,6 +21,7 @@ export async function getValidatedAuthSession(): Promise<StoredAuthSession | nul
       dailyRequestRemaining: data.daily_request_remaining,
       dailyRequestDate: data.daily_request_date || "",
       imageRequestLimit: data.image_request_limit,
+      imageConcurrencyLimit: data.image_concurrency_limit,
     };
     await setStoredAuthSession(nextSession);
     return nextSession;

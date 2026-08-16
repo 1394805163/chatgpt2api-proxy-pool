@@ -35,6 +35,7 @@ export function UserKeysCard() {
   const [name, setName] = useState("");
   const [dailyRequestLimit, setDailyRequestLimit] = useState("0");
   const [imageRequestLimit, setImageRequestLimit] = useState("5");
+  const [imageConcurrencyLimit, setImageConcurrencyLimit] = useState("2");
   const [isCreating, setIsCreating] = useState(false);
   const [pendingIds, setPendingIds] = useState<Set<string>>(() => new Set());
   const [revealedKey, setRevealedKey] = useState("");
@@ -44,6 +45,7 @@ export function UserKeysCard() {
   const [editKey, setEditKey] = useState("");
   const [editDailyRequestLimit, setEditDailyRequestLimit] = useState("0");
   const [editImageRequestLimit, setEditImageRequestLimit] = useState("5");
+  const [editImageConcurrencyLimit, setEditImageConcurrencyLimit] = useState("2");
 
   const load = async () => {
     setIsLoading(true);
@@ -72,12 +74,14 @@ export function UserKeysCard() {
         name: name.trim(),
         daily_request_limit: Math.max(0, Number(dailyRequestLimit) || 0),
         image_request_limit: Math.min(100, Math.max(1, Number(imageRequestLimit) || 5)),
+        image_concurrency_limit: Math.min(100, Math.max(1, Number(imageConcurrencyLimit) || 2)),
       });
       setItems(data.items);
       setRevealedKey(data.key);
       setName("");
       setDailyRequestLimit("0");
       setImageRequestLimit("5");
+      setImageConcurrencyLimit("2");
       setIsDialogOpen(false);
       toast.success("用户密钥已创建");
     } catch (error) {
@@ -136,6 +140,7 @@ export function UserKeysCard() {
     setEditKey("");
     setEditDailyRequestLimit(String(item.daily_request_limit));
     setEditImageRequestLimit(String(item.image_request_limit));
+    setEditImageConcurrencyLimit(String(item.image_concurrency_limit));
   };
 
   const handleEdit = async () => {
@@ -147,11 +152,13 @@ export function UserKeysCard() {
     const trimmedKey = editKey.trim();
     const nextDailyRequestLimit = Math.max(0, Number(editDailyRequestLimit) || 0);
     const nextImageRequestLimit = Math.min(100, Math.max(1, Number(editImageRequestLimit) || 5));
+    const nextImageConcurrencyLimit = Math.min(100, Math.max(1, Number(editImageConcurrencyLimit) || 2));
     if (
       trimmedName === item.name &&
       !trimmedKey &&
       nextDailyRequestLimit === item.daily_request_limit &&
-      nextImageRequestLimit === item.image_request_limit
+      nextImageRequestLimit === item.image_request_limit &&
+      nextImageConcurrencyLimit === item.image_concurrency_limit
     ) {
       setEditingItem(null);
       return;
@@ -166,6 +173,9 @@ export function UserKeysCard() {
           : {}),
         ...(nextImageRequestLimit !== item.image_request_limit
           ? { image_request_limit: nextImageRequestLimit }
+          : {}),
+        ...(nextImageConcurrencyLimit !== item.image_concurrency_limit
+          ? { image_concurrency_limit: nextImageConcurrencyLimit }
           : {}),
       });
       setItems(data.items);
@@ -251,9 +261,10 @@ export function UserKeysCard() {
                         <span>创建时间 {formatDateTime(item.created_at, displayTimezone)}</span>
                         <span>最近使用 {formatDateTime(item.last_used_at, displayTimezone)}</span>
                         <span>
-                          今日成功请求 {item.daily_request_used} / {item.daily_request_limit > 0 ? item.daily_request_limit : "不限"}
+                          今日成功用量 {item.daily_request_used} / {item.daily_request_limit > 0 ? item.daily_request_limit : "不限"}
                         </span>
                         <span>单次生图最多 {item.image_request_limit} 张</span>
+                        <span>同时生图最多 {item.image_concurrency_limit} 路</span>
                       </div>
                     </div>
 
@@ -320,9 +331,9 @@ export function UserKeysCard() {
               className="h-11 rounded-xl border-stone-200 bg-white"
             />
           </div>
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-4 sm:grid-cols-3">
             <div className="space-y-2">
-              <label className="text-sm font-medium text-stone-700">每日成功请求上限</label>
+              <label className="text-sm font-medium text-stone-700">每日成功用量上限（图片按张计）</label>
               <Input
                 type="number"
                 min="0"
@@ -343,6 +354,18 @@ export function UserKeysCard() {
                 onChange={(event) => setImageRequestLimit(event.target.value)}
                 className="h-11 rounded-xl border-stone-200 bg-white"
               />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">同时生图请求上限</label>
+              <Input
+                type="number"
+                min="1"
+                max="100"
+                value={imageConcurrencyLimit}
+                onChange={(event) => setImageConcurrencyLimit(event.target.value)}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">超过后立即返回 429，不进入等待队列。</p>
             </div>
           </div>
           <DialogFooter>
@@ -437,9 +460,9 @@ export function UserKeysCard() {
                 保存后旧密钥会立即失效，新密钥生效。系统仍只保存哈希，不会回显当前密钥。
               </p>
             </div>
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div className="grid gap-4 sm:grid-cols-3">
               <div className="space-y-2">
-                <label className="text-sm font-medium text-stone-700">每日成功请求上限</label>
+                <label className="text-sm font-medium text-stone-700">每日成功用量上限（图片按张计）</label>
                 <Input
                   type="number"
                   min="0"
@@ -460,6 +483,18 @@ export function UserKeysCard() {
                   onChange={(event) => setEditImageRequestLimit(event.target.value)}
                   className="h-11 rounded-xl border-stone-200 bg-white"
                 />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700">同时生图请求上限</label>
+                <Input
+                  type="number"
+                  min="1"
+                  max="100"
+                  value={editImageConcurrencyLimit}
+                  onChange={(event) => setEditImageConcurrencyLimit(event.target.value)}
+                  className="h-11 rounded-xl border-stone-200 bg-white"
+                />
+                <p className="text-xs text-stone-500">超过后立即返回 429，不排队。</p>
               </div>
             </div>
           </div>

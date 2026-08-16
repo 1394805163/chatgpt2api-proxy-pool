@@ -465,15 +465,24 @@ class LoggedCall:
     request_shape: dict[str, int] | None = None
     client_task_id: str = ""
     request_timeout_secs: float | None = None
+    # Image requests reserve their requested `n`, then settle against the
+    # number of image entries actually returned. Other requests use one unit.
+    quota_units: int = 1
+    quota_is_image: bool = False
     quota_reservation_id: str = field(default_factory=lambda: uuid4().hex)
     _quota_reserved: bool = field(default=False, init=False, repr=False)
+    _stream_image_units: int = field(default=0, init=False, repr=False)
 
     def _reserve_quota(self) -> None:
         from services.auth_service import auth_service
 
-        self._quota_reserved = auth_service.reserve_daily_request(self.identity, self.quota_reservation_id)
+        self._quota_reserved = auth_service.reserve_daily_request(
+            self.identity,
+            self.quota_reservation_id,
+            units=max(1, int(self.quota_units or 1)),
+        )
 
-    def _finish_quota(self, success: bool) -> None:
+    def _finish_quota(self, success: bool, units: int | None = None) -> None:
         if not self._quota_reserved:
             return
         try:
@@ -483,11 +492,21 @@ class LoggedCall:
                 self.identity,
                 self.quota_reservation_id,
                 success=success,
+                units=units,
             )
         except Exception as exc:
             logger.error(f"Failed to update daily request usage: {exc}")
             return
         self._quota_reserved = False
+
+    def _result_quota_units(self, result: object) -> int | None:
+        if not self.quota_is_image:
+            return None
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, list):
+                return len(data)
+        return 0
 
     async def run(self, handler, *args, sse: str = "openai"):
         from services.auth_service import DailyRequestQuotaExceeded
@@ -502,23 +521,23 @@ class LoggedCall:
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
-            self._finish_quota(False)
+            self._finish_quota(False, units=0 if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
-            self._finish_quota(False)
+            self._finish_quota(False, units=0 if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self._finish_quota(False)
+            self._finish_quota(False, units=0 if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
-            self._finish_quota(True)
+            self._finish_quota(True, units=self._result_quota_units(result))
             self.log("调用完成", result)
             response = dict(result)
             response.pop("_account_email", None)
@@ -528,22 +547,22 @@ class LoggedCall:
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
-            self._finish_quota(False)
+            self._finish_quota(False, units=self._stream_image_units if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
-            self._finish_quota(False)
+            self._finish_quota(False, units=self._stream_image_units if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self._finish_quota(False)
+            self._finish_quota(False, units=self._stream_image_units if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
-            self._finish_quota(True)
+            self._finish_quota(True, units=0 if self.quota_is_image else None)
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
@@ -555,6 +574,10 @@ class LoggedCall:
         completed = False
         try:
             for item in items:
+                if self.quota_is_image and isinstance(item, dict):
+                    data = item.get("data")
+                    if isinstance(data, list):
+                        self._stream_image_units += len(data)
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
@@ -576,11 +599,11 @@ class LoggedCall:
             raise
         finally:
             if completed:
-                self._finish_quota(True)
+                self._finish_quota(True, units=self._stream_image_units if self.quota_is_image else None)
                 self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          conversation_id=conversation_ids[0] if conversation_ids else "")
             else:
-                self._finish_quota(False)
+                self._finish_quota(False, units=self._stream_image_units if self.quota_is_image else None)
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:

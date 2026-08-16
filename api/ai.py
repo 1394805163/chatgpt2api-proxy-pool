@@ -4,11 +4,12 @@ import time
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask, BackgroundTasks
 
-from api.image_inputs import parse_image_edit_request, read_image_sources
-from api.support import enforce_image_request_limit, require_identity, resolve_image_base_url
+from api.image_inputs import cleanup_spooled_image_sources, parse_image_edit_request, read_image_sources
+from api.support import acquire_image_concurrency, enforce_image_request_limit, require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
 from services.auth_service import DailyRequestQuotaExceeded
 from services.config import config
@@ -124,6 +125,20 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
         raise
 
 
+def release_image_concurrency_after_response(response, lease):
+    if not isinstance(response, StreamingResponse):
+        lease.release()
+        return response
+    if response.background is None:
+        response.background = BackgroundTask(lease.release)
+    else:
+        cleanup_tasks = BackgroundTasks()
+        cleanup_tasks.tasks.append(response.background)
+        cleanup_tasks.add_task(lease.release)
+        response.background = cleanup_tasks
+    return response
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -155,9 +170,17 @@ def create_router() -> APIRouter:
             request_text=body.prompt,
             client_task_id=body.client_task_id or "",
             request_timeout_secs=timeout_secs,
+            quota_units=body.n,
+            quota_is_image=True,
         )
-        await filter_or_log(call, body.prompt)
-        return await call.run(openai_v1_image_generations.handle, payload)
+        lease = acquire_image_concurrency(identity)
+        try:
+            await filter_or_log(call, body.prompt)
+            response = await call.run(openai_v1_image_generations.handle, payload)
+        except BaseException:
+            lease.release()
+            raise
+        return release_image_concurrency_after_response(response, lease)
 
     @router.post("/v1/images/edits")
     async def edit_images(
@@ -181,19 +204,50 @@ def create_router() -> APIRouter:
             request_text=prompt,
             client_task_id=str(payload.get("client_task_id") or ""),
             request_timeout_secs=timeout_secs,
+            quota_units=int(payload.get("n") or 1),
+            quota_is_image=True,
         )
-        await filter_or_log(call, prompt)
-        payload["images"] = await read_image_sources(image_sources)
-        if mask_sources:
-            payload["mask"] = await read_image_sources(mask_sources)
-        payload["base_url"] = resolve_image_base_url(request)
-        return await call.run(openai_v1_image_edit.handle, payload)
+        lease = acquire_image_concurrency(identity)
+        images = []
+        masks = []
+        try:
+            await filter_or_log(call, prompt)
+            images = await read_image_sources(image_sources, spool_to_disk=True)
+            masks = await read_image_sources(mask_sources, spool_to_disk=True) if mask_sources else []
+            payload["images"] = images
+            if masks:
+                payload["mask"] = masks
+            payload["base_url"] = resolve_image_base_url(request)
+            response = await call.run(openai_v1_image_edit.handle, payload)
+        except BaseException:
+            cleanup_spooled_image_sources(images)
+            cleanup_spooled_image_sources(masks)
+            lease.release()
+            raise
+
+        def cleanup_inputs() -> None:
+            cleanup_spooled_image_sources(images)
+            cleanup_spooled_image_sources(masks)
+
+        if isinstance(response, StreamingResponse):
+            if response.background is None:
+                response.background = BackgroundTask(cleanup_inputs)
+            else:
+                cleanup_tasks = BackgroundTasks()
+                cleanup_tasks.tasks.append(response.background)
+                cleanup_tasks.add_task(cleanup_inputs)
+                response.background = cleanup_tasks
+        else:
+            cleanup_inputs()
+        return release_image_concurrency_after_response(response, lease)
 
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
-        if is_image_chat_request(payload):
+        is_image_request = is_image_chat_request(payload)
+        if is_image_request:
+            enforce_image_request_limit(identity, int(payload.get("n") or 1))
             apply_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("prompt"), payload.get("messages"))
@@ -204,15 +258,25 @@ def create_router() -> APIRouter:
             "文本生成",
             request_text=request_preview,
             request_shape=request_shape(payload.get("messages")),
+            quota_units=int(payload.get("n") or 1) if is_image_request else 1,
+            quota_is_image=is_image_request,
         )
-        await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_chat_complete.handle, payload)
+        lease = acquire_image_concurrency(identity) if is_image_request else None
+        try:
+            await filter_or_log(call, request_preview)
+            response = await call.run(openai_v1_chat_complete.handle, payload)
+        except BaseException:
+            if lease is not None:
+                lease.release()
+            raise
+        return release_image_concurrency_after_response(response, lease) if lease is not None else response
 
     @router.post("/v1/responses")
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
-        if not openai_v1_response.is_text_response_request(payload):
+        is_image_request = not openai_v1_response.is_text_response_request(payload)
+        if is_image_request:
             apply_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
@@ -223,9 +287,18 @@ def create_router() -> APIRouter:
             "Responses",
             request_text=request_preview,
             request_shape=request_shape(payload.get("input")),
+            quota_units=int(payload.get("n") or 1) if is_image_request else 1,
+            quota_is_image=is_image_request,
         )
-        await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_response.handle, payload)
+        lease = acquire_image_concurrency(identity) if is_image_request else None
+        try:
+            await filter_or_log(call, request_preview)
+            response = await call.run(openai_v1_response.handle, payload)
+        except BaseException:
+            if lease is not None:
+                lease.release()
+            raise
+        return release_image_concurrency_after_response(response, lease) if lease is not None else response
 
     @router.post("/v1/messages")
     async def create_message(
