@@ -1,0 +1,30 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatgpt2api:lite-local
+    container_name: chatgpt2api
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:3000:80"
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    env_file:
+      - .env
+    environment:
+      STORAGE_BACKEND: sqlite
+      DATABASE_URL: sqlite:////app/data/accounts.db
+      CHATGPT2API_BASE_URL: https://chatgpt2api.xtools.fun
+    mem_limit: 768m
+    memswap_limit: 1024m
+    mem_reservation: 128m
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/health?format=json', timeout=5).read()"]
+      interval: 30s
+      timeout: 8s
+      retries: 5
+      start_period: 30s

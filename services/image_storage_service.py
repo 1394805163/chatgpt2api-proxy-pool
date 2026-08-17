@@ -203,7 +203,14 @@ class ImageStorageService:
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
-    def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
+    def save(
+        self,
+        image_data: bytes,
+        base_url: str | None = None,
+        *,
+        retention_seconds: int | None = None,
+        owner_id: str = "",
+    ) -> StoredImage:
         config.cleanup_old_images()
         rel = self.make_relative_path(image_data)
         mode = self.mode()
@@ -238,11 +245,41 @@ class ImageStorageService:
         }
         if dimensions:
             item["width"], item["height"] = dimensions
+        try:
+            ttl = int(retention_seconds or 0)
+        except (TypeError, ValueError):
+            ttl = 0
+        if ttl > 0:
+            item["expires_at"] = int(time.time()) + max(60, ttl)
+            if owner_id:
+                item["owner_id"] = _clean(owner_id)
         with self._index_lock:
             items = self._load_clean_index()
             items[rel] = item
             self._save_index(items)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
+
+    def cleanup_expired(self, now: float | None = None) -> int:
+        """Delete images with a per-key TTL without reading their bytes into memory."""
+        current = time.time() if now is None else float(now)
+        with self._index_lock:
+            items = self._load_clean_index()
+            targets = []
+            for rel, item in items.items():
+                try:
+                    expires_at = float(item.get("expires_at") or 0)
+                except (TypeError, ValueError):
+                    expires_at = 0
+                if expires_at and expires_at <= current:
+                    targets.append(rel)
+        removed = 0
+        for rel in targets:
+            try:
+                if self.delete(rel):
+                    removed += 1
+            except Exception:
+                continue
+        return removed
 
     def get_bytes(self, rel: str) -> bytes:
         safe_rel = _safe_relative_path(rel)

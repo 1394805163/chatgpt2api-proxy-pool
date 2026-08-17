@@ -358,14 +358,17 @@ def download_images_zip(paths: list[str]) -> io.BytesIO:
 
 
 def _auto_cleanup_worker(stop_event: threading.Event) -> None:
-    """后台线程：每30分钟检查存储，空间低于阈值自动清理最旧图片"""
+    """后台线程：每分钟执行轻量 TTL 检查，低空间时再清理旧图片。"""
     import shutil
     min_free_mb = getattr(config, "image_min_free_mb", None)
     if min_free_mb is None:
         min_free_mb = 500
 
-    while not stop_event.wait(1800):  # 每30分钟
+    while not stop_event.wait(60):
         try:
+            expired = image_storage_service.cleanup_expired()
+            if expired:
+                logger.info({"event": "image_ttl_cleanup", "removed": expired})
             config.cleanup_old_images()
             cleanup_image_thumbnails()
             usage = shutil.disk_usage(config.images_dir)

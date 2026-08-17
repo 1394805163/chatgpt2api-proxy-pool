@@ -10,11 +10,14 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from services.config import config
+from services.image_concurrency import normalize_image_concurrency_limit
 from services.storage.base import StorageBackend
 
 AuthRole = Literal["admin", "user"]
 DEFAULT_IMAGE_REQUEST_LIMIT = 5
 MAX_IMAGE_REQUEST_LIMIT = 100
+DEFAULT_IMAGE_RETENTION_MINUTES = 0
+MAX_IMAGE_RETENTION_MINUTES = 43_200
 
 
 class DailyRequestQuotaExceeded(ValueError):
@@ -63,6 +66,14 @@ class AuthService:
         return min(MAX_IMAGE_REQUEST_LIMIT, max(1, normalized))
 
     @staticmethod
+    def _image_retention_minutes(value: object) -> int:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            normalized = DEFAULT_IMAGE_RETENTION_MINUTES
+        return min(MAX_IMAGE_RETENTION_MINUTES, max(0, normalized))
+
+    @staticmethod
     def _today() -> str:
         return datetime.now(ZoneInfo(config.display_timezone)).date().isoformat()
 
@@ -101,6 +112,8 @@ class AuthService:
             "daily_request_used": daily_request_used,
             "daily_request_date": daily_request_date,
             "image_request_limit": self._image_request_limit(raw.get("image_request_limit")),
+            "image_concurrency_limit": normalize_image_concurrency_limit(raw.get("image_concurrency_limit")),
+            "image_retention_minutes": self._image_retention_minutes(raw.get("image_retention_minutes")),
         }
 
     def _load(self) -> list[dict[str, object]]:
@@ -142,6 +155,8 @@ class AuthService:
             ),
             "daily_request_date": item.get("daily_request_date"),
             "image_request_limit": AuthService._image_request_limit(item.get("image_request_limit")),
+            "image_concurrency_limit": normalize_image_concurrency_limit(item.get("image_concurrency_limit")),
+            "image_retention_minutes": AuthService._image_retention_minutes(item.get("image_retention_minutes")),
         }
 
     def _find_item_locked(self, key_id: str) -> tuple[int, dict[str, object]] | None:
@@ -228,6 +243,8 @@ class AuthService:
         name: str = "",
         daily_request_limit: int = 0,
         image_request_limit: int = DEFAULT_IMAGE_REQUEST_LIMIT,
+        image_concurrency_limit: int = 2,
+        image_retention_minutes: int = DEFAULT_IMAGE_RETENTION_MINUTES,
     ) -> tuple[dict[str, object], str]:
         with self._lock:
             self._reload_locked()
@@ -251,6 +268,8 @@ class AuthService:
                 "daily_request_used": 0,
                 "daily_request_date": self._today(),
                 "image_request_limit": self._image_request_limit(image_request_limit),
+                "image_concurrency_limit": normalize_image_concurrency_limit(image_concurrency_limit),
+                "image_retention_minutes": self._image_retention_minutes(image_retention_minutes),
             }
             self._items.append(item)
             self._save()
@@ -289,6 +308,14 @@ class AuthService:
                     next_item["daily_request_limit"] = self._non_negative_int(updates.get("daily_request_limit"))
                 if "image_request_limit" in updates and updates.get("image_request_limit") is not None:
                     next_item["image_request_limit"] = self._image_request_limit(updates.get("image_request_limit"))
+                if "image_concurrency_limit" in updates and updates.get("image_concurrency_limit") is not None:
+                    next_item["image_concurrency_limit"] = normalize_image_concurrency_limit(
+                        updates.get("image_concurrency_limit")
+                    )
+                if "image_retention_minutes" in updates and updates.get("image_retention_minutes") is not None:
+                    next_item["image_retention_minutes"] = self._image_retention_minutes(
+                        updates.get("image_retention_minutes")
+                    )
                 if bool(updates.get("reset_daily_usage")):
                     next_item["daily_request_used"] = 0
                     next_item["daily_request_date"] = self._today()
@@ -410,6 +437,13 @@ class AuthService:
             limit = self._image_request_limit(item.get("image_request_limit"))
         if count > limit:
             raise ImageRequestLimitExceeded(limit)
+
+    def image_retention_seconds(self, identity: dict[str, object]) -> int:
+        """Return the per-key image TTL; zero keeps the global retention policy."""
+        if identity.get("role") != "user":
+            return 0
+        minutes = self._image_retention_minutes(identity.get("image_retention_minutes"))
+        return minutes * 60
 
     def authenticate(self, raw_key: str) -> dict[str, object] | None:
         candidate = self._clean(raw_key)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import json
+import shutil
 import threading
 import time
 from collections import deque
@@ -12,8 +14,14 @@ from uuid import uuid4
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
-from services.auth_service import ImageRequestLimitExceeded, auth_service
+from services.auth_service import auth_service
 from services.log_service import LOG_TYPE_CALL, log_service
+from services.image_concurrency import (
+    ImageConcurrencyGate,
+    ImageConcurrencyLease,
+    image_concurrency_gate,
+    image_owner_limit,
+)
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.time_utils import utc_now_iso, utc_timestamp_iso
 from utils.log import logger
@@ -24,6 +32,15 @@ TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+
+
+class ImageQueueLimitExceeded(ValueError):
+    """Raised when the bounded asynchronous image queue is full."""
+
+    def __init__(self, scope: str, limit: int):
+        self.scope = scope
+        self.limit = limit
+        super().__init__(f"{scope} image task queue limit of {limit} reached")
 
 
 def _now_iso() -> str:
@@ -125,6 +142,11 @@ class ImageTaskService:
         global_concurrency_getter: Callable[[], int] | None = None,
         per_owner_concurrency_getter: Callable[[], int] | None = None,
         queue_timeout_getter: Callable[[], float] | None = None,
+        queue_limit_getter: Callable[[], int] | None = None,
+        queue_owner_limit_getter: Callable[[], int] | None = None,
+        concurrency_gate: ImageConcurrencyGate | None = None,
+        reject_when_busy: bool = False,
+        queue_when_busy: bool = False,
     ):
         self.path = path
         self.generation_handler = generation_handler
@@ -135,6 +157,11 @@ class ImageTaskService:
         self.global_concurrency_getter = global_concurrency_getter or (lambda: config.image_global_concurrency)
         self.per_owner_concurrency_getter = per_owner_concurrency_getter or (lambda: config.image_user_concurrency)
         self.queue_timeout_getter = queue_timeout_getter or (lambda: config.image_queue_timeout_secs)
+        self.queue_limit_getter = queue_limit_getter or (lambda: config.image_async_queue_limit)
+        self.queue_owner_limit_getter = queue_owner_limit_getter or (lambda: config.image_async_queue_owner_limit)
+        self.concurrency_gate = concurrency_gate or ImageConcurrencyGate()
+        self.reject_when_busy = reject_when_busy
+        self.queue_when_busy = queue_when_busy
         self._lock = threading.RLock()
         self._dispatch_lock = threading.Lock()
         self._tasks: dict[str, dict[str, Any]] = {}
@@ -147,7 +174,10 @@ class ImageTaskService:
         self._ready_owners: deque[str] = deque()
         self._queue_timer: threading.Timer | None = None
         self._queue_timer_deadline: float | None = None
+        self._input_spool_dir = self.path.parent / "image_task_inputs"
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._input_spool_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_orphaned_input_spools()
         with self._lock:
             self._tasks = self._load_locked()
             changed = self._recover_unfinished_locked()
@@ -164,12 +194,13 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        n: int = 1,
         base_url: str = "",
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
             "model": model,
-            "n": 1,
+            "n": max(1, min(100, int(n))),
             "size": size,
             "quality": quality,
             "response_format": "url",
@@ -186,22 +217,134 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        n: int = 1,
         base_url: str = "",
-        images: list[tuple[bytes, str, str]] | None = None,
-        masks: list[tuple[bytes, str, str]] | None = None,
+        images: list[tuple[bytes | str, str, str]] | None = None,
+        masks: list[tuple[bytes | str, str, str]] | None = None,
     ) -> dict[str, Any]:
+        task_id = _clean(client_task_id)
+        if not task_id:
+            raise ValueError("client_task_id is required")
         payload = {
             "prompt": prompt,
             "images": images or [],
             "mask": masks or [],
             "model": model,
-            "n": 1,
+            "n": max(1, min(100, int(n))),
             "size": size,
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
         }
-        return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
+        spooled_payload = self._spool_edit_payload(payload)
+        try:
+            result = self._submit(identity, client_task_id=task_id, mode="edit", payload=spooled_payload)
+        except BaseException:
+            self._cleanup_payload_spool(spooled_payload)
+            raise
+        if not spooled_payload.get("_spool_enqueued"):
+            self._cleanup_payload_spool(spooled_payload)
+        return result
+
+    def _spool_edit_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        spool_path = self._input_spool_dir / uuid4().hex
+        spool_path.mkdir(parents=True, exist_ok=False)
+        references: dict[str, list[dict[str, str]]] = {"images": [], "mask": []}
+        try:
+            for field in ("images", "mask"):
+                for index, item in enumerate(payload.get(field) or []):
+                    data, filename, mime_type = item
+                    suffix = Path(str(filename or "")).suffix.lower()
+                    if not (1 < len(suffix) <= 10 and suffix[1:].isalnum()):
+                        suffix = ".bin"
+                    file_path = spool_path / f"{field}-{index}{suffix}"
+                    if isinstance(data, (str, Path)):
+                        shutil.copyfile(Path(data), file_path)
+                    else:
+                        file_path.write_bytes(bytes(data))
+                    references[field].append({
+                        "path": str(file_path),
+                        "filename": str(filename or "image.png"),
+                        "mime_type": str(mime_type or "image/png"),
+                    })
+        except BaseException:
+            shutil.rmtree(spool_path, ignore_errors=True)
+            raise
+        return {
+            **payload,
+            "images": [],
+            "mask": [],
+            "_input_spool_dir": str(spool_path),
+            "_spooled_inputs": references,
+        }
+
+    @staticmethod
+    def _materialize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        references = payload.get("_spooled_inputs")
+        if not isinstance(references, dict):
+            return payload
+        materialized = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"_input_spool_dir", "_spooled_inputs", "_spool_enqueued"}
+        }
+        for field in ("images", "mask"):
+            items: list[tuple[str, str, str]] = []
+            for reference in references.get(field) or []:
+                if not isinstance(reference, dict):
+                    continue
+                file_path = Path(str(reference.get("path") or ""))
+                items.append((
+                    str(file_path),
+                    str(reference.get("filename") or "image.png"),
+                    str(reference.get("mime_type") or "image/png"),
+                ))
+            materialized[field] = items
+        return materialized
+
+    @staticmethod
+    def _cleanup_payload_spool(payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        spool_dir = _clean(payload.get("_input_spool_dir"))
+        if spool_dir:
+            shutil.rmtree(spool_dir, ignore_errors=True)
+
+    @staticmethod
+    def _pending_payload(pending: object) -> dict[str, Any] | None:
+        if not isinstance(pending, tuple) or len(pending) < 2:
+            return None
+        args = pending[1]
+        if not isinstance(args, tuple) or len(args) < 3:
+            return None
+        payload = args[2]
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _pending_lease(pending: object) -> ImageConcurrencyLease | None:
+        if not isinstance(pending, tuple) or len(pending) < 2:
+            return None
+        args = pending[1]
+        if not isinstance(args, tuple):
+            return None
+        return next((item for item in args if isinstance(item, ImageConcurrencyLease)), None)
+
+    def _cleanup_orphaned_input_spools(self) -> None:
+        for path in self._input_spool_dir.iterdir():
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _release_process_memory() -> None:
+        gc.collect()
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         self._expire_queued_tasks()
@@ -242,8 +385,10 @@ class ImageTaskService:
         task_id = _clean(client_task_id)
         if not task_id:
             raise ValueError("client_task_id is required")
-        payload = {**payload, "client_task_id": task_id}
+        payload["client_task_id"] = task_id
         owner = _owner_id(identity)
+        payload["image_retention_seconds"] = auth_service.image_retention_seconds(identity)
+        payload["image_owner_id"] = owner
         key = _task_key(owner, task_id)
         quota_reservation_id = f"image-task:{key}"
         now = _now_iso()
@@ -255,22 +400,21 @@ class ImageTaskService:
             cleaned = self._cleanup_locked() or cleaned
             task = self._tasks.get(key)
             if task is not None:
+                self._cleanup_payload_spool(payload)
                 if cleaned:
                     self._save_locked()
                 return _public_task(task)
-            if identity.get("role") == "user":
-                try:
-                    active_limit = max(1, int(identity.get("image_request_limit") or 5))
-                except (TypeError, ValueError):
-                    active_limit = 5
-                active_count = sum(
-                    1
-                    for existing in self._tasks.values()
-                    if existing.get("owner_id") == owner and existing.get("status") in UNFINISHED_STATUSES
-                )
-                if active_count >= active_limit:
-                    raise ImageRequestLimitExceeded(active_limit)
-            quota_reserved = auth_service.reserve_daily_request(identity, quota_reservation_id)
+            if self.queue_when_busy:
+                self._ensure_queue_capacity_locked(identity)
+                lease = None
+            else:
+                lease = self._acquire_concurrency(identity)
+            try:
+                quota_reserved = auth_service.reserve_daily_request(identity, quota_reservation_id)
+            except BaseException:
+                if lease is not None:
+                    lease.release()
+                raise
             task = {
                 "id": task_id,
                 "owner_id": owner,
@@ -285,22 +429,27 @@ class ImageTaskService:
                 "created_ts": now_ts,
                 "queued_ts": now_ts,
                 "quota_reservation_id": quota_reservation_id if quota_reserved else "",
+                "image_retention_seconds": int(payload.get("image_retention_seconds") or 0),
+                "image_owner_id": owner,
             }
             self._tasks[key] = task
             try:
                 self._save_locked()
             except Exception:
                 self._tasks.pop(key, None)
+                if lease is not None:
+                    lease.release()
                 if quota_reserved:
                     auth_service.finish_daily_request(identity, quota_reservation_id, success=False)
                 raise
             self._enqueue_pending_locked(
                 key,
                 self._run_task,
-                (key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
+                (key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2"), lease),
                 dict(identity),
                 f"image-task-{task_id[:16]}",
             )
+            payload["_spool_enqueued"] = True
             should_start = True
 
         if should_start:
@@ -360,11 +509,65 @@ class ImageTaskService:
         except Exception:
             return 2
 
+    def _owner_concurrency(self, identity: dict[str, object]) -> int:
+        global_limit = self._global_concurrency()
+        if _clean(identity.get("role")).lower() == "admin":
+            return image_owner_limit(identity, global_limit)
+        if identity.get("image_concurrency_limit") is None:
+            return min(self._per_owner_concurrency(), global_limit)
+        return image_owner_limit(identity, global_limit)
+
+    def _acquire_concurrency(self, identity: dict[str, object]) -> ImageConcurrencyLease | None:
+        if not self.reject_when_busy:
+            return None
+        return self.concurrency_gate.try_acquire(
+            identity,
+            global_limit=self._global_concurrency(),
+            owner_limit=self._owner_concurrency(identity),
+        )
+
     def _queue_timeout(self) -> float:
         try:
             return max(0.01, float(self.queue_timeout_getter()))
         except Exception:
             return 600.0
+
+    def _queue_limit(self) -> int:
+        try:
+            return max(0, int(self.queue_limit_getter()))
+        except Exception:
+            return 100
+
+    def _queue_owner_limit(self) -> int:
+        try:
+            return max(0, int(self.queue_owner_limit_getter()))
+        except Exception:
+            return 50
+
+    def _ensure_queue_capacity_locked(self, identity: dict[str, object]) -> None:
+        owner = _owner_id(identity)
+        owner_queue = self._pending_by_owner.get(owner)
+        if len(self._pending) >= self._queue_limit():
+            raise ImageQueueLimitExceeded("global_queue", self._queue_limit())
+        if owner_queue is not None and len(owner_queue) >= self._queue_owner_limit():
+            raise ImageQueueLimitExceeded("owner_queue", self._queue_owner_limit())
+
+    def _restore_pending_locked(
+        self,
+        key: str,
+        pending: tuple[Callable[..., None], tuple[Any, ...], dict[str, object], str],
+    ) -> None:
+        """Put a task back at the head when a shared concurrency slot is busy."""
+        self._pending[key] = pending
+        owner = _owner_id(pending[2])
+        owner_queue = self._pending_by_owner.get(owner)
+        if owner_queue is None:
+            owner_queue = deque()
+            self._pending_by_owner[owner] = owner_queue
+        owner_queue.appendleft(key)
+        if owner not in self._ready_owners:
+            self._ready_owners.appendleft(owner)
+        self._schedule_queue_expiry_locked()
 
     def _take_next_pending_locked(
         self,
@@ -386,11 +589,7 @@ class ImageTaskService:
                     self._pending_by_owner.pop(owner, None)
                 continue
             identity = pending[2]
-            owner_limit = (
-                self._global_concurrency()
-                if _clean(identity.get("role")).lower() == "admin"
-                else per_owner_limit
-            )
+            owner_limit = self._owner_concurrency(identity)
             if self._running_count_locked(owner) >= owner_limit:
                 self._ready_owners.append(owner)
                 continue
@@ -404,6 +603,9 @@ class ImageTaskService:
                 continue
             task = self._tasks.get(key)
             if not task or task.get("status") != TASK_STATUS_QUEUED:
+                lease = self._pending_lease(pending)
+                if lease is not None:
+                    lease.release()
                 continue
             self._schedule_queue_expiry_locked()
             return key, pending
@@ -416,7 +618,10 @@ class ImageTaskService:
             while True:
                 with self._lock:
                     global_limit = self._global_concurrency()
-                    hard_thread_limit = max(global_limit + 2, global_limit * 2)
+                    # Timed-out network calls may take a moment to unwind. Keep two
+                    # bypass slots so later work can progress without allowing stale
+                    # threads to double the configured concurrency and memory usage.
+                    hard_thread_limit = global_limit + 2
                     if (
                         self._running_count_locked() >= global_limit
                         or self._physical_thread_count_locked() >= hard_thread_limit
@@ -426,14 +631,29 @@ class ImageTaskService:
                 if selected is None:
                     return
                 key, (target, args, identity, name) = selected
+                running_args = args
                 try:
+                    if self.queue_when_busy:
+                        lease = self._acquire_concurrency(identity)
+                        if lease is None:
+                            raise RuntimeError("image concurrency gate is not configured")
+                        running_args = (*args[:-1], lease)
                     self._start_tracked_thread(
                         key,
                         target,
-                        args=args,
+                        args=running_args,
                         name=name,
                     )
+                except ImageConcurrencyLimitExceeded:
+                    with self._lock:
+                        self._restore_pending_locked(key, (target, args, identity, name))
+                    return
                 except BaseException as exc:
+                    failed_pending = (target, running_args, identity, name)
+                    self._cleanup_payload_spool(self._pending_payload(failed_pending))
+                    lease = self._pending_lease(failed_pending)
+                    if lease is not None:
+                        lease.release()
                     self._settle_quota(key, identity, success=False)
                     self._update_task(
                         key,
@@ -521,6 +741,8 @@ class ImageTaskService:
                 if now - created_ts < timeout:
                     continue
                 identity = pending[2]
+                payload = self._pending_payload(pending)
+                lease = self._pending_lease(pending)
                 reservation_id = _clean(task.get("quota_reservation_id"))
                 task["status"] = TASK_STATUS_ERROR
                 task["error"] = f"图片任务排队超过 {timeout:g} 秒，已取消；请稍后重新提交"
@@ -531,6 +753,9 @@ class ImageTaskService:
                 task["updated_ts"] = now
                 task["quota_reservation_id"] = ""
                 self._remove_pending_locked(key)
+                self._cleanup_payload_spool(payload)
+                if lease is not None:
+                    lease.release()
                 if reservation_id:
                     releases.append((identity, reservation_id))
                 changed = True
@@ -555,10 +780,16 @@ class ImageTaskService:
             try:
                 target(*args)
             finally:
+                pending_payload = args[2] if len(args) >= 3 and isinstance(args[2], dict) else None
+                self._cleanup_payload_spool(pending_payload)
+                lease = next((item for item in args if isinstance(item, ImageConcurrencyLease)), None)
+                if lease is not None:
+                    lease.release()
                 current = threading.current_thread()
                 with self._lock:
                     if self._threads.get(key) is current:
                         self._threads.pop(key, None)
+                self._release_process_memory()
                 self._dispatch_available()
 
         thread = threading.Thread(target=run, name=name, daemon=True)
@@ -578,6 +809,7 @@ class ImageTaskService:
         payload: dict[str, Any],
         identity: dict[str, object],
         model: str,
+        _lease: ImageConcurrencyLease,
     ) -> None:
         started = time.time()
         max_duration = self._max_task_duration(identity)
@@ -623,7 +855,8 @@ class ImageTaskService:
         }
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
-            result = handler(payload_with_progress)
+            materialized_payload = self._materialize_payload(payload_with_progress)
+            result = handler(materialized_payload)
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
@@ -863,6 +1096,8 @@ class ImageTaskService:
                 "started_ts": item.get("started_ts"),
                 "duration_ms": item.get("duration_ms"),
                 "queue_duration_ms": item.get("queue_duration_ms"),
+                "image_retention_seconds": item.get("image_retention_seconds", 0),
+                "image_owner_id": _clean(item.get("image_owner_id")) or owner,
             }
             conversation_id = _clean(item.get("conversation_id"))
             if conversation_id:
@@ -1003,22 +1238,13 @@ class ImageTaskService:
                 raise ValueError("original image task is still shutting down")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
-            if identity.get("role") == "user":
-                try:
-                    active_limit = max(1, int(identity.get("image_request_limit") or 5))
-                except (TypeError, ValueError):
-                    active_limit = 5
-                active_count = sum(
-                    1
-                    for existing_key, existing in self._tasks.items()
-                    if existing_key != key
-                    and existing.get("owner_id") == owner
-                    and existing.get("status") in UNFINISHED_STATUSES
-                )
-                if active_count >= active_limit:
-                    raise ImageRequestLimitExceeded(active_limit)
-
-            quota_reserved = auth_service.reserve_daily_request(identity, reservation_id)
+            lease = self._acquire_concurrency(identity)
+            try:
+                quota_reserved = auth_service.reserve_daily_request(identity, reservation_id)
+            except BaseException:
+                if lease is not None:
+                    lease.release()
+                raise
             previous_task = dict(task)
             queued_ts = time.time()
             task["status"] = TASK_STATUS_QUEUED
@@ -1031,13 +1257,15 @@ class ImageTaskService:
                 self._save_locked()
             except Exception:
                 self._tasks[key] = previous_task
+                if lease is not None:
+                    lease.release()
                 if quota_reserved:
                     auth_service.finish_daily_request(identity, reservation_id, success=False)
                 raise
             self._enqueue_pending_locked(
                 key,
                 self._run_resume_poll,
-                (key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+                (key, conversation_id, extra_timeout_secs, dict(identity), mode, model, lease),
                 dict(identity),
                 f"image-resume-{_clean(task_id)[:16]}",
             )
@@ -1053,6 +1281,7 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        _lease: ImageConcurrencyLease,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
@@ -1079,6 +1308,8 @@ class ImageTaskService:
                 task = self._tasks.get(key)
                 account_email = _clean(task.get("account_email")) if task else ""
                 base_url = _clean(task.get("base_url")) if task else ""
+                retention_seconds = int(task.get("image_retention_seconds") or 0) if task else 0
+                owner_id = _clean(task.get("image_owner_id")) if task else _owner_id(identity)
             access_token = ""
             if account_email:
                 from services.account_service import account_service
@@ -1111,7 +1342,7 @@ class ImageTaskService:
                 raise RuntimeError("图片 URL 解析失败")
 
             image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
+                {"image_bytes": image_data}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
             data = format_image_result(
@@ -1120,6 +1351,8 @@ class ImageTaskService:
                 "url",
                 base_url,
                 int(time.time()),
+                retention_seconds=retention_seconds,
+                owner_id=owner_id,
             )["data"]
             if not self._update_task(
                 key,
@@ -1167,4 +1400,9 @@ class ImageTaskService:
                 backend.close()
 
 
-image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")
+image_task_service = ImageTaskService(
+    DATA_DIR / "image_tasks.json",
+    concurrency_gate=image_concurrency_gate,
+    reject_when_busy=True,
+    queue_when_busy=True,
+)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -76,6 +77,18 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertEqual(stored.storage, "local")
         self.assertTrue((self.images_dir / stored.rel).is_file())
         self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
+
+    def test_per_key_retention_records_expiry_and_cleans_without_reading_bytes(self):
+        service = self.service()
+        stored = service.save(png_bytes(), "http://app.test", retention_seconds=30, owner_id="key-1")
+
+        item = service._load_index()[stored.rel]
+        self.assertEqual(item["owner_id"], "key-1")
+        self.assertGreaterEqual(float(item["expires_at"]), time.time() + 50)
+
+        with mock.patch.object(service, "get_bytes", side_effect=AssertionError("cleanup must use the index")):
+            self.assertEqual(service.cleanup_expired(now=float(item["expires_at"])), 1)
+        self.assertFalse((self.images_dir / stored.rel).exists())
 
     def test_webdav_mode_uploads_without_local_file(self):
         self.settings.update({

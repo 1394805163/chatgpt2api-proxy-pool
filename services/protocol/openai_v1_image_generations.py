@@ -25,6 +25,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     task_timeout_secs = body.get("task_timeout_secs")
     client_task_id = str(body.get("client_task_id") or "")
     cancel_event = body.get("cancel_event")
+    retention_seconds = int(body.get("image_retention_seconds") or 0)
+    owner_id = str(body.get("image_owner_id") or "")
     outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
@@ -39,6 +41,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         task_timeout_secs=float(task_timeout_secs) if task_timeout_secs is not None else None,
         client_task_id=client_task_id,
         cancel_event=cancel_event,
+        image_retention_seconds=retention_seconds,
+        image_owner_id=owner_id,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

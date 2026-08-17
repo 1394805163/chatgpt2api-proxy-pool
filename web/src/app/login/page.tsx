@@ -39,6 +39,7 @@ export default function LoginPage() {
         dailyRequestRemaining: data.daily_request_remaining,
         dailyRequestDate: data.daily_request_date || "",
         imageRequestLimit: data.image_request_limit,
+        imageConcurrencyLimit: data.image_concurrency_limit,
       });
       router.replace(getDefaultRouteForRole(data.role));
     } catch (error) {

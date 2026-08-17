@@ -190,6 +190,11 @@ export type SettingsConfig = {
   image_remove_conversation_after_result?: boolean;
   image_settle_secs?: number | string;
   image_timeout_retry_secs?: number | string;
+  image_global_concurrency?: number | string;
+  image_user_concurrency?: number | string;
+  image_queue_timeout_secs?: number | string;
+  image_async_queue_limit?: number | string;
+  image_async_queue_owner_limit?: number | string;
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
   auto_relogin_after_refresh?: boolean;
@@ -332,6 +337,8 @@ export type LoginResponse = {
   daily_request_remaining: number | null;
   daily_request_date: string | null;
   image_request_limit: number;
+  image_concurrency_limit: number;
+  image_retention_minutes: number;
 };
 
 export type UserKey = {
@@ -346,6 +353,8 @@ export type UserKey = {
   daily_request_remaining: number | null;
   daily_request_date: string | null;
   image_request_limit: number;
+  image_concurrency_limit: number;
+  image_retention_minutes: number;
 };
 
 export type OutlookPoolStats = {
@@ -718,7 +727,13 @@ export async function fetchUserKeys() {
   return httpRequest<{ items: UserKey[] }>("/api/auth/users");
 }
 
-export async function createUserKey(input: { name: string; daily_request_limit: number; image_request_limit: number }) {
+export async function createUserKey(input: {
+  name: string;
+  daily_request_limit: number;
+  image_request_limit: number;
+  image_concurrency_limit: number;
+  image_retention_minutes: number;
+}) {
   return httpRequest<{ item: UserKey; key: string; items: UserKey[] }>("/api/auth/users", {
     method: "POST",
     body: input,
@@ -731,6 +746,8 @@ export async function updateUserKey(keyId: string, updates: {
   key?: string;
   daily_request_limit?: number;
   image_request_limit?: number;
+  image_concurrency_limit?: number;
+  image_retention_minutes?: number;
   reset_daily_usage?: boolean;
 }) {
   return httpRequest<{ item: UserKey; items: UserKey[] }>(`/api/auth/users/${keyId}`, {

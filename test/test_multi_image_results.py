@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import base64
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from services.account_service import account_service
 from services.config import config
 from services.openai_backend_api import ImagePollTimeoutError, ImageTaskDeadlineError, OpenAIBackendAPI
 from services.protocol.conversation import (
+    encode_images,
     ConversationRequest,
     ImageGenerationError,
     ImageOutput,
@@ -83,6 +86,19 @@ class FakeStreamingResponse:
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_encode_images_preserves_spooled_file_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            image_path = Path(tmp_dir) / "reference.png"
+            image_path.write_bytes(b"png-data")
+
+            encoded = encode_images([
+                (str(image_path), "reference.png", "image/png"),
+                (b"inline-data", "inline.png", "image/png"),
+            ])
+
+            self.assertEqual(encoded[0], str(image_path))
+            self.assertEqual(encoded[1], base64.b64encode(b"inline-data").decode("ascii"))
+
     def test_deadline_error_uses_request_timeout_label(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
         backend.image_task_timeout_secs = 180.0

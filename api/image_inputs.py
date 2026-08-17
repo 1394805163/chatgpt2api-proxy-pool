@@ -5,7 +5,9 @@ import binascii
 import json
 import mimetypes
 import re
-from pathlib import PurePosixPath
+import shutil
+import tempfile
+from pathlib import Path, PurePosixPath
 from typing import Any, TypeGuard
 from urllib.parse import unquote, unquote_to_bytes, urlparse
 
@@ -15,11 +17,14 @@ from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from services.proxy_service import proxy_settings
+from services.config import DATA_DIR
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_SOURCES = 8
+MAX_IMAGE_INPUT_BYTES = 100 * 1024 * 1024
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 
@@ -229,6 +234,21 @@ def _safe_filename(name: str, mime_type: str, fallback: str) -> str:
     return cleaned
 
 
+def _spool_path(spool_dir: Path, index: int, filename: str = "", mime_type: str = "") -> Path:
+    suffix = Path(_safe_filename(filename, mime_type or "image/png", "input")).suffix.lower()
+    if not (1 < len(suffix) <= 10 and suffix[1:].isalnum()):
+        suffix = f".{_extension_from_mime(mime_type)}" if mime_type else ".bin"
+    return spool_dir / f"input-{index}{suffix}"
+
+
+def _output_path_with_image_suffix(output_path: Path, filename: str, mime_type: str) -> Path:
+    safe_name = _safe_filename(filename, mime_type or "image/png", "input")
+    suffix = Path(safe_name).suffix.lower()
+    if not (1 < len(suffix) <= 10 and suffix[1:].isalnum()):
+        suffix = f".{_extension_from_mime(mime_type)}" if mime_type else ".bin"
+    return output_path.with_suffix(suffix)
+
+
 def _decode_data_url(url: str) -> ImageInput:
     """解码 data URL：把内联图片转成标准图片输入元组。"""
     header, separator, payload = url.partition(",")
@@ -269,11 +289,16 @@ def _filename_from_url(parsed_path: str, mime_type: str) -> str:
     return _safe_filename(raw_name, mime_type, "image_url")
 
 
-def _download_image_url(url: str) -> ImageInput:
+def _download_image_url(url: str, output_path: Path | None = None) -> ImageInput | tuple[str, str, str]:
     """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
     source = _clean(url)
     if source.startswith("data:"):
-        return _decode_data_url(source)
+        data, filename, mime_type = _decode_data_url(source)
+        if output_path is None:
+            return data, filename, mime_type
+        output_path = _output_path_with_image_suffix(output_path, filename, mime_type)
+        output_path.write_bytes(data)
+        return str(output_path), filename, mime_type
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
@@ -283,41 +308,154 @@ def _download_image_url(url: str) -> ImageInput:
             headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
             timeout=60,
             allow_redirects=True,
+            stream=True,
             **proxy_settings.build_session_kwargs(),
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = _clean(response.headers.get("content-length"))
-    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    data = response.content
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    mime_type = _response_mime_type(response, parsed.path)
-    return data, _filename_from_url(parsed.path, mime_type), mime_type
+    try:
+        if not 200 <= response.status_code < 300:
+            raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
+        content_length = _clean(response.headers.get("content-length"))
+        if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
+        mime_type = _response_mime_type(response, parsed.path)
+        filename = _filename_from_url(parsed.path, mime_type)
+        if output_path is not None:
+            output_path = _output_path_with_image_suffix(output_path, filename, mime_type)
+        written = 0
+        if output_path is None:
+            data = bytearray()
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > MAX_IMAGE_REFERENCE_BYTES:
+                    raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
+                data.extend(chunk)
+            if written <= 0:
+                raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+            return bytes(data), filename, mime_type
+        with output_path.open("wb") as target:
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > MAX_IMAGE_REFERENCE_BYTES:
+                    raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
+                target.write(chunk)
+        if written <= 0:
+            raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+        return str(output_path), filename, mime_type
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
 
 
-async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
+def _copy_upload_to_path(source: UploadFile, output_path: Path) -> None:
+    source.file.seek(0)
+    written = 0
+    with output_path.open("wb") as target:
+        while chunk := source.file.read(256 * 1024):
+            written += len(chunk)
+            if written > MAX_IMAGE_REFERENCE_BYTES:
+                raise HTTPException(status_code=400, detail={"error": "image file exceeds 50MB limit"})
+            target.write(chunk)
+    if written <= 0:
+        raise HTTPException(status_code=400, detail={"error": "image file is empty"})
+
+
+async def read_image_sources(
+    sources: list[ImageSource],
+    *,
+    spool_to_disk: bool = False,
+) -> list[ImageInput | tuple[str, str, str]]:
     """读取图片来源：上传文件直接读取，URL 下载后统一返回图片元组。"""
-    images: list[ImageInput] = []
-    for source in sources:
-        if isinstance(source, tuple):
-            images.append(source)
-            continue
-        if _is_upload(source):
-            try:
-                image_data = await source.read()
-            finally:
-                await source.close()
-            if not image_data:
-                raise HTTPException(status_code=400, detail={"error": "image file is empty"})
-            images.append((image_data, source.filename or "image.png", source.content_type or "image/png"))
-            continue
-        images.append(await run_in_threadpool(_download_image_url, source))
+    images: list[ImageInput | tuple[str, str, str]] = []
+    total_bytes = 0
+    if len(sources) > MAX_IMAGE_SOURCES:
+        raise HTTPException(status_code=400, detail={"error": f"at most {MAX_IMAGE_SOURCES} reference images are allowed"})
+    spool_dir: Path | None = None
+    if spool_to_disk:
+        ingest_root = DATA_DIR / "image_ingest"
+        ingest_root.mkdir(parents=True, exist_ok=True)
+        spool_dir = Path(tempfile.mkdtemp(prefix="request-", dir=ingest_root))
+
+    def add_image(item: ImageInput | tuple[str, str, str]) -> None:
+        nonlocal total_bytes
+        stored = item[0]
+        try:
+            total_bytes += Path(stored).stat().st_size if isinstance(stored, str) else len(stored)
+        except OSError:
+            pass
+        if total_bytes > MAX_IMAGE_INPUT_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "combined image inputs exceed 100MB limit"})
+        images.append(item)
+
+    try:
+        for index, source in enumerate(sources):
+            output_path = spool_dir / f"input-{index}.bin" if spool_dir else None
+            if isinstance(source, tuple):
+                if output_path is None:
+                    add_image(source)
+                else:
+                    output_path = _spool_path(spool_dir, index, source[1], source[2])
+                    output_path.write_bytes(source[0])
+                    add_image((str(output_path), source[1], source[2]))
+                continue
+            if _is_upload(source):
+                try:
+                    if output_path is None:
+                        image_data = await source.read()
+                        if not image_data:
+                            raise HTTPException(status_code=400, detail={"error": "image file is empty"})
+                        add_image((image_data, source.filename or "image.png", source.content_type or "image/png"))
+                    else:
+                        output_path = _spool_path(
+                            spool_dir,
+                            index,
+                            source.filename or "image.png",
+                            source.content_type or "image/png",
+                        )
+                        await run_in_threadpool(_copy_upload_to_path, source, output_path)
+                        add_image((str(output_path), source.filename or "image.png", source.content_type or "image/png"))
+                finally:
+                    await source.close()
+                continue
+            add_image(await run_in_threadpool(_download_image_url, source, output_path))
+    except BaseException:
+        if spool_dir is not None:
+            shutil.rmtree(spool_dir, ignore_errors=True)
+        raise
     if not images:
+        if spool_dir is not None:
+            shutil.rmtree(spool_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
     return images
+
+
+def cleanup_spooled_image_sources(images: object) -> None:
+    parents: set[Path] = set()
+    if isinstance(images, list):
+        for item in images:
+            if not isinstance(item, tuple) or not item or not isinstance(item[0], str):
+                continue
+            path = Path(item[0])
+            if path.parent.name.startswith("request-") and path.parent.parent.name == "image_ingest":
+                parents.add(path.parent)
+    for parent in parents:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def cleanup_orphaned_image_ingest() -> None:
+    ingest_root = DATA_DIR / "image_ingest"
+    if not ingest_root.exists():
+        return
+    for path in ingest_root.iterdir():
+        if path.name.startswith("request-"):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)

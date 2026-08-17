@@ -28,6 +28,11 @@ export function ConfigCard() {
   const setImageTaskTimeoutSecs = useSettingsStore((state) => state.setImageTaskTimeoutSecs);
   const setUserImageTaskTimeoutSecs = useSettingsStore((state) => state.setUserImageTaskTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
+  const setImageGlobalConcurrency = useSettingsStore((state) => state.setImageGlobalConcurrency);
+  const setImageUserConcurrency = useSettingsStore((state) => state.setImageUserConcurrency);
+  const setImageQueueTimeoutSecs = useSettingsStore((state) => state.setImageQueueTimeoutSecs);
+  const setImageAsyncQueueLimit = useSettingsStore((state) => state.setImageAsyncQueueLimit);
+  const setImageAsyncQueueOwnerLimit = useSettingsStore((state) => state.setImageAsyncQueueOwnerLimit);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageRemoveConversationAfterResult = useSettingsStore((state) => state.setImageRemoveConversationAfterResult);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
@@ -214,6 +219,31 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">总图片容量</label>
+            <Input type="number" min="1" max="100" value={String(config?.image_global_concurrency || "")} onChange={(event) => setImageGlobalConcurrency(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" />
+            <p className="text-xs text-stone-500">按图片数量计量：n=5 占用 5 个容量；保存后对新请求热更新，满载立即返回 429。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">默认普通 Key 并发</label>
+            <Input type="number" min="1" max="100" value={String(config?.image_user_concurrency || "")} onChange={(event) => setImageUserConcurrency(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" />
+            <p className="text-xs text-stone-500">仅影响未单独设置并发上限的普通 Key。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">异步任务最大排队数</label>
+            <Input type="number" min="0" max="1000" value={String(config?.image_async_queue_limit || "")} onChange={(event) => setImageAsyncQueueLimit(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" />
+            <p className="text-xs text-stone-500">超过后异步接口返回 429，不无限堆积。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">单 Key 最大排队数</label>
+            <Input type="number" min="0" max="1000" value={String(config?.image_async_queue_owner_limit || "")} onChange={(event) => setImageAsyncQueueOwnerLimit(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" />
+            <p className="text-xs text-stone-500">避免一个下游 Key 占满全部异步队列。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">异步任务最长等待（秒）</label>
+            <Input type="number" min="30" value={String(config?.image_queue_timeout_secs || "")} onChange={(event) => setImageQueueTimeoutSecs(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" />
+            <p className="text-xs text-stone-500">超过此时间任务自动取消并释放资源。</p>
           </div>
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">

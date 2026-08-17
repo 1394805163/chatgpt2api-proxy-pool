@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import ImageRequestLimitExceeded, auth_service
 from services.config import config
+from services.image_concurrency import ImageConcurrencyLimitExceeded, image_concurrency_gate
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -54,6 +55,21 @@ def enforce_image_request_limit(identity: dict[str, object], count: int) -> None
         raise HTTPException(
             status_code=400,
             detail={"error": "image request limit exceeded", "limit": exc.limit},
+        ) from exc
+
+
+def acquire_image_concurrency(identity: dict[str, object], units: int = 1):
+    try:
+        return image_concurrency_gate.try_acquire(identity, units=units)
+    except ImageConcurrencyLimitExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "image concurrency limit reached",
+                "scope": exc.scope,
+                "limit": exc.limit,
+                "retryable": True,
+            },
         ) from exc
 
 

@@ -75,6 +75,10 @@ def create_router(app_version: str) -> APIRouter:
             "daily_request_remaining": identity.get("daily_request_remaining"),
             "daily_request_date": identity.get("daily_request_date"),
             "image_request_limit": identity.get("image_request_limit", 100),
+            "image_concurrency_limit": identity.get(
+                "image_concurrency_limit",
+                10 if identity.get("role") == "admin" else 2,
+            ),
         }
 
     @router.get("/version")

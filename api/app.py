@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 
 from api import accounts, ai, image_tasks, system
 from api.errors import install_exception_handlers
+from api.image_inputs import cleanup_orphaned_image_ingest
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
@@ -25,6 +26,7 @@ def create_app() -> FastAPI:
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         backup_service.start()
         config.cleanup_old_images()
+        cleanup_orphaned_image_ingest()
         try:
             yield
         finally:

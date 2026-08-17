@@ -191,6 +191,11 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_task_timeout_secs: Number(config.image_task_timeout_secs || 150),
     user_image_task_timeout_secs: Number(config.user_image_task_timeout_secs || 180),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
+    image_global_concurrency: Math.max(1, Number(config.image_global_concurrency) || 30),
+    image_user_concurrency: Math.max(1, Number(config.image_user_concurrency) || 10),
+    image_queue_timeout_secs: Math.max(30, Number(config.image_queue_timeout_secs) || 2400),
+    image_async_queue_limit: Math.max(0, Number(config.image_async_queue_limit) || 200),
+    image_async_queue_owner_limit: Math.max(0, Number(config.image_async_queue_owner_limit) || 150),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
     image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
     image_remove_conversation_after_result: Boolean(config.image_remove_conversation_after_result),
@@ -315,6 +320,11 @@ type SettingsStore = {
   setImageTaskTimeoutSecs: (value: string) => void;
   setUserImageTaskTimeoutSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
+  setImageGlobalConcurrency: (value: string) => void;
+  setImageUserConcurrency: (value: string) => void;
+  setImageQueueTimeoutSecs: (value: string) => void;
+  setImageAsyncQueueLimit: (value: string) => void;
+  setImageAsyncQueueOwnerLimit: (value: string) => void;
   setImageSettleEnabled: (value: boolean) => void;
   setImageCheckBeforeHitEnabled: (value: boolean) => void;
   setImageRemoveConversationAfterResult: (value: boolean) => void;
@@ -448,6 +458,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         image_task_timeout_secs: imageTaskTimeoutSecs,
         user_image_task_timeout_secs: userImageTaskTimeoutSecs,
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
+        image_global_concurrency: Math.min(100, Math.max(1, Number(config.image_global_concurrency) || 30)),
+        image_user_concurrency: Math.min(100, Math.max(1, Number(config.image_user_concurrency) || 10)),
+        image_queue_timeout_secs: Math.max(30, Number(config.image_queue_timeout_secs) || 2400),
+        image_async_queue_limit: Math.min(1000, Math.max(0, Number(config.image_async_queue_limit) || 200)),
+        image_async_queue_owner_limit: Math.min(1000, Math.max(0, Number(config.image_async_queue_owner_limit) || 150)),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
         image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
         image_remove_conversation_after_result: Boolean(config.image_remove_conversation_after_result),
@@ -565,6 +580,26 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageAccountConcurrency: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_account_concurrency: value } } : {});
+  },
+
+  setImageGlobalConcurrency: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_global_concurrency: value } } : {});
+  },
+
+  setImageUserConcurrency: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_user_concurrency: value } } : {});
+  },
+
+  setImageQueueTimeoutSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_queue_timeout_secs: value } } : {});
+  },
+
+  setImageAsyncQueueLimit: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_async_queue_limit: value } } : {});
+  },
+
+  setImageAsyncQueueOwnerLimit: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_async_queue_owner_limit: value } } : {});
   },
 
   setImageSettleEnabled: (value) => {

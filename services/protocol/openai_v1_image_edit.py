@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Iterator
 
 from PIL import Image
@@ -18,9 +19,9 @@ from utils.image_tokens import count_image_inputs_tokens, count_image_output_ite
 
 
 def _composite_mask(
-    images: list[tuple[bytes, str, str]],
-    masks: list[tuple[bytes, str, str]],
-) -> list[tuple[bytes, str, str]]:
+    images: list[tuple[bytes | str, str, str]],
+    masks: list[tuple[bytes | str, str, str]],
+) -> list[tuple[bytes | str, str, str]]:
     """将 mask 的 alpha 通道合成到图片中，标识需要编辑的区域。
     
     mask 的透明区域（低 alpha）= 需要编辑的区域，
@@ -29,9 +30,13 @@ def _composite_mask(
     """
     if not masks:
         return images
-    result: list[tuple[bytes, str, str]] = []
+    result: list[tuple[bytes | str, str, str]] = []
     for i, (data, filename, mime_type) in enumerate(images):
         mask_data = masks[i][0] if i < len(masks) else masks[-1][0]
+        if isinstance(data, str):
+            data = Path(data).read_bytes()
+        if isinstance(mask_data, str):
+            mask_data = Path(mask_data).read_bytes()
         img = Image.open(BytesIO(data)).convert("RGBA")
         mask_img = Image.open(BytesIO(mask_data))
         if mask_img.mode == "RGBA":
@@ -64,6 +69,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     task_timeout_secs = body.get("task_timeout_secs")
     client_task_id = str(body.get("client_task_id") or "")
     cancel_event = body.get("cancel_event")
+    retention_seconds = int(body.get("image_retention_seconds") or 0)
+    owner_id = str(body.get("image_owner_id") or "")
     encoded_images = encode_images(images)
     if not encoded_images:
         raise ImageGenerationError("image is required")
@@ -82,6 +89,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         task_timeout_secs=float(task_timeout_secs) if task_timeout_secs is not None else None,
         client_task_id=client_task_id,
         cancel_event=cancel_event,
+        image_retention_seconds=retention_seconds,
+        image_owner_id=owner_id,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)
