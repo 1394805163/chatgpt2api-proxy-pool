@@ -7,8 +7,9 @@ from unittest import mock
 
 from PIL import Image
 
-from services.image_storage_service import ImageStorageService
-from services.image_service import IMAGE_CACHE_CONTROL, delete_to_target, get_image_response
+from services.image_storage_service import ImageStorageService, StoredImage
+from services.image_service import delete_to_target, get_image_response
+from services.protocol.conversation import format_image_result
 
 
 def png_bytes() -> bytes:
@@ -61,6 +62,8 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.mock_config = self.config_patcher.start()
         self.addCleanup(self.config_patcher.stop)
         self.mock_config.images_dir = self.images_dir
+        self.mock_config.image_thumbnails_dir = self.data_dir / "image_thumbnails"
+        self.mock_config.image_retention_days = 30
         self.mock_config.base_url = "http://app.test"
         self.mock_config.cleanup_old_images.return_value = 0
         self.mock_config.get_image_storage_settings.side_effect = lambda: dict(self.settings)
@@ -76,6 +79,81 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertEqual(stored.storage, "local")
         self.assertTrue((self.images_dir / stored.rel).is_file())
         self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
+
+    def test_expired_key_image_removes_file_and_index(self):
+        service = self.service()
+        stored = service.save(
+            png_bytes(),
+            "http://app.test",
+            retention_seconds=60,
+            owner_id="user-key-1",
+        )
+        index = service._load_index()
+        expires_at = int(index[stored.rel]["expires_at"])
+
+        self.assertEqual(index[stored.rel]["owner_id"], "user-key-1")
+        self.assertEqual(service.cleanup_expired(now=expires_at - 1), 0)
+        self.assertTrue((self.images_dir / stored.rel).is_file())
+        self.assertEqual(service.cleanup_expired(now=expires_at), 1)
+        self.assertFalse((self.images_dir / stored.rel).exists())
+        self.assertNotIn(stored.rel, service._load_index())
+
+    def test_expired_key_image_removes_thumbnail(self):
+        service = self.service()
+        stored = service.save(png_bytes(), "http://app.test", retention_seconds=60)
+        thumbnail = self.mock_config.image_thumbnails_dir / f"{stored.rel}.png"
+        thumbnail.parent.mkdir(parents=True, exist_ok=True)
+        thumbnail.write_bytes(png_bytes())
+        expires_at = int(service._load_index()[stored.rel]["expires_at"])
+
+        self.assertEqual(service.cleanup_expired(now=expires_at), 1)
+        self.assertFalse(thumbnail.exists())
+
+    def test_legacy_webdav_only_image_uses_created_at_for_global_expiry(self):
+        service = self.service()
+        rel = "2020/01/01/legacy.png"
+        service._save_index({
+            rel: {
+                "rel": rel,
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "storage": "webdav",
+                "local": False,
+                "webdav": True,
+            }
+        })
+        FakeWebDAVClient.uploaded[rel] = png_bytes()
+
+        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+            self.assertTrue(service.is_expired(rel))
+            self.assertEqual(service.cleanup_expired(), 1)
+
+        self.assertNotIn(rel, FakeWebDAVClient.uploaded)
+        self.assertNotIn(rel, service._load_index())
+
+    def test_cache_age_does_not_outlive_image_expiry(self):
+        service = self.service()
+        stored = service.save(png_bytes(), "http://app.test", retention_seconds=60)
+        expires_at = int(service._load_index()[stored.rel]["expires_at"])
+
+        self.assertEqual(service.cache_max_age(stored.rel, now=expires_at - 15), 15)
+        self.assertEqual(service.cache_max_age(stored.rel, now=expires_at), 0)
+
+    def test_image_result_passes_owner_and_retention_to_storage(self):
+        stored = StoredImage("image.png", "http://app.test/images/image.png", "local", 10)
+        with mock.patch("services.protocol.conversation.image_storage_service.save", return_value=stored) as save:
+            result = format_image_result(
+                [{"image_bytes": png_bytes()}],
+                "prompt",
+                "url",
+                "http://app.test",
+                retention_seconds=120,
+                owner_id="key-1",
+            )
+
+        save.assert_called_once()
+        self.assertEqual(save.call_args.kwargs["retention_seconds"], 120)
+        self.assertEqual(save.call_args.kwargs["owner_id"], "key-1")
+        self.assertEqual(result["data"][0]["url"], stored.url)
 
     def test_webdav_mode_uploads_without_local_file(self):
         self.settings.update({
@@ -135,16 +213,18 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn(".chatgpt2api_webdav_test.txt", FakeWebDAVClient.deleted)
 
-    def test_image_response_is_browser_cacheable_for_two_hours(self):
+    def test_image_response_cache_ttl_uses_remaining_image_lifetime(self):
         image_path = self.images_dir / "cached.png"
         image_path.parent.mkdir(parents=True, exist_ok=True)
         image_path.write_bytes(png_bytes())
         with mock.patch("services.image_service.image_storage_service.has_local", return_value=True), mock.patch(
+            "services.image_service.image_storage_service.is_expired", return_value=False
+        ), mock.patch("services.image_service.image_storage_service.cache_max_age", return_value=60), mock.patch(
             "services.image_service._safe_image_path", return_value=image_path
         ):
             response = get_image_response("cached.png")
 
-        self.assertEqual(response.headers["cache-control"], IMAGE_CACHE_CONTROL)
+        self.assertEqual(response.headers["cache-control"], "public, max-age=60, immutable")
 
     def test_low_disk_cleanup_keeps_images_younger_than_two_hours(self):
         image_path = self.images_dir / "recent.png"

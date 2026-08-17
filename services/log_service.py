@@ -482,6 +482,15 @@ class LoggedCall:
             units=max(1, int(self.quota_units or 1)),
         )
 
+    def _decorate_image_payload(self, args: tuple[object, ...]) -> None:
+        if not self.quota_is_image or not args or not isinstance(args[0], dict):
+            return
+        from services.auth_service import auth_service
+
+        payload = args[0]
+        payload["_image_retention_seconds"] = auth_service.image_retention_seconds(self.identity)
+        payload["_image_owner_id"] = str(self.identity.get("id") or "")
+
     def _finish_quota(self, success: bool, units: int | None = None) -> None:
         if not self._quota_reserved:
             return
@@ -493,6 +502,7 @@ class LoggedCall:
                 self.quota_reservation_id,
                 success=success,
                 units=units,
+                is_image=self.quota_is_image,
             )
         except Exception as exc:
             logger.error(f"Failed to update daily request usage: {exc}")
@@ -514,6 +524,7 @@ class LoggedCall:
 
         try:
             self._reserve_quota()
+            self._decorate_image_payload(args)
         except DailyRequestQuotaExceeded as exc:
             self.log("调用失败", status="failed", error=str(exc))
             raise HTTPException(status_code=429, detail={"error": "daily request quota exhausted"}) from exc

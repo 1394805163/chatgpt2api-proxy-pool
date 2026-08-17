@@ -79,6 +79,8 @@ def create_router(app_version: str) -> APIRouter:
                 "image_concurrency_limit",
                 10 if identity.get("role") == "admin" else 2,
             ),
+            "image_retention_minutes": identity.get("image_retention_minutes", 0),
+            "image_total_generated": identity.get("image_total_generated", 0),
         }
 
     @router.get("/version")

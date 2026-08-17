@@ -94,6 +94,7 @@ class ImageTaskQuotaTests(unittest.TestCase):
             item = auth.list_keys(role="user")[0]
             self.assertEqual(item["daily_request_used"], 1)
             self.assertEqual(item["daily_request_remaining"], 2)
+            self.assertEqual(item["image_total_generated"], 1)
 
     def test_user_tasks_use_configured_limit_and_admin_uses_global_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

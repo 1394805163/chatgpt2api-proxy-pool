@@ -13,7 +13,7 @@ from api.image_inputs import cleanup_orphaned_image_ingest
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
-from services.image_service import start_image_cleanup_scheduler
+from services.image_service import cleanup_expired_images, start_image_cleanup_scheduler
 
 
 def create_app() -> FastAPI:
@@ -25,7 +25,7 @@ def create_app() -> FastAPI:
         thread = start_limited_account_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         backup_service.start()
-        config.cleanup_old_images()
+        cleanup_expired_images()
         cleanup_orphaned_image_ingest()
         try:
             yield

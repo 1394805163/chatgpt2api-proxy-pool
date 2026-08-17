@@ -385,6 +385,17 @@ class ImageTaskService:
             raise ValueError("client_task_id is required")
         payload["client_task_id"] = task_id
         owner = _owner_id(identity)
+        try:
+            retention_seconds = int(auth_service.image_retention_seconds(identity))
+            if retention_seconds <= 0:
+                raise ValueError("image retention must be positive")
+        except (AttributeError, TypeError, ValueError):
+            try:
+                retention_seconds = max(1, int(self.retention_days_getter())) * 86400
+            except (TypeError, ValueError):
+                retention_seconds = 30 * 86400
+        payload.setdefault("_image_retention_seconds", retention_seconds)
+        payload.setdefault("_image_owner_id", owner)
         key = _task_key(owner, task_id)
         quota_reservation_id = f"image-task:{key}"
         now = _now_iso()
@@ -426,6 +437,7 @@ class ImageTaskService:
                 "quality": _clean(payload.get("quality"), "auto"),
                 "quota_units": quota_units,
                 "base_url": _clean(payload.get("base_url")),
+                "image_retention_seconds": payload.get("_image_retention_seconds"),
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": now_ts,
@@ -946,7 +958,13 @@ class ImageTaskService:
             if not reservation_id:
                 return
         try:
-            auth_service.finish_daily_request(identity, reservation_id, success=success, units=units)
+            auth_service.finish_daily_request(
+                identity,
+                reservation_id,
+                success=success,
+                units=units,
+                is_image=True,
+            )
         except Exception as exc:
             logger.error(f"Failed to settle image task daily usage: {exc}")
             return
@@ -1318,6 +1336,8 @@ class ImageTaskService:
                 task = self._tasks.get(key)
                 account_email = _clean(task.get("account_email")) if task else ""
                 base_url = _clean(task.get("base_url")) if task else ""
+                retention_seconds = task.get("image_retention_seconds") if task else None
+                owner_id = _clean(task.get("owner_id")) if task else _owner_id(identity)
             access_token = ""
             if account_email:
                 from services.account_service import account_service
@@ -1359,6 +1379,8 @@ class ImageTaskService:
                 "url",
                 base_url,
                 int(time.time()),
+                retention_seconds=int(retention_seconds) if retention_seconds else None,
+                owner_id=owner_id,
             )["data"]
             if not self._update_task(
                 key,

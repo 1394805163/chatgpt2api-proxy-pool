@@ -103,6 +103,38 @@ class AuthQuotaPersistenceTests(unittest.TestCase):
             finally:
                 storage.engine.dispose()
 
+    def test_image_retention_uses_user_override_and_admin_global_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch("services.auth_service.config") as config:
+            config.image_retention_days = 10
+            config.display_timezone = "Asia/Shanghai"
+            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            _, user_key = service.create_key(
+                role="user",
+                name="one-hour-user",
+                image_retention_minutes=60,
+            )
+            _, global_user_key = service.create_key(
+                role="user",
+                name="global-user",
+                image_retention_minutes=0,
+            )
+            _, admin_key = service.create_key(
+                role="admin",
+                name="admin",
+                image_retention_minutes=60,
+            )
+
+            user = service.authenticate(user_key)
+            global_user = service.authenticate(global_user_key)
+            admin = service.authenticate(admin_key)
+
+            self.assertIsNotNone(user)
+            self.assertIsNotNone(global_user)
+            self.assertIsNotNone(admin)
+            self.assertEqual(service.image_retention_seconds(user), 60 * 60)
+            self.assertEqual(service.image_retention_seconds(global_user), 10 * 86400)
+            self.assertEqual(service.image_retention_seconds(admin), 10 * 86400)
+
 
 class LoggedCallQuotaTests(unittest.TestCase):
     def test_non_stream_success_counts_and_failure_does_not(self) -> None:
@@ -140,7 +172,9 @@ class LoggedCallQuotaTests(unittest.TestCase):
                         call.run(lambda: {"data": [{"url": "one"}, {"url": "two"}, {"url": "three"}]})
                     )
             self.assertEqual(len(result["data"]), 3)
-            self.assertEqual(service.list_keys(role="user")[0]["daily_request_used"], 3)
+            item = service.list_keys(role="user")[0]
+            self.assertEqual(item["daily_request_used"], 3)
+            self.assertEqual(item["image_total_generated"], 3)
 
     def test_stream_counts_only_after_full_exhaustion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

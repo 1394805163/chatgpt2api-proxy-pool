@@ -338,6 +338,8 @@ export type LoginResponse = {
   daily_request_date: string | null;
   image_request_limit: number;
   image_concurrency_limit: number;
+  image_retention_minutes: number;
+  image_total_generated: number;
 };
 
 export type UserKey = {
@@ -353,6 +355,8 @@ export type UserKey = {
   daily_request_date: string | null;
   image_request_limit: number;
   image_concurrency_limit: number;
+  image_retention_minutes: number;
+  image_total_generated: number;
 };
 
 export type OutlookPoolStats = {
@@ -730,6 +734,7 @@ export async function createUserKey(input: {
   daily_request_limit: number;
   image_request_limit: number;
   image_concurrency_limit: number;
+  image_retention_minutes: number;
 }) {
   return httpRequest<{ item: UserKey; key: string; items: UserKey[] }>("/api/auth/users", {
     method: "POST",
@@ -744,6 +749,7 @@ export async function updateUserKey(keyId: string, updates: {
   daily_request_limit?: number;
   image_request_limit?: number;
   image_concurrency_limit?: number;
+  image_retention_minutes?: number;
   reset_daily_usage?: boolean;
 }) {
   return httpRequest<{ item: UserKey; items: UserKey[] }>(`/api/auth/users/${keyId}`, {

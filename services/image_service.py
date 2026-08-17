@@ -52,12 +52,25 @@ def _safe_image_path(relative_path: str) -> Path:
     return path
 
 
+def _image_cache_control(relative_path: str) -> str:
+    max_age = image_storage_service.cache_max_age(relative_path)
+    return f"public, max-age={max_age}, immutable" if max_age > 0 else "no-store"
+
+
+def _ensure_image_available(relative_path: str) -> None:
+    if not image_storage_service.is_expired(relative_path):
+        return
+    image_storage_service.cleanup_expired()
+    raise HTTPException(status_code=404, detail="image not found")
+
+
 def get_image_response(relative_path: str) -> FileResponse | Response:
+    _ensure_image_available(relative_path)
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
-        "Cache-Control": IMAGE_CACHE_CONTROL,
+        "Cache-Control": _image_cache_control(relative_path),
     }
     if image_storage_service.has_local(relative_path):
         return FileResponse(_safe_image_path(relative_path), headers=headers)
@@ -108,16 +121,18 @@ def ensure_thumbnail(relative_path: str) -> Path:
 
 
 def get_thumbnail_response(relative_path: str) -> FileResponse:
+    _ensure_image_available(relative_path)
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
-        "Cache-Control": IMAGE_CACHE_CONTROL,
+        "Cache-Control": _image_cache_control(relative_path),
     }
     return FileResponse(ensure_thumbnail(relative_path), headers=headers)
 
 
 def get_image_download_response(relative_path: str) -> FileResponse:
+    _ensure_image_available(relative_path)
     cors_headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -152,9 +167,14 @@ def cleanup_image_thumbnails() -> int:
     _cleanup_empty_dirs(thumbnails_root)
     return removed
 
-def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict[str, object]:
-    config.cleanup_old_images()
+
+def cleanup_expired_images() -> int:
+    removed = image_storage_service.cleanup_expired()
     cleanup_image_thumbnails()
+    return removed
+
+def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict[str, object]:
+    cleanup_expired_images()
     all_tags = load_tags()
     items = [
         {
@@ -358,16 +378,15 @@ def download_images_zip(paths: list[str]) -> io.BytesIO:
 
 
 def _auto_cleanup_worker(stop_event: threading.Event) -> None:
-    """后台线程：每30分钟检查存储，空间低于阈值自动清理最旧图片"""
+    """后台线程：每分钟清理到期图片，并在磁盘空间不足时清理最旧图片。"""
     import shutil
     min_free_mb = getattr(config, "image_min_free_mb", None)
     if min_free_mb is None:
         min_free_mb = 500
 
-    while not stop_event.wait(1800):  # 每30分钟
+    while not stop_event.wait(60):
         try:
-            config.cleanup_old_images()
-            cleanup_image_thumbnails()
+            cleanup_expired_images()
             usage = shutil.disk_usage(config.images_dir)
             free_mb = usage.free // (1024 * 1024)
             if free_mb < min_free_mb:

@@ -69,6 +69,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     task_timeout_secs = body.get("task_timeout_secs")
     client_task_id = str(body.get("client_task_id") or "")
     cancel_event = body.get("cancel_event")
+    retention_seconds = body.get("_image_retention_seconds")
+    owner_id = str(body.get("_image_owner_id") or "")
     encoded_images = encode_images(images)
     if not encoded_images:
         raise ImageGenerationError("image is required")
@@ -87,6 +89,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         task_timeout_secs=float(task_timeout_secs) if task_timeout_secs is not None else None,
         client_task_id=client_task_id,
         cancel_event=cancel_event,
+        image_retention_seconds=int(retention_seconds) if retention_seconds else None,
+        owner_id=owner_id,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

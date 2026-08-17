@@ -241,6 +241,8 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         images=encode_images(images) or None,
         task_deadline_ts=task_deadline_ts,
         task_timeout_secs=task_timeout_secs,
+        image_retention_seconds=int(body["_image_retention_seconds"]) if body.get("_image_retention_seconds") else None,
+        owner_id=str(body.get("_image_owner_id") or ""),
     )))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
@@ -263,6 +265,8 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images=encode_images(images) or None,
         task_deadline_ts=task_deadline_ts,
         task_timeout_secs=task_timeout_secs,
+        image_retention_seconds=int(body["_image_retention_seconds"]) if body.get("_image_retention_seconds") else None,
+        owner_id=str(body.get("_image_owner_id") or ""),
     ))
     yield from stream_image_chat_completion(image_outputs, model)
 

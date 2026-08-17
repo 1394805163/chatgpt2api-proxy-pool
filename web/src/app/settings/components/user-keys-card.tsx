@@ -36,6 +36,7 @@ export function UserKeysCard() {
   const [dailyRequestLimit, setDailyRequestLimit] = useState("0");
   const [imageRequestLimit, setImageRequestLimit] = useState("5");
   const [imageConcurrencyLimit, setImageConcurrencyLimit] = useState("2");
+  const [imageRetentionMinutes, setImageRetentionMinutes] = useState("0");
   const [isCreating, setIsCreating] = useState(false);
   const [pendingIds, setPendingIds] = useState<Set<string>>(() => new Set());
   const [revealedKey, setRevealedKey] = useState("");
@@ -46,6 +47,7 @@ export function UserKeysCard() {
   const [editDailyRequestLimit, setEditDailyRequestLimit] = useState("0");
   const [editImageRequestLimit, setEditImageRequestLimit] = useState("5");
   const [editImageConcurrencyLimit, setEditImageConcurrencyLimit] = useState("2");
+  const [editImageRetentionMinutes, setEditImageRetentionMinutes] = useState("0");
 
   const load = async () => {
     setIsLoading(true);
@@ -75,6 +77,7 @@ export function UserKeysCard() {
         daily_request_limit: Math.max(0, Number(dailyRequestLimit) || 0),
         image_request_limit: Math.min(100, Math.max(1, Number(imageRequestLimit) || 5)),
         image_concurrency_limit: Math.min(100, Math.max(1, Number(imageConcurrencyLimit) || 2)),
+        image_retention_minutes: Math.min(43200, Math.max(0, Number(imageRetentionMinutes) || 0)),
       });
       setItems(data.items);
       setRevealedKey(data.key);
@@ -82,6 +85,7 @@ export function UserKeysCard() {
       setDailyRequestLimit("0");
       setImageRequestLimit("5");
       setImageConcurrencyLimit("2");
+      setImageRetentionMinutes("0");
       setIsDialogOpen(false);
       toast.success("用户密钥已创建");
     } catch (error) {
@@ -141,6 +145,7 @@ export function UserKeysCard() {
     setEditDailyRequestLimit(String(item.daily_request_limit));
     setEditImageRequestLimit(String(item.image_request_limit));
     setEditImageConcurrencyLimit(String(item.image_concurrency_limit));
+    setEditImageRetentionMinutes(String(item.image_retention_minutes || 0));
   };
 
   const handleEdit = async () => {
@@ -153,12 +158,14 @@ export function UserKeysCard() {
     const nextDailyRequestLimit = Math.max(0, Number(editDailyRequestLimit) || 0);
     const nextImageRequestLimit = Math.min(100, Math.max(1, Number(editImageRequestLimit) || 5));
     const nextImageConcurrencyLimit = Math.min(100, Math.max(1, Number(editImageConcurrencyLimit) || 2));
+    const nextImageRetentionMinutes = Math.min(43200, Math.max(0, Number(editImageRetentionMinutes) || 0));
     if (
       trimmedName === item.name &&
       !trimmedKey &&
       nextDailyRequestLimit === item.daily_request_limit &&
       nextImageRequestLimit === item.image_request_limit &&
-      nextImageConcurrencyLimit === item.image_concurrency_limit
+      nextImageConcurrencyLimit === item.image_concurrency_limit &&
+      nextImageRetentionMinutes === item.image_retention_minutes
     ) {
       setEditingItem(null);
       return;
@@ -176,6 +183,9 @@ export function UserKeysCard() {
           : {}),
         ...(nextImageConcurrencyLimit !== item.image_concurrency_limit
           ? { image_concurrency_limit: nextImageConcurrencyLimit }
+          : {}),
+        ...(nextImageRetentionMinutes !== item.image_retention_minutes
+          ? { image_retention_minutes: nextImageRetentionMinutes }
           : {}),
       });
       setItems(data.items);
@@ -263,8 +273,10 @@ export function UserKeysCard() {
                         <span>
                           今日成功用量 {item.daily_request_used} / {item.daily_request_limit > 0 ? item.daily_request_limit : "不限"}
                         </span>
+                        <span>累计成功图片 {item.image_total_generated}</span>
                         <span>单次生图最多 {item.image_request_limit} 张</span>
                         <span>同时生图最多 {item.image_concurrency_limit} 路</span>
+                        <span>图片保留 {item.image_retention_minutes > 0 ? `${item.image_retention_minutes} 分钟` : "跟随全局"}</span>
                       </div>
                     </div>
 
@@ -331,7 +343,7 @@ export function UserKeysCard() {
               className="h-11 rounded-xl border-stone-200 bg-white"
             />
           </div>
-          <div className="grid gap-4 sm:grid-cols-3">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <div className="space-y-2">
               <label className="text-sm font-medium text-stone-700">每日成功用量上限（图片按张计）</label>
               <Input
@@ -366,6 +378,18 @@ export function UserKeysCard() {
                 className="h-11 rounded-xl border-stone-200 bg-white"
               />
               <p className="text-xs text-stone-500">超过后立即返回 429，不进入等待队列。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">图片保留分钟</label>
+              <Input
+                type="number"
+                min="0"
+                max="43200"
+                value={imageRetentionMinutes}
+                onChange={(event) => setImageRetentionMinutes(event.target.value)}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">填 0 跟随全局图片保留天数。</p>
             </div>
           </div>
           <DialogFooter>
@@ -460,7 +484,7 @@ export function UserKeysCard() {
                 保存后旧密钥会立即失效，新密钥生效。系统仍只保存哈希，不会回显当前密钥。
               </p>
             </div>
-            <div className="grid gap-4 sm:grid-cols-3">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <div className="space-y-2">
                 <label className="text-sm font-medium text-stone-700">每日成功用量上限（图片按张计）</label>
                 <Input
@@ -495,6 +519,18 @@ export function UserKeysCard() {
                   className="h-11 rounded-xl border-stone-200 bg-white"
                 />
                 <p className="text-xs text-stone-500">超过后立即返回 429，不排队。</p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700">图片保留分钟</label>
+                <Input
+                  type="number"
+                  min="0"
+                  max="43200"
+                  value={editImageRetentionMinutes}
+                  onChange={(event) => setEditImageRetentionMinutes(event.target.value)}
+                  className="h-11 rounded-xl border-stone-200 bg-white"
+                />
+                <p className="text-xs text-stone-500">填 0 跟随全局图片保留天数。</p>
               </div>
             </div>
           </div>

@@ -16,6 +16,8 @@ from services.storage.base import StorageBackend
 AuthRole = Literal["admin", "user"]
 DEFAULT_IMAGE_REQUEST_LIMIT = 5
 MAX_IMAGE_REQUEST_LIMIT = 100
+DEFAULT_IMAGE_RETENTION_MINUTES = 0
+MAX_IMAGE_RETENTION_MINUTES = 43_200
 
 
 class DailyRequestQuotaExceeded(ValueError):
@@ -66,6 +68,14 @@ class AuthService:
         return min(MAX_IMAGE_REQUEST_LIMIT, max(1, normalized))
 
     @staticmethod
+    def _image_retention_minutes(value: object) -> int:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            normalized = DEFAULT_IMAGE_RETENTION_MINUTES
+        return min(MAX_IMAGE_RETENTION_MINUTES, max(0, normalized))
+
+    @staticmethod
     def _today() -> str:
         return datetime.now(ZoneInfo(config.display_timezone)).date().isoformat()
 
@@ -105,6 +115,8 @@ class AuthService:
             "daily_request_date": daily_request_date,
             "image_request_limit": self._image_request_limit(raw.get("image_request_limit")),
             "image_concurrency_limit": normalize_image_concurrency_limit(raw.get("image_concurrency_limit")),
+            "image_retention_minutes": self._image_retention_minutes(raw.get("image_retention_minutes")),
+            "image_total_generated": self._non_negative_int(raw.get("image_total_generated")),
         }
 
     def _load(self) -> list[dict[str, object]]:
@@ -147,7 +159,19 @@ class AuthService:
             "daily_request_date": item.get("daily_request_date"),
             "image_request_limit": AuthService._image_request_limit(item.get("image_request_limit")),
             "image_concurrency_limit": normalize_image_concurrency_limit(item.get("image_concurrency_limit")),
+            "image_retention_minutes": AuthService._image_retention_minutes(item.get("image_retention_minutes")),
+            "image_total_generated": AuthService._non_negative_int(item.get("image_total_generated")),
         }
+
+    def image_retention_seconds(self, identity: dict[str, object]) -> int:
+        if str(identity.get("role") or "").strip().lower() == "user":
+            minutes = self._image_retention_minutes(identity.get("image_retention_minutes"))
+            if minutes > 0:
+                return minutes * 60
+        try:
+            return max(1, int(config.image_retention_days)) * 86400
+        except (TypeError, ValueError):
+            return 30 * 86400
 
     def _find_item_locked(self, key_id: str) -> tuple[int, dict[str, object]] | None:
         for index, item in enumerate(self._items):
@@ -234,6 +258,7 @@ class AuthService:
         daily_request_limit: int = 0,
         image_request_limit: int = DEFAULT_IMAGE_REQUEST_LIMIT,
         image_concurrency_limit: int = 2,
+        image_retention_minutes: int = DEFAULT_IMAGE_RETENTION_MINUTES,
     ) -> tuple[dict[str, object], str]:
         with self._lock:
             self._reload_locked()
@@ -258,6 +283,8 @@ class AuthService:
                 "daily_request_date": self._today(),
                 "image_request_limit": self._image_request_limit(image_request_limit),
                 "image_concurrency_limit": normalize_image_concurrency_limit(image_concurrency_limit),
+                "image_retention_minutes": self._image_retention_minutes(image_retention_minutes),
+                "image_total_generated": 0,
             }
             self._items.append(item)
             self._save()
@@ -299,6 +326,10 @@ class AuthService:
                 if "image_concurrency_limit" in updates and updates.get("image_concurrency_limit") is not None:
                     next_item["image_concurrency_limit"] = normalize_image_concurrency_limit(
                         updates.get("image_concurrency_limit")
+                    )
+                if "image_retention_minutes" in updates and updates.get("image_retention_minutes") is not None:
+                    next_item["image_retention_minutes"] = self._image_retention_minutes(
+                        updates.get("image_retention_minutes")
                     )
                 if bool(updates.get("reset_daily_usage")):
                     next_item["daily_request_used"] = 0
@@ -384,6 +415,7 @@ class AuthService:
         *,
         success: bool,
         units: int | None = None,
+        is_image: bool = False,
     ) -> bool:
         if identity.get("role") != "user":
             return False
@@ -422,6 +454,10 @@ class AuthService:
             next_item["daily_request_used"] = (
                 self._non_negative_int(next_item.get("daily_request_used")) + charge_units
             )
+            if is_image and charge_units > 0:
+                next_item["image_total_generated"] = (
+                    self._non_negative_int(next_item.get("image_total_generated")) + charge_units
+                )
             self._items[index] = next_item
             try:
                 self._save_item_locked(next_item)
