@@ -963,7 +963,6 @@ def stream_image_outputs(
             size=request.size,
             quality=request.quality,
             task_deadline_ts=request.task_deadline_ts,
-            task_timeout_secs=request.task_timeout_secs,
             cancel_event=request.cancel_event,
     ):
         last = event
