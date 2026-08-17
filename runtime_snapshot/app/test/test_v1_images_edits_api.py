@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import base64
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+import api.ai as ai_module
+from services.config import config
+
+
+AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
+PNG_BYTES = b"\x89PNG\r\n\x1a\n"
+DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
+
+
+class ImagesEditsApiTests(unittest.TestCase):
+    def setUp(self):
+        self.handle_calls = []
+
+        def fake_handle(payload):
+            captured = dict(payload)
+            captured["images"] = [
+                (Path(data).read_bytes() if isinstance(data, str) else data, filename, mime_type)
+                for data, filename, mime_type in payload.get("images", [])
+            ]
+            self.handle_calls.append(captured)
+            return {"created": 1, "data": [{"b64_json": base64.b64encode(b"out").decode("ascii")}]}
+
+        self.handler_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
+        self.handler_patcher.start()
+        self.addCleanup(self.handler_patcher.stop)
+        self.identity_patcher = mock.patch.object(
+            ai_module,
+            "require_identity",
+            return_value={"id": "admin", "role": "admin"},
+        )
+        self.identity_patcher.start()
+        self.addCleanup(self.identity_patcher.stop)
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        self.client = TestClient(app)
+
+    def test_edit_accepts_json_image_url(self):
+        """测试图片编辑接口支持官方 JSON image_url 引用。"""
+        response = self.client.post(
+            "/v1/images/edits",
+            headers=AUTH_HEADERS,
+            json={
+                "model": "gpt-image-2",
+                "prompt": "edit",
+                "images": [{"image_url": DATA_IMAGE_URL}],
+                "n": 1,
+                "response_format": "b64_json",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.handle_calls), 1)
+        payload = self.handle_calls[0]
+        self.assertEqual(payload["prompt"], "edit")
+        self.assertEqual(payload["n"], 1)
+        self.assertEqual(payload["images"], [(PNG_BYTES, "image_url.png", "image/png")])
+
+    def test_edit_rejects_file_id_reference(self):
+        """测试图片编辑接口对暂不支持的 file_id 返回明确错误。"""
+        response = self.client.post(
+            "/v1/images/edits",
+            headers=AUTH_HEADERS,
+            json={
+                "model": "gpt-image-2",
+                "prompt": "edit",
+                "images": [{"file_id": "file-abc123"}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("file_id image references are not supported", response.text)
+        self.assertEqual(self.handle_calls, [])
+
+    def test_edit_forwards_requested_timeout_and_client_task_id(self):
+        started = time.time()
+        with mock.patch.dict(config.data, {"image_task_timeout_secs": 180}):
+            response = self.client.post(
+                "/v1/images/edits",
+                headers=AUTH_HEADERS,
+                data={
+                    "prompt": "edit",
+                    "model": "gpt-image-2",
+                    "timeout_secs": "300",
+                    "client_task_id": "ximage-edit-1",
+                },
+                files={"image": ("source.png", PNG_BYTES, "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = self.handle_calls[-1]
+        self.assertEqual(payload["task_timeout_secs"], 300.0)
+        self.assertEqual(payload["client_task_id"], "ximage-edit-1")
+        self.assertGreaterEqual(payload["task_deadline_ts"], started + 299.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
