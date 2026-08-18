@@ -570,8 +570,7 @@ def sanitize_output_text(text: str) -> str:
                 return value
         return ""
 
-    def replace_annotation(match: re.Match[str]) -> str:
-        payload = match.group(1)
+    def annotation_text(payload: str) -> str:
         parts = [part.strip() for part in payload.split("\ue202")]
         kind = (parts[0] if parts else "").lower()
         data = parts[1:]
@@ -585,12 +584,20 @@ def sanitize_output_text(text: str) -> str:
             return readable_annotation_part(data)
         return readable_annotation_part(data)
 
+    def replace_annotation(match: re.Match[str]) -> str:
+        return annotation_text(match.group(1))
+
+    def replace_annotation_before_punctuation(match: re.Match[str]) -> str:
+        leading_space = match.group(1)
+        replacement = annotation_text(match.group(2))
+        return f"{leading_space}{replacement}" if replacement else ""
+
     # ChatGPT web sometimes returns rich annotation markers using private-use
     # characters. API clients cannot render those. Preserve readable labels
     # from entity/link annotations, while removing internal citation pointers.
+    text = re.sub(r"(\s*)\ue200([^\ue201]*)\ue201(?=[.,;:!?])", replace_annotation_before_punctuation, text)
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
-    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
     return text
 
 
@@ -837,8 +844,8 @@ def conversation_events(
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
 
-def text_backend() -> OpenAIBackendAPI:
-    return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
+def text_backend(model: str = "auto") -> OpenAIBackendAPI:
+    return OpenAIBackendAPI(access_token=account_service.get_text_access_token(model=model))
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
@@ -877,7 +884,10 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     token = refreshed_token
                 else:
                     account_service.remove_invalid_token(token, "text_stream")
-                    token = account_service.get_text_access_token(attempted_tokens)
+                    token = account_service.get_text_access_token(
+                        excluded_tokens=set(attempted_tokens),
+                        model=request.model,
+                    )
                 if token:
                     continue
             raise
@@ -957,8 +967,18 @@ def _remove_image_conversation(access_token: str, conversation_id: str) -> None:
             backend.close()
 
 
-def _remove_image_conversation_later(access_token: str, conversation_id: str) -> None:
-    if not config.image_remove_conversation_after_result or not access_token or not conversation_id:
+def _remove_image_conversation_later(
+        access_token: str,
+        conversation_id: str,
+        *,
+        success: bool,
+) -> None:
+    if not access_token or not conversation_id:
+        return
+    if not (
+        config.image_remove_conversation_always
+        or (success and config.image_remove_conversation_after_result)
+    ):
         return
     threading.Thread(
         target=_remove_image_conversation,
@@ -1481,6 +1501,8 @@ def _generate_single_image(
             "index": index,
         })
         backend = None
+        last_conversation_id = ""
+        cleanup_success = False
         try:
             backend = OpenAIBackendAPI(access_token=token)
             backend.image_deadline_ts = request.task_deadline_ts
@@ -1492,6 +1514,7 @@ def _generate_single_image(
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []
             for output in stream_fn(backend, request, index, total):
+                last_conversation_id = output.conversation_id or last_conversation_id
                 if account_email and not output.account_email:
                     output.account_email = account_email
                 if output.kind == "message" and request.message_as_error:
@@ -1524,6 +1547,7 @@ def _generate_single_image(
                     )
                 return outputs
             account_service.mark_image_result(token, True)
+            cleanup_success = True
             result_conversation_id = next(
                 (
                     output.conversation_id
@@ -1532,9 +1556,10 @@ def _generate_single_image(
                 ),
                 "",
             )
-            _remove_image_conversation_later(token, result_conversation_id)
+            last_conversation_id = result_conversation_id or last_conversation_id
             return outputs
         except ImageTaskDeadlineError as exc:
+            last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
             account_service.release_image_slot(token)
             raise ImageGenerationError(
                 str(exc),
@@ -1544,6 +1569,7 @@ def _generate_single_image(
                 account_email=account_email,
             ) from exc
         except ImagePollTimeoutError as exc:
+            last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
             record_image_failure(token, str(exc), "image_poll_timeout")
             if account_email:
                 setattr(exc, "account_email", account_email)
@@ -1570,6 +1596,7 @@ def _generate_single_image(
                 raise
             raise
         except ImageContentPolicyError as exc:
+            last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
             record_image_failure(token, str(exc), "image_content_policy", verify_free_account=False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
@@ -1587,6 +1614,7 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
+            last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
             record_image_failure(
                 token,
                 str(exc),
@@ -1634,6 +1662,7 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
+            last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1693,6 +1722,7 @@ def _generate_single_image(
                 record_image_failure(token, last_error, "image_stream")
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
+            _remove_image_conversation_later(token, last_conversation_id, success=cleanup_success)
             if backend is not None:
                 backend.close()
 

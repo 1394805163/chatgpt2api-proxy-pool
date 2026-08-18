@@ -35,6 +35,7 @@ export function ConfigCard() {
   const setImageAsyncQueueOwnerLimit = useSettingsStore((state) => state.setImageAsyncQueueOwnerLimit);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageRemoveConversationAfterResult = useSettingsStore((state) => state.setImageRemoveConversationAfterResult);
+  const setImageRemoveConversationAlways = useSettingsStore((state) => state.setImageRemoveConversationAlways);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
   const setImageTimeoutRetrySecs = useSettingsStore((state) => state.setImageTimeoutRetrySecs);
   const setAutoRemoveInvalidAccounts = useSettingsStore((state) => state.setAutoRemoveInvalidAccounts);
@@ -45,6 +46,8 @@ export function ConfigCard() {
   const setProxy = useSettingsStore((state) => state.setProxy);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
   const setGlobalSystemPrompt = useSettingsStore((state) => state.setGlobalSystemPrompt);
+  const setDefaultUpstreamModelName = useSettingsStore((state) => state.setDefaultUpstreamModelName);
+  const setDefaultThinkingEffort = useSettingsStore((state) => state.setDefaultThinkingEffort);
   const setSensitiveWordsText = useSettingsStore((state) => state.setSensitiveWordsText);
   const setAIReviewField = useSettingsStore((state) => state.setAIReviewField);
   const setImageStorageField = useSettingsStore((state) => state.setImageStorageField);
@@ -181,6 +184,34 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">用于生成图片结果的访问前缀地址。</p>
           </div>
           <div className="space-y-2">
+            <label className="text-sm text-stone-700">默认上游模型</label>
+            <Input
+              value={String(config?.default_upstream_model_name || "")}
+              onChange={(event) => setDefaultUpstreamModelName(event.target.value)}
+              placeholder="gpt-5-5"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">gpt-image-2 发起图片请求时使用的上游模型名称。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">默认思考强度</label>
+            <Select
+              value={String(config?.default_thinking_effort || "auto")}
+              onValueChange={(value) => setDefaultThinkingEffort(value as "auto" | "standard" | "extended" | "max")}
+            >
+              <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">Auto</SelectItem>
+                <SelectItem value="standard">Standard</SelectItem>
+                <SelectItem value="extended">Extended</SelectItem>
+                <SelectItem value="max">Max</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-stone-500">模型名以 -standard、-extended 或 -max 结尾时，后缀优先。</p>
+          </div>
+          <div className="space-y-2">
             <label className="text-sm text-stone-700">图片自动清理</label>
             <Input
               value={String(config?.image_retention_days || "")}
@@ -274,6 +305,16 @@ export function ConfigCard() {
               <span className="text-sm text-stone-700">出图后隐藏上游对话</span>
             </div>
             <p className="text-xs text-stone-500">成功保存图片后隐藏 ChatGPT 侧会话，不影响本地图片、日志和历史记录。</p>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
+              <Checkbox
+                checked={Boolean(config?.image_remove_conversation_always)}
+                onCheckedChange={(checked) => setImageRemoveConversationAlways(Boolean(checked))}
+              />
+              <span className="text-sm text-stone-700">失败时也隐藏上游对话</span>
+            </div>
+            <p className="text-xs text-stone-500">失败、超时或只返回文本时也隐藏对应会话；开启后也包含成功结果。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片超时继续等待时间</label>

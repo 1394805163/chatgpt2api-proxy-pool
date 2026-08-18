@@ -565,6 +565,14 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def image_remove_conversation_always(self) -> bool:
+        """无论是否出图，图片请求结束后都异步隐藏上游对话。"""
+        value = self.data.get("image_remove_conversation_always", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
     def image_settle_secs(self) -> float:
         """二次确认等待时间（秒）。"""
         try:
@@ -614,6 +622,15 @@ class ConfigStore:
     @property
     def global_system_prompt(self) -> str:
         return str(self.data.get("global_system_prompt") or "").strip()
+
+    @property
+    def default_upstream_model_name(self) -> str:
+        return str(self.data.get("default_upstream_model_name") or "gpt-5-5").strip() or "gpt-5-5"
+
+    @property
+    def default_thinking_effort(self) -> str:
+        value = str(self.data.get("default_thinking_effort") or "auto").strip().lower()
+        return value if value in {"auto", "standard", "extended", "max"} else "auto"
 
     @property
     def images_dir(self) -> Path:
@@ -676,6 +693,7 @@ class ConfigStore:
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
+        data["image_remove_conversation_always"] = self.image_remove_conversation_always
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
@@ -683,6 +701,8 @@ class ConfigStore:
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review
         data["global_system_prompt"] = self.global_system_prompt
+        data["default_upstream_model_name"] = self.default_upstream_model_name
+        data["default_thinking_effort"] = self.default_thinking_effort
         data["backup"] = self.get_backup_settings()
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
@@ -763,6 +783,16 @@ class ConfigStore:
         except (TypeError, ValueError):
             image_async_queue_owner_limit = min(image_async_queue_limit, 150)
         next_data["image_async_queue_owner_limit"] = image_async_queue_owner_limit
+        next_data["default_upstream_model_name"] = (
+            str(next_data.get("default_upstream_model_name") or "gpt-5-5").strip()
+            or "gpt-5-5"
+        )
+        default_thinking_effort = str(next_data.get("default_thinking_effort") or "auto").strip().lower()
+        next_data["default_thinking_effort"] = (
+            default_thinking_effort
+            if default_thinking_effort in {"auto", "standard", "extended", "max"}
+            else "auto"
+        )
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

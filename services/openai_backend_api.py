@@ -575,9 +575,9 @@ class OpenAIBackendAPI:
     @staticmethod
     def _normalize_thinking_effort(value: str) -> str:
         normalized = str(value or "").strip().lower()
-        if normalized in {"", "none"}:
+        if normalized in {"", "none", "auto"}:
             return ""
-        if normalized in {"low", "medium", "high"}:
+        if normalized in {"low", "medium", "high", "standard", "max"}:
             return normalized
         if normalized in {"xhigh", "extended"}:
             return "extended"
@@ -621,21 +621,30 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
-        normalized_effort = self._normalize_thinking_effort(thinking_effort)
+        normalized_effort = self._normalize_thinking_effort(thinking_effort or config.default_thinking_effort)
         if normalized_effort:
             payload["thinking_effort"] = normalized_effort
         return payload
 
-    def _image_model_slug(self, model: str) -> str:
-        """把标准图片模型名映射到底层 model slug。"""
+    def _image_model_settings(self, model: str) -> tuple[str, str]:
+        """把标准图片模型名映射为上游模型及思考强度。"""
         _, base_model = split_image_model(model)
         if not base_model:
-            return "auto"
+            return "auto", ""
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
+            upstream_model = config.default_upstream_model_name
         if base_model == CODEX_IMAGE_MODEL:
-            return base_model
-        return "auto"
+            upstream_model = base_model
+        elif base_model not in {"gpt-image-2", CODEX_IMAGE_MODEL}:
+            return "auto", ""
+        model_name, separator, suffix = upstream_model.rpartition("-")
+        if separator and suffix.lower() in {"standard", "extended", "max"}:
+            return model_name, suffix.lower()
+        return upstream_model, self._normalize_thinking_effort(config.default_thinking_effort)
+
+    def _image_model_slug(self, model: str) -> str:
+        """兼容旧调用方，只返回图片请求使用的上游模型名。"""
+        return self._image_model_settings(model)[0]
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
             Dict[str, str]:
@@ -925,11 +934,12 @@ class OpenAIBackendAPI:
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
+        upstream_model, thinking_effort = self._image_model_settings(model)
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
             "parent_message_id": new_uuid(),
-            "model": self._image_model_slug(model),
+            "model": upstream_model,
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -944,6 +954,8 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
+        if thinking_effort:
+            payload["thinking_effort"] = thinking_effort
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements),
@@ -1051,6 +1063,7 @@ class OpenAIBackendAPI:
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
+        upstream_model, thinking_effort = self._image_model_settings(model)
         references = references or []
         parts = [{
             "content_type": "image_asset_pointer",
@@ -1088,7 +1101,7 @@ class OpenAIBackendAPI:
                 "metadata": metadata,
             }],
             "parent_message_id": new_uuid(),
-            "model": self._image_model_slug(model),
+            "model": upstream_model,
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -1110,6 +1123,8 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
+        if thinking_effort:
+            payload["thinking_effort"] = thinking_effort
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
@@ -2344,7 +2359,9 @@ class OpenAIBackendAPI:
                         "attempt": attempt,
                         "error_msg": policy_msg[:200],
                     })
-                    raise ImageContentPolicyError(policy_msg)
+                    error = ImageContentPolicyError(policy_msg)
+                    setattr(error, "conversation_id", conversation_id or "")
+                    raise error
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
@@ -2609,7 +2626,9 @@ class OpenAIBackendAPI:
                 task_error = getattr(exc, "task_error", "")
                 if not file_ids and not sediment_ids:
                     if task_error:
-                        raise ImageContentPolicyError(task_error) from exc
+                        error = ImageContentPolicyError(task_error)
+                        setattr(error, "conversation_id", conversation_id or "")
+                        raise error from exc
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
