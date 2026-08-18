@@ -60,3 +60,27 @@ COPY --from=web-build /app/web/out ./web_dist
 EXPOSE 80
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
+
+
+# Verification-only target. It keeps pytest out of the runtime image while
+# allowing the exact container dependency set to run the full regression suite.
+FROM python-deps AS test-deps
+
+RUN uv sync --frozen --no-install-project --group dev
+
+FROM test-deps AS test
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:$PATH"
+
+COPY main.py ./
+COPY config.json ./
+COPY VERSION ./
+COPY api ./api
+COPY services ./services
+COPY utils ./utils
+COPY scripts ./scripts
+COPY test ./test
+
+CMD ["python", "-m", "pytest", "-q"]

@@ -8,7 +8,12 @@ import base64
 from services.config import config
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache
-from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
+from services.protocol.conversation import (
+    assistant_raw_text,
+    event_assistant_text,
+    iter_conversation_payloads,
+    sanitize_output_text,
+)
 from utils.helper import extract_image_from_message_content
 
 
@@ -77,6 +82,28 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertNotEqual(default_key, thinking_key)
         self.assertNotEqual(default_key, reasoning_key)
         self.assertNotEqual(thinking_key, reasoning_key)
+
+    def test_assistant_raw_text_ignores_internal_tool_recipient(self) -> None:
+        event = {
+            "message": {
+                "author": {"role": "assistant"},
+                "recipient": "web",
+                "content": {"parts": ["internal tool command"]},
+            }
+        }
+
+        self.assertEqual(assistant_raw_text(event, current_text="visible text"), "visible text")
+
+    def test_event_assistant_text_ignores_non_final_channel(self) -> None:
+        event = {
+            "message": {
+                "author": {"role": "assistant"},
+                "channel": "analysis",
+                "content": {"parts": ["internal reasoning"]},
+            }
+        }
+
+        self.assertEqual(event_assistant_text(event), "")
 
     def test_chat_completion_reasoning_effort_reaches_conversation_request(self) -> None:
         captured_efforts: list[str] = []
