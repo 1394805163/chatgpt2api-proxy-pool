@@ -4,6 +4,7 @@ import base64
 import math
 import re
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 from PIL import Image
@@ -51,6 +52,17 @@ def image_size_from_bytes(data: bytes) -> tuple[int, int] | None:
         return None
     try:
         with Image.open(BytesIO(data)) as image:
+            width, height = image.size
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return int(width), int(height)
+
+
+def image_size_from_path(path: str) -> tuple[int, int] | None:
+    try:
+        with Image.open(Path(path)) as image:
             width, height = image.size
     except Exception:
         return None
@@ -241,9 +253,12 @@ def count_image_inputs_tokens(images: object, model: str, default_detail: str = 
     entries = images if isinstance(images, list) else [images]
     for image in entries:
         data = image[0] if isinstance(image, tuple) and image else image
-        if not isinstance(data, (bytes, bytearray)):
-            continue
-        size = image_size_from_bytes(bytes(data))
+        if isinstance(data, (bytes, bytearray)):
+            size = image_size_from_bytes(bytes(data))
+        elif isinstance(data, str):
+            size = image_size_from_path(data)
+        else:
+            size = None
         if size:
             total += count_image_input_tokens(size[0], size[1], model, default_detail)
     return total

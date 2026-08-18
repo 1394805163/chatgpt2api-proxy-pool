@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 import tiktoken
@@ -176,12 +177,31 @@ def is_model_text_reply_instead_of_image(message: str) -> bool:
     return False
 
 
-def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
-    return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
+def encode_images(images: Iterable[tuple[bytes | str, str, str]]) -> list[str]:
+    encoded: list[str] = []
+    for data, _, _ in images:
+        if not data:
+            continue
+        if isinstance(data, str) and Path(data).is_file():
+            encoded.append(data)
+        else:
+            encoded.append(base64.b64encode(bytes(data)).decode("ascii"))
+    return encoded
 
 
-def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
-    return image_storage_service.save(image_data, base_url).url
+def save_image_bytes(
+    image_data: bytes,
+    base_url: str | None = None,
+    *,
+    retention_seconds: int | None = None,
+    owner_id: str = "",
+) -> str:
+    return image_storage_service.save(
+        image_data,
+        base_url,
+        retention_seconds=retention_seconds,
+        owner_id=owner_id,
+    ).url
 
 
 def message_text(content: Any) -> str:
@@ -344,22 +364,40 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
+    retention_seconds: int | None = None,
+    owner_id: str = "",
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for item in items:
         b64_json = str(item.get("b64_json") or "").strip()
-        if not b64_json:
+        raw_image = item.get("image_bytes")
+        image_data = bytes(raw_image) if isinstance(raw_image, (bytes, bytearray, memoryview)) else b""
+        if not image_data and b64_json:
+            image_data = base64.b64decode(b64_json)
+        if not image_data:
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
+            if not b64_json:
+                b64_json = base64.b64encode(image_data).decode("ascii")
             data.append({
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(
+                    image_data,
+                    base_url,
+                    retention_seconds=retention_seconds,
+                    owner_id=owner_id,
+                ),
                 "revised_prompt": revised_prompt,
             })
         else:
             data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(
+                    image_data,
+                    base_url,
+                    retention_seconds=retention_seconds,
+                    owner_id=owner_id,
+                ),
                 "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
@@ -386,6 +424,8 @@ class ConversationRequest:
     task_timeout_secs: float | None = None
     client_task_id: str = ""
     cancel_event: Any = None  # threading.Event | None
+    image_retention_seconds: int | None = None
+    owner_id: str = ""
 
 
 def _image_task_timeout_secs(request: ConversationRequest) -> float:
@@ -478,6 +518,29 @@ def assistant_message_text(message: dict[str, Any]) -> str:
     return ""
 
 
+def is_visible_assistant_message(message: dict[str, Any]) -> bool:
+    """只保留面向用户的 assistant 消息，过滤工具和内部思考通道。"""
+    author = message.get("author")
+    if not isinstance(author, dict):
+        return False
+    if str(author.get("role") or "").strip().lower() != "assistant":
+        return False
+
+    metadata = message.get("metadata") or {}
+    if isinstance(metadata, dict) and metadata.get("is_visually_hidden_from_conversation") is True:
+        return False
+
+    recipient = str(message.get("recipient") or "").strip().lower()
+    if recipient and recipient != "all":
+        return False
+
+    channel = str(message.get("channel") or "").strip().lower()
+    if channel and channel != "final":
+        return False
+
+    return True
+
+
 def strip_history(text: str, history_text: str = "") -> str:
     text = str(text or "")
     history_text = str(history_text or "")
@@ -536,10 +599,7 @@ def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_te
         if not isinstance(candidate, dict):
             continue
         message = candidate.get("message")
-        if not isinstance(message, dict):
-            continue
-        role = str((message.get("author") or {}).get("role") or "").strip().lower()
-        if role != "assistant":
+        if not isinstance(message, dict) or not is_visible_assistant_message(message):
             continue
         text = assistant_message_text(message)
         if text:
@@ -556,7 +616,7 @@ def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
         if not isinstance(candidate, dict):
             continue
         message = candidate.get("message")
-        if isinstance(message, dict) and (message.get("author") or {}).get("role") == "assistant":
+        if isinstance(message, dict) and is_visible_assistant_message(message):
             return strip_history(assistant_message_text(message), history_text)
     return ""
 
@@ -1074,7 +1134,7 @@ def stream_image_outputs(
         if request.progress_callback:
             request.progress_callback("receiving_image")
         image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
+            {"image_bytes": image_data}
             for image_data in backend.download_image_bytes(image_urls)
         ]
         data = format_image_result(
@@ -1083,6 +1143,8 @@ def stream_image_outputs(
             request.response_format,
             request.base_url,
             int(time.time()),
+            retention_seconds=request.image_retention_seconds,
+            owner_id=request.owner_id,
         )["data"]
         if data:
             yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
@@ -1170,7 +1232,7 @@ def stream_image_outputs(
                     if request.progress_callback:
                         request.progress_callback("receiving_image")
                     image_items = [
-                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
+                        {"image_bytes": image_data}
                         for image_data in backend.download_image_bytes(image_urls)
                     ]
                     data = format_image_result(
@@ -1179,6 +1241,8 @@ def stream_image_outputs(
                         request.response_format,
                         request.base_url,
                         int(time.time()),
+                        retention_seconds=request.image_retention_seconds,
+                        owner_id=request.owner_id,
                     )["data"]
                     if data:
                         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
@@ -1282,7 +1346,7 @@ def stream_image_outputs(
                 if request.progress_callback:
                     request.progress_callback("receiving_image")
                 image_items = [
-                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
+                    {"image_bytes": image_data}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
                 data = format_image_result(
@@ -1291,6 +1355,8 @@ def stream_image_outputs(
                     request.response_format,
                     request.base_url,
                     int(time.time()),
+                    retention_seconds=request.image_retention_seconds,
+                    owner_id=request.owner_id,
                 )["data"]
                 if data:
                     yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
@@ -1351,6 +1417,8 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
+        retention_seconds=request.image_retention_seconds,
+        owner_id=request.owner_id,
     )["data"]
     if data:
         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)

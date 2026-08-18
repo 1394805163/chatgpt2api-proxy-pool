@@ -14,6 +14,7 @@ export type StoredAuthSession = {
   dailyRequestRemaining: number | null;
   dailyRequestDate: string;
   imageRequestLimit: number;
+  imageConcurrencyLimit: number;
 };
 
 export const AUTH_KEY_STORAGE_KEY = "chatgpt2api_auth_key";
@@ -47,6 +48,7 @@ function normalizeSession(value: unknown, fallbackKey = ""): StoredAuthSession |
       candidate.dailyRequestRemaining == null ? null : Math.max(0, Number(candidate.dailyRequestRemaining) || 0),
     dailyRequestDate: String(candidate.dailyRequestDate || "").trim(),
     imageRequestLimit: Math.min(100, Math.max(1, Number(candidate.imageRequestLimit) || (role === "admin" ? 100 : 5))),
+    imageConcurrencyLimit: Math.min(100, Math.max(1, Number(candidate.imageConcurrencyLimit) || (role === "admin" ? 10 : 2))),
   };
 }
 

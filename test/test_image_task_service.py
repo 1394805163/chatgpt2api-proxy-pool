@@ -325,7 +325,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(max_running, 3)
             self.assertTrue(all(value == 1 for value in max_running_by_owner.values()))
 
-    def test_admin_can_fill_global_concurrency_for_ten_image_batch(self):
+    def test_admin_can_fill_ten_concurrency_slots(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             release = threading.Event()
             state_lock = threading.Lock()
@@ -349,7 +349,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 generation_handler=handler,
                 edit_handler=handler,
                 retention_days_getter=lambda: 30,
-                global_concurrency_getter=lambda: 10,
+                global_concurrency_getter=lambda: 20,
                 per_owner_concurrency_getter=lambda: 2,
             )
             for index in range(10):
@@ -379,6 +379,57 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(observed_running, 10)
             self.assertEqual(max_running, 10)
             self.assertEqual(observed_started, 10)
+
+    def test_single_admin_is_limited_to_ten_of_twenty_global_slots(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            release = threading.Event()
+            running_lock = threading.Lock()
+            running = 0
+
+            def handler(_payload):
+                nonlocal running
+                with running_lock:
+                    running += 1
+                release.wait(2)
+                with running_lock:
+                    running -= 1
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=handler,
+                edit_handler=handler,
+                retention_days_getter=lambda: 30,
+                global_concurrency_getter=lambda: 20,
+                per_owner_concurrency_getter=lambda: 2,
+            )
+            for index in range(17):
+                service.submit_generation(
+                    OWNER,
+                    client_task_id=f"admin-limit-{index}",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                )
+
+            deadline = time.time() + 1
+            while time.time() < deadline:
+                with running_lock:
+                    if running == 10:
+                        break
+                time.sleep(0.01)
+            with running_lock:
+                self.assertEqual(running, 10)
+            self.assertEqual(
+                sum(
+                    service.list_tasks(OWNER, [f"admin-limit-{index}"])["items"][0]["status"] == "queued"
+                    for index in range(17)
+                ),
+                7,
+            )
+            release.set()
+            for index in range(17):
+                wait_for_task(service, OWNER, f"admin-limit-{index}", "success", timeout=4)
 
     def test_queued_time_does_not_consume_generation_deadline(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -422,6 +473,64 @@ class ImageTaskServiceTests(unittest.TestCase):
             wait_for_task(service, OWNER, "first", "success")
             second = wait_for_task(service, OWNER, "second", "success")
             self.assertGreaterEqual(second["queue_duration_ms"], 50)
+
+    def test_queued_edit_inputs_are_spooled_and_cleaned(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            release = threading.Event()
+            received: dict[str, bytes] = {}
+
+            def handler(payload):
+                received[str(payload["client_task_id"])] = Path(payload["images"][0][0]).read_bytes()
+                if payload["client_task_id"] == "first-edit":
+                    release.wait(1)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=handler,
+                edit_handler=handler,
+                retention_days_getter=lambda: 30,
+                global_concurrency_getter=lambda: 1,
+                per_owner_concurrency_getter=lambda: 1,
+            )
+            service.submit_edit(
+                OWNER,
+                client_task_id="first-edit",
+                prompt="edit",
+                model="gpt-image-2",
+                size=None,
+                images=[(b"first-image", "first.png", "image/png")],
+            )
+            service.submit_edit(
+                OWNER,
+                client_task_id="queued-edit",
+                prompt="edit",
+                model="gpt-image-2",
+                size=None,
+                images=[(b"queued-image", "queued.png", "image/png")],
+            )
+
+            wait_for_task(service, OWNER, "first-edit", "running")
+            queued = service.list_tasks(OWNER, ["queued-edit"])["items"][0]
+            self.assertEqual(queued["status"], "queued")
+            self.assertEqual(len(list(service._input_spool_dir.iterdir())), 2)
+            with service._lock:
+                pending = service._pending["owner-1:queued-edit"]
+                pending_payload = pending[1][2]
+                self.assertEqual(pending_payload["images"], [])
+                self.assertNotIn(b"queued-image", repr(pending_payload).encode())
+                queued_reference = pending_payload["_spooled_inputs"]["images"][0]
+                self.assertEqual(Path(queued_reference["path"]).suffix, ".png")
+
+            release.set()
+            wait_for_task(service, OWNER, "first-edit", "success")
+            wait_for_task(service, OWNER, "queued-edit", "success")
+            self.assertEqual(received["first-edit"], b"first-image")
+            self.assertEqual(received["queued-edit"], b"queued-image")
+            cleanup_deadline = time.time() + 1
+            while time.time() < cleanup_deadline and any(service._input_spool_dir.iterdir()):
+                time.sleep(0.01)
+            self.assertEqual(list(service._input_spool_dir.iterdir()), [])
 
     def test_queued_task_expires_without_starting_the_handler(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

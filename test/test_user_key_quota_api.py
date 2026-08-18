@@ -41,6 +41,8 @@ class UserKeyQuotaApiTests(unittest.TestCase):
                 "name": "limited-user",
                 "daily_request_limit": 12,
                 "image_request_limit": 4,
+                "image_concurrency_limit": 20,
+                "image_retention_minutes": 60,
             },
         )
 
@@ -50,17 +52,26 @@ class UserKeyQuotaApiTests(unittest.TestCase):
         self.assertEqual(item["daily_request_used"], 0)
         self.assertEqual(item["daily_request_remaining"], 12)
         self.assertEqual(item["image_request_limit"], 4)
+        self.assertEqual(item["image_concurrency_limit"], 20)
+        self.assertEqual(item["image_retention_minutes"], 60)
 
         updated = self.client.post(
             f"/api/auth/users/{item['id']}",
             headers={"Authorization": "Bearer admin"},
-            json={"daily_request_limit": 20, "image_request_limit": 7},
+            json={
+                "daily_request_limit": 20,
+                "image_request_limit": 7,
+                "image_concurrency_limit": 12,
+                "image_retention_minutes": 0,
+            },
         )
 
         self.assertEqual(updated.status_code, 200, updated.text)
         updated_item = updated.json()["item"]
         self.assertEqual(updated_item["daily_request_limit"], 20)
         self.assertEqual(updated_item["image_request_limit"], 7)
+        self.assertEqual(updated_item["image_concurrency_limit"], 12)
+        self.assertEqual(updated_item["image_retention_minutes"], 0)
 
         listed = self.client.get("/api/auth/users", headers={"Authorization": "Bearer admin"})
         self.assertEqual(listed.status_code, 200, listed.text)

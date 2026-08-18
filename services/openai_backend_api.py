@@ -17,7 +17,7 @@ from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlOpt, requests
 from PIL import Image
 
 from services.account_service import account_service
@@ -948,7 +948,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements),
             json=payload,
-            timeout=self._image_request_timeout(60),
+            timeout=self._image_request_timeout(30),
         )
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
@@ -968,60 +968,81 @@ class OpenAIBackendAPI:
         payload = image.split(",", 1)[1] if image.startswith("data:") and "," in image else image
         return base64.b64decode(payload)
 
+    @staticmethod
+    def _image_file_path(image: str) -> Path | None:
+        if not image or len(image) >= 512 or image.startswith("data:") or "\n" in image or "\r" in image:
+            return None
+        candidate = Path(os.path.expanduser(image))
+        return candidate if candidate.exists() and candidate.is_file() else None
+
     def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
         """上传一张 base64 图片，返回底层文件元数据。"""
-        data = self._decode_image_base64(image)
-        if (
-                image
-                and len(image) < 512
-                and not image.startswith("data:")
-                and "\n" not in image
-                and "\r" not in image
-        ):
-            candidate_path = Path(os.path.expanduser(image))
-            if candidate_path.exists() and candidate_path.is_file():
-                file_name = candidate_path.name
-        image = Image.open(BytesIO(data))
-        width, height = image.size
-        mime_type = Image.MIME.get(image.format, "image/png")
+        file_path = self._image_file_path(image)
+        data = b"" if file_path is not None else self._decode_image_base64(image)
+        image_source = file_path if file_path is not None else BytesIO(data)
+        with Image.open(image_source) as parsed_image:
+            width, height = parsed_image.size
+            mime_type = Image.MIME.get(parsed_image.format, "image/png")
+        if file_path is not None:
+            file_name = file_path.name
+            file_size = file_path.stat().st_size
+        else:
+            file_size = len(data)
         path = "/backend-api/files"
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
-            json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
+            json={"file_name": file_name, "file_size": file_size, "use_case": "multimodal", "width": width,
                   "height": height},
-            timeout=self._image_request_timeout(60),
+            timeout=self._image_request_timeout(30),
         )
         ensure_ok(response, path)
         upload_meta = response.json()
-        response = self.session.put(
-            upload_meta["upload_url"],
-            headers={
-                "Content-Type": mime_type,
-                "x-ms-blob-type": "BlockBlob",
-                "x-ms-version": "2020-04-08",
-                "Origin": self.base_url,
-                "Referer": self.base_url + "/",
-                "User-Agent": self.user_agent,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.8",
-            },
-            data=data,
-            timeout=self._image_request_timeout(120),
-        )
+        source_file = None
+        original_curl_options = None
+        if file_path is not None:
+            source_file = file_path.open("rb")
+            original_curl_options = self.session.curl_options
+            self.session.curl_options = {
+                **original_curl_options,
+                CurlOpt.UPLOAD: 1,
+                CurlOpt.READFUNCTION: source_file.read,
+                CurlOpt.INFILESIZE_LARGE: file_size,
+            }
+        try:
+            response = self.session.put(
+                upload_meta["upload_url"],
+                headers={
+                    "Content-Type": mime_type,
+                    "x-ms-blob-type": "BlockBlob",
+                    "x-ms-version": "2020-04-08",
+                    "Origin": self.base_url,
+                    "Referer": self.base_url + "/",
+                    "User-Agent": self.user_agent,
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-US,en;q=0.8",
+                },
+                **({"data": data} if file_path is None else {}),
+                timeout=self._image_request_timeout(45),
+            )
+        finally:
+            if original_curl_options is not None:
+                self.session.curl_options = original_curl_options
+            if source_file is not None:
+                source_file.close()
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             data="{}",
-            timeout=self._image_request_timeout(60),
+            timeout=self._image_request_timeout(30),
         )
         ensure_ok(response, path)
         return {
             "file_id": upload_meta["file_id"],
             "file_name": file_name,
-            "file_size": len(data),
+            "file_size": file_size,
             "mime_type": mime_type,
             "width": width,
             "height": height,

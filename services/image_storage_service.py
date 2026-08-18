@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from urllib.parse import quote, urlparse
 
 from curl_cffi import requests
@@ -18,7 +18,7 @@ from services.config import DATA_DIR, config
 from services.time_utils import utc_now_iso, utc_timestamp_iso
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
-IMAGE_INDEX_LOCK = Lock()
+IMAGE_INDEX_LOCK = RLock()
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
@@ -40,6 +40,13 @@ def _clean(value: object) -> str:
 
 def _now_iso() -> str:
     return utc_now_iso()
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _safe_relative_path(path: str) -> str:
@@ -203,8 +210,64 @@ class ImageStorageService:
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
-    def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
-        config.cleanup_old_images()
+    @staticmethod
+    def _expires_at(item: dict[str, object]) -> float | None:
+        try:
+            expires_at = float(item.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            return None
+        return expires_at if expires_at > 0 else None
+
+    @staticmethod
+    def _created_at(item: dict[str, object]) -> float | None:
+        value = str(item.get("created_at") or "").strip()
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _remove_thumbnail_files(relative_path: str) -> None:
+        rel = _safe_relative_path(relative_path)
+        thumbnails_root = config.image_thumbnails_dir.resolve()
+        for path in (thumbnails_root / f"{rel}.png", thumbnails_root / rel):
+            try:
+                path.resolve().relative_to(thumbnails_root)
+            except ValueError:
+                continue
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _remove_image_tags(relative_path: str) -> None:
+        try:
+            from services.image_tags_service import remove_tags
+
+            remove_tags(relative_path)
+        except Exception:
+            pass
+
+    def _retention_seconds(self, value: int | None) -> int:
+        if value is not None:
+            try:
+                if int(value) > 0:
+                    return int(value)
+            except (TypeError, ValueError):
+                pass
+        return _positive_int(getattr(config, "image_retention_days", 30), 30) * 86400
+
+    def save(
+        self,
+        image_data: bytes,
+        base_url: str | None = None,
+        *,
+        retention_seconds: int | None = None,
+        owner_id: str = "",
+    ) -> StoredImage:
         rel = self.make_relative_path(image_data)
         mode = self.mode()
         if mode not in {"local", "webdav", "both"}:
@@ -224,18 +287,22 @@ class ImageStorageService:
             stored_webdav = True
 
         dimensions = _image_dimensions(image_data)
+        now = time.time()
         item = {
             "rel": rel,
             "path": rel,
             "name": Path(rel).name,
             "date": "-".join(rel.split("/")[:3]),
             "size": len(image_data),
-            "created_at": _now_iso(),
+            "created_at": utc_timestamp_iso(now),
+            "expires_at": int(now) + self._retention_seconds(retention_seconds),
             "storage": "both" if stored_local and stored_webdav else ("webdav" if stored_webdav else "local"),
             "local": stored_local,
             "webdav": stored_webdav,
             "remote_url": remote_url,
         }
+        if _clean(owner_id):
+            item["owner_id"] = _clean(owner_id)
         if dimensions:
             item["width"], item["height"] = dimensions
         with self._index_lock:
@@ -243,6 +310,94 @@ class ImageStorageService:
             items[rel] = item
             self._save_index(items)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
+
+    def is_expired(self, rel: str, now: float | None = None) -> bool:
+        safe_rel = _safe_relative_path(rel)
+        current = time.time() if now is None else float(now)
+        with self._index_lock:
+            item = self._load_clean_index().get(safe_rel)
+        if item is None:
+            path = _local_image_path(safe_rel)
+            return path.is_file() and path.stat().st_mtime + self._retention_seconds(None) <= current
+        expires_at = self._expires_at(item)
+        if expires_at is not None:
+            return expires_at <= current
+        path = _local_image_path(safe_rel)
+        created_at = self._created_at(item) or (path.stat().st_mtime if path.is_file() else None)
+        return created_at is not None and created_at + self._retention_seconds(None) <= current
+
+    def cache_max_age(self, rel: str, now: float | None = None) -> int:
+        safe_rel = _safe_relative_path(rel)
+        current = time.time() if now is None else float(now)
+        with self._index_lock:
+            item = self._load_clean_index().get(safe_rel)
+        if item is not None and (expires_at := self._expires_at(item)) is not None:
+            return max(0, int(expires_at - current))
+        if item is not None:
+            created_at = self._created_at(item)
+            if created_at is not None:
+                return max(0, int(created_at + self._retention_seconds(None) - current))
+        return self._retention_seconds(None)
+
+    def cleanup_expired(self, now: float | None = None) -> int:
+        current = time.time() if now is None else float(now)
+        removed = 0
+        changed = False
+        with self._index_lock:
+            items = self._load_clean_index()
+            for rel, item in list(items.items()):
+                expires_at = self._expires_at(item)
+                if expires_at is None:
+                    path = _local_image_path(rel)
+                    created_at = self._created_at(item) or (path.stat().st_mtime if path.is_file() else None)
+                    if created_at is not None:
+                        expires_at = created_at + self._retention_seconds(None)
+                if expires_at is None or expires_at > current:
+                    continue
+
+                local_path = _local_image_path(rel)
+                local_exists = local_path.is_file()
+                if local_exists:
+                    local_path.unlink()
+                    local_exists = False
+
+                webdav_exists = bool(item.get("webdav"))
+                if webdav_exists:
+                    try:
+                        webdav_exists = not WebDAVClient(self.settings()).delete(rel)
+                    except Exception:
+                        webdav_exists = True
+
+                self._remove_thumbnail_files(rel)
+                self._remove_image_tags(rel)
+                if local_exists or webdav_exists:
+                    item = {
+                        **item,
+                        "local": local_exists,
+                        "webdav": webdav_exists,
+                        "storage": "both" if local_exists and webdav_exists else ("webdav" if webdav_exists else "local"),
+                    }
+                    items[rel] = item
+                else:
+                    items.pop(rel, None)
+                    removed += 1
+                changed = True
+
+            fallback_cutoff = current - self._retention_seconds(None)
+            for path in config.images_dir.rglob("*"):
+                if not path.is_file() or not _is_image_rel(path.name):
+                    continue
+                rel = path.relative_to(config.images_dir).as_posix()
+                if rel in items or path.stat().st_mtime > fallback_cutoff:
+                    continue
+                path.unlink()
+                self._remove_thumbnail_files(rel)
+                self._remove_image_tags(rel)
+                removed += 1
+                changed = True
+            if changed:
+                self._save_index(items)
+        return removed
 
     def get_bytes(self, rel: str) -> bytes:
         safe_rel = _safe_relative_path(rel)

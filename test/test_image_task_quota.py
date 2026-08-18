@@ -9,6 +9,7 @@ from unittest import mock
 
 from services.auth_service import AuthService, DailyRequestQuotaExceeded, ImageRequestLimitExceeded
 from services.config import config
+from services.image_concurrency import ImageConcurrencyLimitExceeded
 from services.image_task_service import ImageTaskService
 from services.storage.json_storage import JSONStorageBackend
 
@@ -42,6 +43,7 @@ def make_identity(
     *,
     daily_limit: int = 5,
     image_limit: int = 5,
+    concurrency_limit: int = 2,
 ) -> tuple[AuthService, dict[str, object]]:
     auth = AuthService(JSONStorageBackend(root / "accounts.json", root / "auth_keys.json"))
     _, raw_key = auth.create_key(
@@ -49,6 +51,7 @@ def make_identity(
         name="image-user",
         daily_request_limit=daily_limit,
         image_request_limit=image_limit,
+        image_concurrency_limit=concurrency_limit,
     )
     identity = auth.authenticate(raw_key)
     assert identity is not None
@@ -81,6 +84,7 @@ class ImageTaskQuotaTests(unittest.TestCase):
                 return {"data": [{"url": "http://example.test/image.png"}]}
 
             service = make_service(root / "tasks.json", handler)
+            service.reject_when_busy = True
             with mock.patch("services.image_task_service.auth_service", auth):
                 service.submit_generation(identity, client_task_id="success", prompt="cat", model="gpt-image-2", size=None)
                 wait_for_status(service, identity, "success", "success")
@@ -90,6 +94,7 @@ class ImageTaskQuotaTests(unittest.TestCase):
             item = auth.list_keys(role="user")[0]
             self.assertEqual(item["daily_request_used"], 1)
             self.assertEqual(item["daily_request_remaining"], 2)
+            self.assertEqual(item["image_total_generated"], 1)
 
     def test_user_tasks_use_configured_limit_and_admin_uses_global_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -126,10 +131,10 @@ class ImageTaskQuotaTests(unittest.TestCase):
             public = reloaded.list_tasks({"id": "admin", "role": "admin"}, ["account-metadata"])["items"][0]
             self.assertNotIn("account_email", public)
 
-    def test_active_image_task_limit_cannot_be_bypassed(self) -> None:
+    def test_active_image_task_limit_uses_independent_concurrency_setting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            auth, identity = make_identity(root, image_limit=1)
+            auth, identity = make_identity(root, image_limit=10, concurrency_limit=1)
             release = threading.Event()
 
             def handler(_payload):
@@ -137,20 +142,21 @@ class ImageTaskQuotaTests(unittest.TestCase):
                 return {"data": [{"url": "http://example.test/image.png"}]}
 
             service = make_service(root / "tasks.json", handler)
+            service.reject_when_busy = True
             with mock.patch("services.image_task_service.auth_service", auth):
                 service.submit_generation(identity, client_task_id="first", prompt="cat", model="gpt-image-2", size=None)
                 wait_for_status(service, identity, "first", "running")
-                with self.assertRaises(ImageRequestLimitExceeded):
+                with self.assertRaises(ImageConcurrencyLimitExceeded):
                     service.submit_generation(identity, client_task_id="second", prompt="cat", model="gpt-image-2", size=None)
                 release.set()
                 wait_for_status(service, identity, "first", "success")
 
             self.assertEqual(auth.list_keys(role="user")[0]["daily_request_used"], 1)
 
-    def test_queued_timeout_releases_daily_quota_reservation(self) -> None:
+    def test_over_capacity_request_is_rejected_without_queue_or_quota_use(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            auth, identity = make_identity(root, daily_limit=2, image_limit=2)
+            auth, identity = make_identity(root, daily_limit=2, image_limit=2, concurrency_limit=2)
             release = threading.Event()
 
             def handler(payload):
@@ -168,11 +174,19 @@ class ImageTaskQuotaTests(unittest.TestCase):
                 global_concurrency_getter=lambda: 1,
                 per_owner_concurrency_getter=lambda: 1,
                 queue_timeout_getter=lambda: 0.05,
+                reject_when_busy=True,
             )
             with mock.patch("services.image_task_service.auth_service", auth):
                 service.submit_generation(identity, client_task_id="blocking", prompt="cat", model="gpt-image-2", size=None)
-                service.submit_generation(identity, client_task_id="queued-timeout", prompt="cat", model="gpt-image-2", size=None)
-                wait_for_status(service, identity, "queued-timeout", "error")
+                with self.assertRaises(ImageConcurrencyLimitExceeded):
+                    service.submit_generation(
+                        identity,
+                        client_task_id="rejected",
+                        prompt="cat",
+                        model="gpt-image-2",
+                        size=None,
+                    )
+                self.assertEqual(service.list_tasks(identity, ["rejected"])["items"], [])
                 release.set()
                 wait_for_status(service, identity, "blocking", "success")
 

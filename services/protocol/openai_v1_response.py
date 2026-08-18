@@ -446,6 +446,8 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images=images,
         task_deadline_ts=task_deadline_ts,
         task_timeout_secs=task_timeout_secs,
+        image_retention_seconds=int(body["_image_retention_seconds"]) if body.get("_image_retention_seconds") else None,
+        owner_id=str(body.get("_image_owner_id") or ""),
     ))
     yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
 

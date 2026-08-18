@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI
@@ -22,7 +23,12 @@ class ImagesEditsApiTests(unittest.TestCase):
         self.handle_calls = []
 
         def fake_handle(payload):
-            self.handle_calls.append(payload)
+            captured = dict(payload)
+            captured["images"] = [
+                (Path(data).read_bytes() if isinstance(data, str) else data, filename, mime_type)
+                for data, filename, mime_type in payload.get("images", [])
+            ]
+            self.handle_calls.append(captured)
             return {"created": 1, "data": [{"b64_json": base64.b64encode(b"out").decode("ascii")}]}
 
         self.handler_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
