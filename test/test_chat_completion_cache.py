@@ -291,6 +291,10 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         self.assertEqual(sanitize_output_text(text), "The character is Invincible.")
 
+    def test_output_sanitizer_preserves_spaces_before_code_punctuation(self) -> None:
+        self.assertEqual(sanitize_output_text("find ."), "find .")
+        self.assertEqual(sanitize_output_text("if ! test -f x; then"), "if ! test -f x; then")
+
     def test_stream_sanitizer_does_not_emit_partial_annotation_or_repeat_prefix(self) -> None:
         events = [
             {"p": "/message/content/parts/0", "o": "append", "v": "Repo: \ue200url\ue202chat"},

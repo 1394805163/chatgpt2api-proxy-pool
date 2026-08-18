@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import threading
 from unittest import mock
 
 from services.config import config
@@ -19,6 +20,29 @@ class ImageConversationCleanupTests(unittest.TestCase):
     def test_cleanup_setting_defaults_to_disabled(self) -> None:
         with mock.patch.dict(config.data, {}, clear=True):
             self.assertFalse(config.image_remove_conversation_after_result)
+            self.assertFalse(config.image_remove_conversation_always)
+
+    def test_always_cleanup_can_run_for_failed_image_attempt(self) -> None:
+        cleanup_backend = mock.Mock()
+        cleanup_backend.delete_conversation.return_value = {"success": True}
+        closed = threading.Event()
+        cleanup_backend.close.side_effect = closed.set
+        with (
+            mock.patch.dict(
+                config.data,
+                {
+                    "image_remove_conversation_after_result": False,
+                    "image_remove_conversation_always": True,
+                },
+                clear=False,
+            ),
+            mock.patch.object(conversation, "OpenAIBackendAPI", return_value=cleanup_backend),
+        ):
+            conversation._remove_image_conversation_later("token-1", "conv-failed", success=False)
+
+        cleanup_backend.delete_conversation.assert_called_once_with("conv-failed")
+        self.assertTrue(closed.wait(2.0))
+        cleanup_backend.close.assert_called_once_with()
 
     def test_delete_conversation_hides_upstream_record(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
@@ -44,7 +68,7 @@ class ImageConversationCleanupTests(unittest.TestCase):
             mock.patch.dict(config.data, {"image_remove_conversation_after_result": False}),
             mock.patch.object(conversation.threading, "Thread") as thread_factory,
         ):
-            conversation._remove_image_conversation_later("token-1", "conv-1")
+            conversation._remove_image_conversation_later("token-1", "conv-1", success=False)
 
         thread_factory.assert_not_called()
 
@@ -85,7 +109,7 @@ class ImageConversationCleanupTests(unittest.TestCase):
             )
 
         self.assertEqual(outputs, [output])
-        schedule_cleanup.assert_called_once_with("token-1", "conv-1")
+        schedule_cleanup.assert_called_once_with("token-1", "conv-1", success=True)
         image_backend.close.assert_called_once_with()
 
 

@@ -6,27 +6,31 @@ from time import monotonic
 from typing import Any
 
 from services.account_service import account_service
+from services.model_service import model_catalog_service
 from services.openai_backend_api import OpenAIBackendAPI
 from utils.helper import CODEX_IMAGE_MODEL
 
 
 MODEL_CACHE_TTL_SECONDS = 60.0
-_model_cache_lock = Lock()
-_model_cache: tuple[float, dict[str, Any]] | None = None
+_legacy_model_cache_lock = Lock()
+_legacy_model_cache: tuple[float, dict[str, Any]] | None = None
 
 
 def clear_model_cache() -> None:
-    global _model_cache
-    with _model_cache_lock:
-        _model_cache = None
+    """清除新旧两套缓存，保持旧调用方的生命周期语义。"""
+    global _legacy_model_cache
+    with _legacy_model_cache_lock:
+        _legacy_model_cache = None
+    model_catalog_service.clear_cache()
 
 
 def _backend_models() -> dict[str, Any]:
-    global _model_cache
+    """兼容旧调用方：获取匿名模型目录并确保会话及时关闭。"""
+    global _legacy_model_cache
     now = monotonic()
-    with _model_cache_lock:
-        if _model_cache is not None:
-            cached_at, cached_result = _model_cache
+    with _legacy_model_cache_lock:
+        if _legacy_model_cache is not None:
+            cached_at, cached_result = _legacy_model_cache
             if now - cached_at < MODEL_CACHE_TTL_SECONDS:
                 return deepcopy(cached_result)
 
@@ -35,14 +39,14 @@ def _backend_models() -> dict[str, Any]:
         result = backend.list_models()
     finally:
         backend.close()
-    with _model_cache_lock:
-        _model_cache = (monotonic(), deepcopy(result))
+    with _legacy_model_cache_lock:
+        _legacy_model_cache = (monotonic(), deepcopy(result))
     return result
 
 
 def list_models() -> dict[str, Any]:
     try:
-        result = _backend_models()
+        result = model_catalog_service.list_models()
     except Exception:
         result = {"object": "list", "data": []}
     data = result.get("data")

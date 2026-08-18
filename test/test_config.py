@@ -125,6 +125,27 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(persisted["image_user_concurrency"], 5)
             self.assertEqual(persisted["image_queue_timeout_secs"], 30)
 
+    def test_upstream_model_and_thinking_settings_are_normalized_and_persisted(self) -> None:
+        module = self.config_module
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
+            store = module.ConfigStore(path)
+
+            self.assertEqual(store.default_upstream_model_name, "gpt-5-5")
+            self.assertEqual(store.default_thinking_effort, "auto")
+
+            updated = store.update({
+                "default_upstream_model_name": "gpt-5-5-extended",
+                "default_thinking_effort": "invalid",
+            })
+
+            self.assertEqual(updated["default_upstream_model_name"], "gpt-5-5-extended")
+            self.assertEqual(updated["default_thinking_effort"], "auto")
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["default_upstream_model_name"], "gpt-5-5-extended")
+            self.assertEqual(persisted["default_thinking_effort"], "auto")
+
 
 if __name__ == "__main__":
     unittest.main()
