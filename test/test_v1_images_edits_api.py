@@ -103,6 +103,30 @@ class ImagesEditsApiTests(unittest.TestCase):
         self.assertEqual(payload["client_task_id"], "ximage-edit-1")
         self.assertGreaterEqual(payload["task_deadline_ts"], started + 299.0)
 
+    def test_edit_replays_same_client_task_id_without_second_upstream_call(self):
+        request = {
+            "prompt": "edit",
+            "model": "gpt-image-2",
+            "client_task_id": "same-edit",
+        }
+        first = self.client.post(
+            "/v1/images/edits",
+            headers=AUTH_HEADERS,
+            data=request,
+            files={"image": ("source.png", PNG_BYTES, "image/png")},
+        )
+        second = self.client.post(
+            "/v1/images/edits",
+            headers=AUTH_HEADERS,
+            data=request,
+            files={"image": ("source.png", PNG_BYTES, "image/png")},
+        )
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(first.json(), second.json())
+        self.assertEqual(len(self.handle_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

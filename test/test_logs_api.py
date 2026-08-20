@@ -35,7 +35,7 @@ class LogsApiTests(unittest.TestCase):
         app.include_router(system_module.create_router("9.9.9-test"))
         self.client = TestClient(app)
 
-    def test_date_filtered_call_logs_request_all_items_and_collapse_failures(self) -> None:
+    def test_date_filtered_call_logs_keep_hard_limit_and_collapse_failures(self) -> None:
         response = self.client.get(
             "/api/logs?type=call&start_date=2026-07-05&end_date=2026-07-05",
             headers=AUTH_HEADERS,
@@ -49,7 +49,7 @@ class LogsApiTests(unittest.TestCase):
                     "type": "call",
                     "start_date": "2026-07-05",
                     "end_date": "2026-07-05",
-                    "limit": None,
+                    "limit": 200,
                     "collapse_image_failures": True,
                     "display_timezone": "Asia/Shanghai",
                 }
@@ -91,6 +91,15 @@ class LogsApiTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_log_limit_is_bounded_and_forwarded(self) -> None:
+        response = self.client.get("/api/logs?type=call&limit=1000", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.fake_log_service.calls[0]["limit"], 1000)
+
+        too_large = self.client.get("/api/logs?limit=1001", headers=AUTH_HEADERS)
+        self.assertEqual(too_large.status_code, 422, too_large.text)
 
 
 if __name__ == "__main__":

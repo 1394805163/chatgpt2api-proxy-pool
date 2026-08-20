@@ -14,6 +14,13 @@ from services.content_filter import check_request, request_shape, request_text
 from services.auth_service import DailyRequestQuotaExceeded, auth_service
 from services.config import config
 from services.editable_file_task_service import editable_file_task_service
+from services.image_idempotency import (
+    CachedImageResponse,
+    ImageIdempotencyCapacityExceeded,
+    ImageIdempotencyConflict,
+    ImageIdempotencyRegistry,
+    image_request_fingerprint,
+)
 from services.log_service import LoggedCall
 from services.protocol import (
     anthropic_v1_messages,
@@ -24,7 +31,7 @@ from services.protocol import (
     openai_v1_response,
     openai_search,
 )
-from utils.helper import is_image_chat_request
+from utils.helper import is_image_chat_request, parse_image_count
 from utils.log import logger
 
 
@@ -119,6 +126,29 @@ def log_image_request(request: Request, identity: dict[str, object], endpoint: s
     })
 
 
+def image_idempotency_key(request: Request, client_task_id: object = "") -> str:
+    header_key = str(request.headers.get("idempotency-key") or "").strip()
+    body_key = str(client_task_id or "").strip()
+    if header_key and body_key and header_key != body_key:
+        raise HTTPException(status_code=400, detail={"error": "Idempotency-Key and client_task_id must match"})
+    key = header_key or body_key
+    if len(key) > 128:
+        raise HTTPException(status_code=400, detail={"error": "idempotency key must be at most 128 characters"})
+    return key
+
+
+def image_idempotency_scope(identity: dict[str, object], endpoint: str) -> str:
+    return f"{str(identity.get('role') or 'user').strip()}:{str(identity.get('id') or '').strip()}:{endpoint}"
+
+
+def raise_image_idempotency_error(exc: Exception) -> None:
+    if isinstance(exc, ImageIdempotencyConflict):
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+    if isinstance(exc, ImageIdempotencyCapacityExceeded):
+        raise HTTPException(status_code=429, detail={"error": str(exc), "retryable": True}) from exc
+    raise exc
+
+
 async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
         await run_in_threadpool(check_request, text)
@@ -143,6 +173,7 @@ def release_image_concurrency_after_response(response, lease):
 
 def create_router() -> APIRouter:
     router = APIRouter()
+    image_idempotency = ImageIdempotencyRegistry()
 
     @router.get("/v1/models")
     async def list_models(authorization: str | None = Header(default=None)):
@@ -161,26 +192,53 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         enforce_image_request_limit(identity, body.n)
         payload = body.model_dump(mode="python")
+        idempotency_key = image_idempotency_key(request, payload.get("client_task_id"))
+        if idempotency_key:
+            if payload.get("stream"):
+                raise HTTPException(status_code=400, detail={"error": "idempotency is not supported for streaming image requests"})
+            payload["client_task_id"] = idempotency_key
+        fingerprint = image_request_fingerprint("/v1/images/generations", payload) if idempotency_key else ""
         timeout_secs = apply_image_timeout(identity, payload)
         payload["base_url"] = resolve_image_base_url(request)
         log_image_request(request, identity, "/v1/images/generations", payload, timeout_secs)
-        call = LoggedCall(
-            identity,
-            "/v1/images/generations",
-            body.model,
-            "文生图",
-            request_text=body.prompt,
-            client_task_id=body.client_task_id or "",
-            request_timeout_secs=timeout_secs,
-        )
-        lease = acquire_image_concurrency(identity, units=body.n)
+
+        async def execute_response():
+            call = LoggedCall(
+                identity,
+                "/v1/images/generations",
+                body.model,
+                "文生图",
+                request_text=body.prompt,
+                client_task_id=idempotency_key,
+                request_timeout_secs=timeout_secs,
+            )
+            lease = acquire_image_concurrency(identity, units=body.n)
+            try:
+                await filter_or_log(call, body.prompt)
+                result = await call.run(openai_v1_image_generations.handle, payload)
+            except BaseException:
+                lease.release()
+                raise
+            return release_image_concurrency_after_response(result, lease)
+
+        if not idempotency_key:
+            return await execute_response()
+
+        async def execute() -> CachedImageResponse:
+            return CachedImageResponse.capture(await execute_response())
+
         try:
-            await filter_or_log(call, body.prompt)
-            response = await call.run(openai_v1_image_generations.handle, payload)
-        except BaseException:
-            lease.release()
-            raise
-        return release_image_concurrency_after_response(response, lease)
+            cached, replayed = await image_idempotency.run(
+                image_idempotency_scope(identity, "/v1/images/generations"),
+                idempotency_key,
+                fingerprint,
+                execute,
+            )
+        except (ImageIdempotencyConflict, ImageIdempotencyCapacityExceeded) as exc:
+            raise_image_idempotency_error(exc)
+        if replayed:
+            logger.info({"event": "image_idempotency_replay", "endpoint": "/v1/images/generations", "client_task_id": idempotency_key})
+        return cached.materialize()
 
     @router.post("/v1/images/edits")
     async def edit_images(
@@ -193,106 +251,208 @@ def create_router() -> APIRouter:
         enforce_image_request_limit(identity, int(payload.get("n") or 1))
         prompt = str(payload["prompt"])
         model = str(payload["model"])
+        idempotency_key = image_idempotency_key(request, payload.get("client_task_id"))
+        if idempotency_key:
+            if payload.get("stream"):
+                raise HTTPException(status_code=400, detail={"error": "idempotency is not supported for streaming image requests"})
+            payload["client_task_id"] = idempotency_key
         timeout_secs = apply_image_timeout(identity, payload)
         log_image_request(request, identity, "/v1/images/edits", payload, timeout_secs)
-        call = LoggedCall(
-            identity,
-            "/v1/images/edits",
-            model,
-            "图生图",
-            started=request_started,
-            request_text=prompt,
-            client_task_id=str(payload.get("client_task_id") or ""),
-            request_timeout_secs=timeout_secs,
-        )
-        lease = acquire_image_concurrency(identity, units=int(payload.get("n") or 1))
         images = []
         masks = []
         try:
-            await filter_or_log(call, prompt)
             images = await read_image_sources(image_sources, spool_to_disk=True)
             masks = await read_image_sources(mask_sources, spool_to_disk=True) if mask_sources else []
             payload["images"] = images
             if masks:
                 payload["mask"] = masks
             payload["base_url"] = resolve_image_base_url(request)
-            response = await call.run(openai_v1_image_edit.handle, payload)
         except BaseException:
             cleanup_spooled_image_sources(images)
             cleanup_spooled_image_sources(masks)
-            lease.release()
             raise
 
         def cleanup_inputs() -> None:
             cleanup_spooled_image_sources(images)
             cleanup_spooled_image_sources(masks)
 
-        if isinstance(response, StreamingResponse):
-            if response.background is None:
-                response.background = BackgroundTask(cleanup_inputs)
-            else:
-                cleanup_tasks = BackgroundTasks()
-                cleanup_tasks.tasks.append(response.background)
-                cleanup_tasks.add_task(cleanup_inputs)
-                response.background = cleanup_tasks
-        else:
+        fingerprint = image_request_fingerprint("/v1/images/edits", payload) if idempotency_key else ""
+
+        async def execute_response():
+            call = LoggedCall(
+                identity,
+                "/v1/images/edits",
+                model,
+                "图生图",
+                started=request_started,
+                request_text=prompt,
+                client_task_id=idempotency_key,
+                request_timeout_secs=timeout_secs,
+            )
+            lease = acquire_image_concurrency(identity, units=int(payload.get("n") or 1))
+            try:
+                await filter_or_log(call, prompt)
+                result = await call.run(openai_v1_image_edit.handle, payload)
+                if isinstance(result, StreamingResponse):
+                    if result.background is None:
+                        result.background = BackgroundTask(cleanup_inputs)
+                    else:
+                        cleanup_tasks = BackgroundTasks()
+                        cleanup_tasks.tasks.append(result.background)
+                        cleanup_tasks.add_task(cleanup_inputs)
+                        result.background = cleanup_tasks
+                else:
+                    cleanup_inputs()
+                return release_image_concurrency_after_response(result, lease)
+            except BaseException:
+                cleanup_inputs()
+                lease.release()
+                raise
+
+        if not idempotency_key:
+            return await execute_response()
+
+        async def execute() -> CachedImageResponse:
+            return CachedImageResponse.capture(await execute_response())
+
+        try:
+            cached, replayed = await image_idempotency.run(
+                image_idempotency_scope(identity, "/v1/images/edits"),
+                idempotency_key,
+                fingerprint,
+                execute,
+                on_replay=cleanup_inputs,
+            )
+        except (ImageIdempotencyConflict, ImageIdempotencyCapacityExceeded) as exc:
             cleanup_inputs()
-        return release_image_concurrency_after_response(response, lease)
+            raise_image_idempotency_error(exc)
+        if replayed:
+            logger.info({"event": "image_idempotency_replay", "endpoint": "/v1/images/edits", "client_task_id": idempotency_key})
+        return cached.materialize()
 
     @router.post("/v1/chat/completions")
-    async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
+    async def create_chat_completion(
+        body: ChatCompletionRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         is_image_request = is_image_chat_request(payload)
+        image_units = parse_image_count(payload.get("n")) if is_image_request else 1
+        idempotency_key = ""
+        fingerprint = ""
         if is_image_request:
-            enforce_image_request_limit(identity, int(payload.get("n") or 1))
+            enforce_image_request_limit(identity, image_units)
+            idempotency_key = image_idempotency_key(request, payload.get("client_task_id"))
+            if idempotency_key:
+                if payload.get("stream"):
+                    raise HTTPException(status_code=400, detail={"error": "idempotency is not supported for streaming image requests"})
+                payload["client_task_id"] = idempotency_key
+            fingerprint = image_request_fingerprint("/v1/chat/completions", payload) if idempotency_key else ""
             apply_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("prompt"), payload.get("messages"))
-        call = LoggedCall(
-            identity,
-            "/v1/chat/completions",
-            model,
-            "文本生成",
-            request_text=request_preview,
-            request_shape=request_shape(payload.get("messages")),
-        )
-        lease = acquire_image_concurrency(identity) if is_image_request else None
+
+        async def execute_response():
+            call = LoggedCall(
+                identity,
+                "/v1/chat/completions",
+                model,
+                "图片生成" if is_image_request else "文本生成",
+                request_text=request_preview,
+                request_shape=request_shape(payload.get("messages")),
+                client_task_id=idempotency_key,
+            )
+            lease = acquire_image_concurrency(identity, units=image_units) if is_image_request else None
+            try:
+                await filter_or_log(call, request_preview)
+                result = await call.run(openai_v1_chat_complete.handle, payload)
+            except BaseException:
+                if lease is not None:
+                    lease.release()
+                raise
+            return release_image_concurrency_after_response(result, lease) if lease is not None else result
+
+        if not idempotency_key:
+            return await execute_response()
+
+        async def execute() -> CachedImageResponse:
+            return CachedImageResponse.capture(await execute_response())
+
         try:
-            await filter_or_log(call, request_preview)
-            response = await call.run(openai_v1_chat_complete.handle, payload)
-        except BaseException:
-            if lease is not None:
-                lease.release()
-            raise
-        return release_image_concurrency_after_response(response, lease) if lease is not None else response
+            cached, replayed = await image_idempotency.run(
+                image_idempotency_scope(identity, "/v1/chat/completions"),
+                idempotency_key,
+                fingerprint,
+                execute,
+            )
+        except (ImageIdempotencyConflict, ImageIdempotencyCapacityExceeded) as exc:
+            raise_image_idempotency_error(exc)
+        if replayed:
+            logger.info({"event": "image_idempotency_replay", "endpoint": "/v1/chat/completions", "client_task_id": idempotency_key})
+        return cached.materialize()
 
     @router.post("/v1/responses")
-    async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
+    async def create_response(
+        body: ResponseCreateRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         is_image_request = not openai_v1_response.is_text_response_request(payload)
+        idempotency_key = ""
+        fingerprint = ""
         if is_image_request:
+            idempotency_key = image_idempotency_key(request, payload.get("client_task_id"))
+            if idempotency_key:
+                if payload.get("stream"):
+                    raise HTTPException(status_code=400, detail={"error": "idempotency is not supported for streaming image requests"})
+                payload["client_task_id"] = idempotency_key
+            fingerprint = image_request_fingerprint("/v1/responses", payload) if idempotency_key else ""
             apply_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
-        call = LoggedCall(
-            identity,
-            "/v1/responses",
-            model,
-            "Responses",
-            request_text=request_preview,
-            request_shape=request_shape(payload.get("input")),
-        )
-        lease = acquire_image_concurrency(identity) if is_image_request else None
+
+        async def execute_response():
+            call = LoggedCall(
+                identity,
+                "/v1/responses",
+                model,
+                "Responses",
+                request_text=request_preview,
+                request_shape=request_shape(payload.get("input")),
+                client_task_id=idempotency_key,
+            )
+            lease = acquire_image_concurrency(identity) if is_image_request else None
+            try:
+                await filter_or_log(call, request_preview)
+                result = await call.run(openai_v1_response.handle, payload)
+            except BaseException:
+                if lease is not None:
+                    lease.release()
+                raise
+            return release_image_concurrency_after_response(result, lease) if lease is not None else result
+
+        if not idempotency_key:
+            return await execute_response()
+
+        async def execute() -> CachedImageResponse:
+            return CachedImageResponse.capture(await execute_response())
+
         try:
-            await filter_or_log(call, request_preview)
-            response = await call.run(openai_v1_response.handle, payload)
-        except BaseException:
-            if lease is not None:
-                lease.release()
-            raise
-        return release_image_concurrency_after_response(response, lease) if lease is not None else response
+            cached, replayed = await image_idempotency.run(
+                image_idempotency_scope(identity, "/v1/responses"),
+                idempotency_key,
+                fingerprint,
+                execute,
+            )
+        except (ImageIdempotencyConflict, ImageIdempotencyCapacityExceeded) as exc:
+            raise_image_idempotency_error(exc)
+        if replayed:
+            logger.info({"event": "image_idempotency_replay", "endpoint": "/v1/responses", "client_task_id": idempotency_key})
+        return cached.materialize()
 
     @router.post("/v1/messages")
     async def create_message(

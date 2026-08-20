@@ -1111,13 +1111,28 @@ class OpenAIBackendAPI:
             "force_parallel_switch": "auto",
         }
         path = "/backend-api/f/conversation"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json=payload,
-            timeout=self._image_request_timeout(300),
-            stream=True,
-        )
+        # curl_cffi maps a numeric timeout on streaming requests to
+        # LOW_SPEED_LIMIT=1 and LOW_SPEED_TIME=timeout.  Image SSE can be
+        # legitimately silent while the upstream job is rendering, so that
+        # heuristic turns a healthy in-flight job into curl(28) and invites a
+        # duplicate POST. Keep the connect timeout, but let the task deadline
+        # watcher below own the lifetime of the stream.
+        original_curl_options = self.session.curl_options
+        self.session.curl_options = {
+            **original_curl_options,
+            CurlOpt.LOW_SPEED_LIMIT: 0,
+            CurlOpt.LOW_SPEED_TIME: 0,
+        }
+        try:
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+                json=payload,
+                timeout=self._image_request_timeout(300),
+                stream=True,
+            )
+        finally:
+            self.session.curl_options = original_curl_options
         ensure_ok(response, path)
         return response
 

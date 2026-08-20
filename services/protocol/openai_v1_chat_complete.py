@@ -235,6 +235,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     task_deadline_ts, task_timeout_secs = image_task_timing(body)
     retention_seconds = int(body.get("image_retention_seconds") or 0)
     owner_id = str(body.get("image_owner_id") or "")
+    client_task_id = str(body.get("client_task_id") or "")
     result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
@@ -245,6 +246,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         task_timeout_secs=task_timeout_secs,
         image_retention_seconds=retention_seconds,
         image_owner_id=owner_id,
+        client_task_id=client_task_id,
     )))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
@@ -261,6 +263,7 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     task_deadline_ts, task_timeout_secs = image_task_timing(body)
     retention_seconds = int(body.get("image_retention_seconds") or 0)
     owner_id = str(body.get("image_owner_id") or "")
+    client_task_id = str(body.get("client_task_id") or "")
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
@@ -271,6 +274,7 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         task_timeout_secs=task_timeout_secs,
         image_retention_seconds=retention_seconds,
         image_owner_id=owner_id,
+        client_task_id=client_task_id,
     ))
     yield from stream_image_chat_completion(image_outputs, model)
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from services.config import config
+from services.image_concurrency import ImageConcurrencyLimitExceeded
 from services.image_task_service import ImageTaskService
 
 
@@ -29,6 +30,32 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
+    def test_queue_rejects_request_that_exceeds_static_concurrency_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=lambda _payload: {"data": [{"url": "http://example.test/image.png"}]},
+                edit_handler=lambda _payload: {"data": [{"url": "http://example.test/image.png"}]},
+                retention_days_getter=lambda: 30,
+                global_concurrency_getter=lambda: 20,
+                per_owner_concurrency_getter=lambda: 20,
+                reject_when_busy=True,
+                queue_when_busy=True,
+            )
+
+            with self.assertRaises(ImageConcurrencyLimitExceeded) as raised:
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="too-many",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    n=11,
+                )
+
+            self.assertEqual(raised.exception.scope, "owner")
+            self.assertEqual(service.list_tasks(OWNER, ["too-many"])["items"], [])
+
     def make_service(self, path: Path, handler=None) -> ImageTaskService:
         return ImageTaskService(
             path,
@@ -112,7 +139,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["status"], "error")
             self.assertEqual(task["data"], [])
 
-    def test_timed_out_unresponsive_handler_does_not_permanently_block_the_queue(self):
+    def test_timed_out_handler_keeps_slot_until_worker_really_exits(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             release_stuck = threading.Event()
             second_started = threading.Event()
@@ -138,14 +165,69 @@ class ImageTaskServiceTests(unittest.TestCase):
             wait_for_task(service, OWNER, "stuck", "error")
 
             service.submit_generation(OWNER, client_task_id="after-stuck", prompt="cat", model="gpt-image-2", size=None)
-            self.assertTrue(second_started.wait(0.5))
-            wait_for_task(service, OWNER, "after-stuck", "success")
+            time.sleep(0.1)
+            self.assertFalse(second_started.is_set())
+            queued = service.list_tasks(OWNER, ["after-stuck"])["items"][0]
+            self.assertEqual(queued["status"], "queued")
 
             with service._lock:
                 stuck_thread = service._threads.get("owner-1:stuck")
                 self.assertIsNotNone(stuck_thread)
                 self.assertTrue(stuck_thread.is_alive())
             release_stuck.set()
+            self.assertTrue(second_started.wait(0.5))
+            wait_for_task(service, OWNER, "after-stuck", "success")
+
+    def test_async_task_reserves_global_capacity_for_requested_image_count(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            release = threading.Event()
+            second_started = threading.Event()
+            other_admin = {"id": "owner-2", "name": "Other", "role": "admin"}
+
+            def handler(payload):
+                if payload["client_task_id"] == "two-images":
+                    release.wait(2)
+                else:
+                    second_started.set()
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=handler,
+                edit_handler=handler,
+                retention_days_getter=lambda: 30,
+                global_concurrency_getter=lambda: 2,
+                per_owner_concurrency_getter=lambda: 2,
+                reject_when_busy=True,
+                queue_when_busy=True,
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="two-images",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                n=2,
+            )
+            wait_for_task(service, OWNER, "two-images", "running")
+            service.submit_generation(
+                other_admin,
+                client_task_id="one-image",
+                prompt="dog",
+                model="gpt-image-2",
+                size=None,
+            )
+
+            time.sleep(0.1)
+            self.assertFalse(second_started.is_set())
+            self.assertEqual(
+                service.list_tasks(other_admin, ["one-image"])["items"][0]["status"],
+                "queued",
+            )
+            release.set()
+            wait_for_task(service, OWNER, "two-images", "success")
+            self.assertTrue(second_started.wait(0.5))
+            wait_for_task(service, other_admin, "one-image", "success")
 
     def test_list_tasks_marks_orphaned_running_task_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -284,6 +366,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             ]
             quota = mock.Mock()
             quota.reserve_daily_request.return_value = False
+            quota.image_retention_seconds.return_value = 0
             quota_patcher = mock.patch("services.image_task_service.auth_service", quota)
             quota_patcher.start()
             self.addCleanup(quota_patcher.stop)
@@ -324,6 +407,48 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual(max_running, 3)
             self.assertTrue(all(value == 1 for value in max_running_by_owner.values()))
+
+    def test_busy_shared_gate_keeps_task_queued_without_dispatch_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            release = threading.Event()
+
+            def handler(payload):
+                if payload["client_task_id"] == "first":
+                    release.wait(2)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=handler,
+                edit_handler=handler,
+                retention_days_getter=lambda: 30,
+                global_concurrency_getter=lambda: 1,
+                per_owner_concurrency_getter=lambda: 1,
+                reject_when_busy=True,
+                queue_when_busy=True,
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="first",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+            )
+            wait_for_task(service, OWNER, "first", "running")
+
+            second = service.submit_generation(
+                OWNER,
+                client_task_id="second",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+            )
+
+            self.assertEqual(second["status"], "queued")
+            self.assertEqual(service.list_tasks(OWNER, ["second"])["items"][0]["status"], "queued")
+            release.set()
+            wait_for_task(service, OWNER, "first", "success")
+            wait_for_task(service, OWNER, "second", "success")
 
     def test_admin_can_fill_ten_concurrency_slots(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -646,12 +771,13 @@ class ImageTaskServiceTests(unittest.TestCase):
             ]
             quota = mock.Mock()
             quota.reserve_daily_request.return_value = False
+            quota.image_retention_seconds.return_value = 0
             with mock.patch("services.image_task_service.auth_service", quota):
                 for thread in submitters:
                     thread.start()
                 start_gate.wait()
                 for thread in submitters:
-                    thread.join(timeout=5)
+                    thread.join(timeout=10)
                     self.assertFalse(thread.is_alive())
                 completed = [
                     wait_for_task(service, owner, f"{owner['id']}:{task_index}", "success", timeout=5)

@@ -61,6 +61,34 @@ class BackendSessionLifecycleTests(unittest.TestCase):
         self.assertEqual(result["file_size"], len(png))
         self.assertEqual(result["mime_type"], "image/png")
 
+    def test_image_sse_disables_low_speed_timeout_only_for_stream_setup(self) -> None:
+        session = mock.Mock(headers={}, curl_options={CurlOpt.LOW_SPEED_LIMIT: 1, CurlOpt.LOW_SPEED_TIME: 30})
+        response = mock.Mock(status_code=200, headers={})
+        seen_options = {}
+
+        def start_request(_url, **_kwargs):
+            seen_options.update(session.curl_options)
+            return response
+
+        session.post.side_effect = start_request
+        backend = object.__new__(openai_backend_api.OpenAIBackendAPI)
+        backend.session = session
+        backend.base_url = "https://chatgpt.com"
+        backend.image_deadline_ts = None
+        backend.image_cancel_event = None
+        backend.image_task_timeout_secs = 180
+
+        backend._start_image_generation(
+            "draw a cat",
+            openai_backend_api.ChatRequirements(token="requirements"),
+            "conduit",
+            "gpt-image-2",
+        )
+
+        self.assertEqual(seen_options[CurlOpt.LOW_SPEED_LIMIT], 0)
+        self.assertEqual(seen_options[CurlOpt.LOW_SPEED_TIME], 0)
+        self.assertEqual(session.curl_options, {CurlOpt.LOW_SPEED_LIMIT: 1, CurlOpt.LOW_SPEED_TIME: 30})
+
     def test_backend_close_is_idempotent_and_context_managed(self) -> None:
         session = RecordingSession()
 

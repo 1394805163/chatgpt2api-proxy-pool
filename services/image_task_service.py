@@ -18,6 +18,7 @@ from services.auth_service import auth_service
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.image_concurrency import (
     ImageConcurrencyGate,
+    ImageConcurrencyLimitExceeded,
     ImageConcurrencyLease,
     image_concurrency_gate,
     image_owner_limit,
@@ -387,6 +388,7 @@ class ImageTaskService:
             raise ValueError("client_task_id is required")
         payload["client_task_id"] = task_id
         owner = _owner_id(identity)
+        requested_units = max(1, int(payload.get("n") or 1))
         payload["image_retention_seconds"] = auth_service.image_retention_seconds(identity)
         payload["image_owner_id"] = owner
         key = _task_key(owner, task_id)
@@ -404,11 +406,12 @@ class ImageTaskService:
                 if cleaned:
                     self._save_locked()
                 return _public_task(task)
+            requested_units = self._validate_requested_units(identity, requested_units)
             if self.queue_when_busy:
                 self._ensure_queue_capacity_locked(identity)
                 lease = None
             else:
-                lease = self._acquire_concurrency(identity)
+                lease = self._acquire_concurrency(identity, units=requested_units)
             try:
                 quota_reserved = auth_service.reserve_daily_request(identity, quota_reservation_id)
             except BaseException:
@@ -486,16 +489,12 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if (
                 task
-                and task.get("status") in UNFINISHED_STATUSES
                 and (owner is None or task.get("owner_id") == owner)
             ):
                 count += 1
         for key in stale_keys:
             self._threads.pop(key, None)
         return count
-
-    def _physical_thread_count_locked(self) -> int:
-        return sum(1 for thread in self._threads.values() if thread.is_alive())
 
     def _global_concurrency(self) -> int:
         try:
@@ -517,14 +516,39 @@ class ImageTaskService:
             return min(self._per_owner_concurrency(), global_limit)
         return image_owner_limit(identity, global_limit)
 
-    def _acquire_concurrency(self, identity: dict[str, object]) -> ImageConcurrencyLease | None:
+    def _acquire_concurrency(
+        self,
+        identity: dict[str, object],
+        *,
+        units: int = 1,
+    ) -> ImageConcurrencyLease | None:
         if not self.reject_when_busy:
             return None
         return self.concurrency_gate.try_acquire(
             identity,
             global_limit=self._global_concurrency(),
             owner_limit=self._owner_concurrency(identity),
+            units=max(1, int(units)),
         )
+
+    def _validate_requested_units(self, identity: dict[str, object], units: int) -> int:
+        """Reject a request that can never fit, even when queueing is enabled."""
+        normalized_units = max(1, int(units))
+        global_limit = self._global_concurrency()
+        if normalized_units > global_limit:
+            raise ImageConcurrencyLimitExceeded("request", global_limit)
+        owner_limit = self._owner_concurrency(identity)
+        if normalized_units > owner_limit:
+            raise ImageConcurrencyLimitExceeded("owner", owner_limit)
+        return normalized_units
+
+    @classmethod
+    def _pending_units(cls, pending: object) -> int:
+        payload = cls._pending_payload(pending)
+        try:
+            return max(1, int(payload.get("n") or 1)) if payload is not None else 1
+        except (TypeError, ValueError):
+            return 1
 
     def _queue_timeout(self) -> float:
         try:
@@ -618,14 +642,10 @@ class ImageTaskService:
             while True:
                 with self._lock:
                     global_limit = self._global_concurrency()
-                    # Timed-out network calls may take a moment to unwind. Keep two
-                    # bypass slots so later work can progress without allowing stale
-                    # threads to double the configured concurrency and memory usage.
-                    hard_thread_limit = global_limit + 2
-                    if (
-                        self._running_count_locked() >= global_limit
-                        or self._physical_thread_count_locked() >= hard_thread_limit
-                    ):
+                    # A timed-out task still consumes memory and sockets until its
+                    # worker really exits. Keep it in the physical concurrency count
+                    # even after its public task state has become terminal.
+                    if self._running_count_locked() >= global_limit:
                         return
                     selected = self._take_next_pending_locked()
                 if selected is None:
@@ -634,7 +654,10 @@ class ImageTaskService:
                 running_args = args
                 try:
                     if self.queue_when_busy:
-                        lease = self._acquire_concurrency(identity)
+                        lease = self._acquire_concurrency(
+                            identity,
+                            units=self._pending_units((target, args, identity, name)),
+                        )
                         if lease is None:
                             raise RuntimeError("image concurrency gate is not configured")
                         running_args = (*args[:-1], lease)

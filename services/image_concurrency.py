@@ -86,15 +86,15 @@ class ImageConcurrencyGate:
             if self._active_total + normalized_units > normalized_global_limit:
                 raise ImageConcurrencyLimitExceeded("global", normalized_global_limit)
             owner_active = self._active_by_owner.get(owner, 0)
-            if owner_active >= normalized_owner_limit:
+            if owner_active + normalized_units > normalized_owner_limit:
                 raise ImageConcurrencyLimitExceeded("owner", normalized_owner_limit)
             self._active_total += normalized_units
-            self._active_by_owner[owner] = owner_active + 1
+            self._active_by_owner[owner] = owner_active + normalized_units
 
         def release() -> None:
             with self._lock:
                 self._active_total = max(0, self._active_total - normalized_units)
-                remaining = self._active_by_owner.get(owner, 0) - 1
+                remaining = self._active_by_owner.get(owner, 0) - normalized_units
                 if remaining > 0:
                     self._active_by_owner[owner] = remaining
                 else:

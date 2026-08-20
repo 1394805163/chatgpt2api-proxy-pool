@@ -102,6 +102,21 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(payload["status"], "success")
         self.assertEqual(len(self.fake_service.generation_calls), 1)
 
+    def test_generation_task_enforces_per_key_image_count_limit(self):
+        user = {"id": "user-1", "name": "User", "role": "user"}
+        with (
+            mock.patch.object(image_tasks_module, "require_identity", return_value=user),
+            mock.patch.object(image_tasks_module, "enforce_image_request_limit") as enforce,
+        ):
+            response = self.client.post(
+                "/api/image-tasks/generations",
+                headers=AUTH_HEADERS,
+                json={"client_task_id": "task-2", "prompt": "cats", "model": "gpt-image-2", "n": 3},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        enforce.assert_called_once_with(user, 3)
+
     def test_create_edit_task_accepts_multiple_images(self):
         """测试图片编辑任务接口支持多个上传图片。"""
         response = self.client.post(

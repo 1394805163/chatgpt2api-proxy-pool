@@ -301,7 +301,11 @@ class LogService:
         display_timezone: str = DEFAULT_DISPLAY_TIMEZONE,
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        for item in self._all_items(type=type, limit=limit):
+        # Date filters may target older records, so load the complete source
+        # set before applying the response limit. The API still bounds the
+        # returned page and runs this work off the event loop.
+        source_limit = None if start_date or end_date else limit
+        for item in self._all_items(type=type, limit=source_limit):
             if not self._matches_filters(
                 item,
                 type=type,

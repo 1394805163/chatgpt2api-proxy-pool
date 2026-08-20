@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +15,7 @@ import api.ai as ai_api
 import api.support as api_support
 from services.auth_service import AuthService
 from services.config import config
+from services.protocol.conversation import ImageGenerationError
 from services.storage.json_storage import JSONStorageBackend
 
 
@@ -170,6 +173,99 @@ class ApiRequestQuotaTests(unittest.TestCase):
         self.assertEqual(payload["client_task_id"], "ximage-test-1")
         self.assertGreaterEqual(payload["task_deadline_ts"], started + 299.0)
 
+    def test_direct_generation_coalesces_same_client_task_id(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def handler(_payload):
+            started.set()
+            release.wait(2)
+            return {"created": 1, "data": [{"url": "https://example.test/image.png"}]}
+
+        with mock.patch.object(ai_api.openai_v1_image_generations, "handle", side_effect=handler) as upstream:
+            def submit():
+                return self.client.post(
+                    "/v1/images/generations",
+                    headers={"Authorization": "Bearer user"},
+                    json={"model": "gpt-image-2", "prompt": "one cat", "client_task_id": "same-task"},
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(submit)
+                self.assertTrue(started.wait(1))
+                second = executor.submit(submit)
+                time.sleep(0.1)
+                self.assertEqual(upstream.call_count, 1)
+                release.set()
+                first_response = first.result(timeout=2)
+                second_response = second.result(timeout=2)
+
+        self.assertEqual(first_response.status_code, 200, first_response.text)
+        self.assertEqual(second_response.status_code, 200, second_response.text)
+        self.assertEqual(first_response.json(), second_response.json())
+        self.assertEqual(upstream.call_count, 1)
+
+    def test_idempotency_key_rejects_different_generation_payload(self) -> None:
+        with mock.patch.object(
+            ai_api.openai_v1_image_generations,
+            "handle",
+            return_value={"created": 1, "data": [{"url": "https://example.test/image.png"}]},
+        ) as upstream:
+            first = self.client.post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer user", "Idempotency-Key": "fixed-key"},
+                json={"model": "gpt-image-2", "prompt": "one cat"},
+            )
+            conflict = self.client.post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer user", "Idempotency-Key": "fixed-key"},
+                json={"model": "gpt-image-2", "prompt": "one dog"},
+            )
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertEqual(upstream.call_count, 1)
+
+    def test_idempotency_key_replays_poll_timeout_without_a_second_upstream_post(self) -> None:
+        timeout = ImageGenerationError(
+            "upstream image polling timed out",
+            status_code=504,
+            code="image_poll_timeout",
+            conversation_id="conversation-poll-timeout",
+        )
+        with mock.patch.object(ai_api.openai_v1_image_generations, "handle", side_effect=timeout) as upstream:
+            first = self.client.post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer user", "Idempotency-Key": "poll-timeout-key"},
+                json={"model": "gpt-image-2", "prompt": "one cat"},
+            )
+            second = self.client.post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer user", "Idempotency-Key": "poll-timeout-key"},
+                json={"model": "gpt-image-2", "prompt": "one cat"},
+            )
+
+        self.assertEqual(first.status_code, 504, first.text)
+        self.assertEqual(second.status_code, 504, second.text)
+        self.assertEqual(first.json(), second.json())
+        self.assertEqual(upstream.call_count, 1)
+
+    def test_admin_requested_images_respect_owner_concurrency_units(self) -> None:
+        admin = {"id": "admin", "name": "admin", "role": "admin"}
+        with (
+            mock.patch.object(ai_api, "require_identity", return_value=admin),
+            mock.patch.object(ai_api.openai_v1_image_generations, "handle") as handler,
+        ):
+            response = self.client.post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer admin"},
+                json={"model": "gpt-image-2", "prompt": "eleven cats", "n": 11},
+            )
+
+        self.assertEqual(response.status_code, 429, response.text)
+        self.assertEqual(response.json()["detail"]["scope"], "owner")
+        handler.assert_not_called()
+
     def test_user_image_chat_request_receives_configured_timeout(self) -> None:
         with (
             mock.patch.dict(config.data, {"user_image_task_timeout_secs": 210}),
@@ -188,6 +284,49 @@ class ApiRequestQuotaTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         payload = handler.call_args.args[0]
         self.assertEqual(payload["task_timeout_secs"], 210.0)
+
+    def test_image_chat_counts_each_requested_image_for_global_concurrency(self) -> None:
+        admin = {"id": "admin", "name": "admin", "role": "admin"}
+        with (
+            mock.patch.object(ai_api, "require_identity", return_value=admin),
+            mock.patch.dict(config.data, {"image_global_concurrency": 3}),
+            mock.patch.object(ai_api.openai_v1_chat_complete, "handle") as handler,
+        ):
+            response = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer admin"},
+                json={"model": "gpt-image-2", "prompt": "four cats", "n": 4},
+            )
+
+        self.assertEqual(response.status_code, 429, response.text)
+        self.assertEqual(response.json()["detail"]["scope"], "request")
+        handler.assert_not_called()
+
+    def test_image_response_replays_same_idempotency_key(self) -> None:
+        admin = {"id": "admin", "name": "admin", "role": "admin"}
+        result = {
+            "id": "resp_test",
+            "object": "response",
+            "status": "completed",
+            "output": [],
+        }
+        body = {
+            "model": "gpt-image-2",
+            "input": "one cat",
+            "tools": [{"type": "image_generation"}],
+            "client_task_id": "response-task",
+        }
+        with (
+            mock.patch.object(ai_api, "require_identity", return_value=admin),
+            mock.patch.object(ai_api.openai_v1_response, "handle", return_value=result) as handler,
+        ):
+            first = self.client.post("/v1/responses", headers={"Authorization": "Bearer admin"}, json=body)
+            second = self.client.post("/v1/responses", headers={"Authorization": "Bearer admin"}, json=body)
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(handler.call_count, 1)
+        self.assertEqual(handler.call_args.args[0]["client_task_id"], "response-task")
 
     def test_user_text_request_does_not_receive_image_timeout(self) -> None:
         with mock.patch.object(

@@ -15,5 +15,8 @@ README.md
 data
 .env
 .env.*
+config.json
+config.json.backup-*
+backups
 .learnings
 .learnings/

@@ -99,7 +99,7 @@ def is_tls_connection_error(message: str) -> bool:
 
 
 def is_connection_timeout_error(message: str) -> bool:
-    """检测连接超时错误（如 curl 28），这类错误可通过同账号短等待重试解决。"""
+    """Detect curl/read timeout failures from the upstream image stream."""
     text = str(message or "").lower()
     return (
         "curl: (28)" in text
@@ -107,6 +107,47 @@ def is_connection_timeout_error(message: str) -> bool:
         or "connection timed out" in text
         or "read timed out" in text
         or "connect timeout" in text
+    )
+
+
+CONNECTION_TIMEOUT_RECEIVED_BYTES_RE = re.compile(
+    r"\bwith\s+(\d+)\s+bytes\s+received\b",
+    re.IGNORECASE,
+)
+
+
+def connection_timeout_received_bytes(message: str) -> int | None:
+    match = CONNECTION_TIMEOUT_RECEIVED_BYTES_RE.search(str(message or ""))
+    if match is None:
+        return None
+    try:
+        return max(0, int(match.group(1)))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_pre_request_connection_timeout_error(message: str) -> bool:
+    """Return true only when a retry cannot have submitted an upstream job.
+
+    A curl timeout after response body bytes are received is ambiguous: the
+    upstream may already have created the image. Retrying those requests can
+    create duplicate generations, so only a pure connect timeout or an
+    explicitly zero-byte timeout is eligible for the one-shot retry below.
+    """
+    text = str(message or "").lower()
+    if not is_connection_timeout_error(text):
+        return False
+    received_bytes = connection_timeout_received_bytes(text)
+    if received_bytes is not None:
+        # A zero-byte response is the only body-timeout case retained as a
+        # retry candidate. Once any body bytes arrived, the upstream job may
+        # already exist and a second POST is unsafe.
+        return received_bytes == 0 and "operation timed out" in text
+    return (
+        "connection timed out" in text
+        and "operation timed out" not in text
+        and "operation too slow" not in text
+        and "read timed out" not in text
     )
 
 
@@ -955,37 +996,56 @@ def stream_image_outputs(
         total: int = 1,
 ) -> Iterator[ImageOutput]:
     last: dict[str, Any] = {}
-    for event in conversation_events(
-            backend,
-            prompt=request.prompt,
-            model=request.model,
-            images=request.images or [],
-            size=request.size,
-            quality=request.quality,
-            task_deadline_ts=request.task_deadline_ts,
-            cancel_event=request.cancel_event,
-    ):
-        last = event
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
+    try:
+        for event in conversation_events(
+                backend,
+                prompt=request.prompt,
                 model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
-            )
-            continue
-        if event.get("type") == "conversation.event":
-            raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-            )
+                images=request.images or [],
+                size=request.size,
+                quality=request.quality,
+                task_deadline_ts=request.task_deadline_ts,
+                cancel_event=request.cancel_event,
+        ):
+            last = event
+            if event.get("type") == "conversation.delta":
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    text=str(event.get("delta") or ""),
+                    upstream_event_type="conversation.delta",
+                )
+                continue
+            if event.get("type") == "conversation.event":
+                raw = event.get("raw")
+                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    upstream_event_type=raw_type,
+                )
+    except Exception as exc:
+        conversation_id = str(last.get("conversation_id") or "")
+        received_bytes = connection_timeout_received_bytes(str(exc))
+        if conversation_id and is_connection_timeout_error(str(exc)):
+            # The upstream generation has already been created. Continue with
+            # the existing conversation instead of submitting a duplicate.
+            logger.warning({
+                "event": "image_stream_partial_timeout_resume_poll",
+                "conversation_id": conversation_id,
+                "received_bytes": received_bytes,
+            })
+        else:
+            if conversation_id and not getattr(exc, "conversation_id", ""):
+                try:
+                    setattr(exc, "conversation_id", conversation_id)
+                except Exception:
+                    pass
+            raise
 
     conversation_id = str(last.get("conversation_id") or "")
     file_ids = [str(item) for item in last.get("file_ids") or []]
@@ -1420,15 +1480,14 @@ def _generate_single_image(
     MAX_TEXT_REPLY_RETRIES = 3
     # TLS 连接错误最大重试次数
     MAX_TLS_RETRIES = 3
-    # 连接超时错误最大重试次数（同账号短等待重试）
-    MAX_CONN_TIMEOUT_RETRIES = 3
-    # 轮询超时错误最大重试次数（换账号重试）
-    MAX_POLL_TIMEOUT_RETRIES = 4
+    # Only retry once when no response bytes were received. A partial SSE
+    # response means the upstream generation may already exist, so resubmitting
+    # can create duplicate images.
+    MAX_CONN_TIMEOUT_RETRIES = 1
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
-    poll_timeout_retry_count = 0
     account_email = ""
 
     while True:
@@ -1451,7 +1510,18 @@ def _generate_single_image(
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
         if account_email and request.progress_callback:
-            request.progress_callback(f"account_email:{account_email}")
+            try:
+                request.progress_callback(f"account_email:{account_email}")
+            except Exception as exc:
+                # Progress reporting is auxiliary. A storage/UI callback
+                # failure must not strand the acquired account image slot or
+                # turn a valid upstream generation into a retry.
+                logger.warning({
+                    "event": "image_progress_callback_failed",
+                    "account_email": account_email,
+                    "index": index,
+                    "error": str(exc)[:200],
+                })
         logger.debug({
             "event": "image_account_lookup",
             "client_task_id": request.client_task_id,
@@ -1527,28 +1597,26 @@ def _generate_single_image(
             record_image_failure(token, str(exc), "image_poll_timeout")
             if account_email:
                 setattr(exc, "account_email", account_email)
-            # 轮询超时：换账号重试
-            if not emitted_for_token:
-                poll_timeout_retry_count += 1
-                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
-                    logger.warning({
-                        "event": "image_poll_timeout_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": poll_timeout_retry_count,
-                        "index": index,
-                        "error": str(exc)[:200],
-                    })
-                    continue
-                logger.warning({
-                    "event": "image_poll_timeout_exhausted_retries",
-                    "request_token": token,
-                    "account_email": account_email,
-                    "retry_count": poll_timeout_retry_count,
-                    "index": index,
-                })
-                raise
-            raise
+            # The conversation already exists upstream. Re-submitting with a
+            # different account here can create a duplicate image while the
+            # original job is still running. Return the conversation ID so an
+            # async caller can use the dedicated resume-poll endpoint.
+            logger.warning({
+                "event": "image_poll_timeout_no_resubmit",
+                "request_token": token,
+                "account_email": account_email,
+                "conversation_id": str(getattr(exc, "conversation_id", "") or ""),
+                "index": index,
+                "error": str(exc)[:200],
+            })
+            raise ImageGenerationError(
+                str(exc) or "upstream image polling timed out",
+                status_code=504,
+                error_type="server_error",
+                code="image_poll_timeout",
+                account_email=account_email,
+                conversation_id=str(getattr(exc, "conversation_id", "") or ""),
+            ) from exc
         except ImageContentPolicyError as exc:
             record_image_failure(token, str(exc), "image_content_policy", verify_free_account=False)
             logger.warning({
@@ -1652,26 +1720,43 @@ def _generate_single_image(
                     })
                     time.sleep(min(2.0 * tls_retry_count, 10.0))
                     continue
-            # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
+            # Retry only when the TCP connection timed out before an HTTP
+            # response could be established. Any response/body timeout is
+            # ambiguous because the upstream may already have created a job.
             if not emitted_for_token and is_connection_timeout_error(last_error):
                 record_image_failure(token, last_error, "image_stream_timeout", verify_free_account=False)
-                conn_timeout_retry_count += 1
-                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
-                    wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
+                received_bytes = connection_timeout_received_bytes(last_error)
+                if is_pre_request_connection_timeout_error(last_error):
+                    conn_timeout_retry_count += 1
+                    if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
+                        wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
+                        logger.warning({
+                            "event": "image_stream_conn_timeout_retry",
+                            "request_token": token,
+                            "account_email": account_email,
+                            "retry_count": conn_timeout_retry_count,
+                            "index": index,
+                            "wait_secs": wait_secs,
+                            "error": last_error[:200],
+                        })
+                        time.sleep(wait_secs)
+                        continue
+                else:
                     logger.warning({
-                        "event": "image_stream_conn_timeout_retry",
+                        "event": "image_stream_timeout_no_resubmit",
                         "request_token": token,
                         "account_email": account_email,
-                        "retry_count": conn_timeout_retry_count,
+                        "received_bytes": received_bytes,
                         "index": index,
-                        "wait_secs": wait_secs,
                         "error": last_error[:200],
                     })
-                    time.sleep(wait_secs)
-                    continue
             if not is_tls_connection_error(last_error) and not is_connection_timeout_error(last_error):
                 record_image_failure(token, last_error, "image_stream")
-            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+            raise ImageGenerationError(
+                image_stream_error_message(last_error),
+                account_email=account_email,
+                conversation_id=str(getattr(exc, "conversation_id", "") or ""),
+            ) from exc
         finally:
             if backend is not None:
                 backend.close()

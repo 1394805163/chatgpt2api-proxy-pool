@@ -46,7 +46,9 @@ WORKDIR /app
 COPY --from=python-deps /app/.venv /app/.venv
 
 COPY main.py ./
-COPY config.json ./
+# Runtime configuration is mounted or supplied through environment variables.
+# Never embed the workstation's config.json or credentials in a distributable image.
+COPY config.container.json ./config.json
 COPY VERSION ./
 COPY api ./api
 COPY services ./services

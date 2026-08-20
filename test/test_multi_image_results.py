@@ -16,6 +16,7 @@ from services.protocol.conversation import (
     ImageOutput,
     _generate_single_image,
     extract_conversation_ids,
+    is_pre_request_connection_timeout_error,
     stream_image_outputs,
 )
 from services.protocol.openai_v1_response import stream_image_response
@@ -86,6 +87,12 @@ class FakeStreamingResponse:
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_timeout_retry_classifier_rejects_partial_and_slow_streams(self) -> None:
+        self.assertTrue(is_pre_request_connection_timeout_error("curl: (28) Connection timed out after 30000 milliseconds"))
+        self.assertTrue(is_pre_request_connection_timeout_error("curl: (28) Operation timed out after 30000 milliseconds with 0 bytes received"))
+        self.assertFalse(is_pre_request_connection_timeout_error("curl: (28) Operation timed out after 30000 milliseconds with 49125 bytes received"))
+        self.assertFalse(is_pre_request_connection_timeout_error("curl: (28) Operation too slow. Less than 1 bytes/sec transferred"))
+
     def test_encode_images_preserves_spooled_file_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             image_path = Path(tmp_dir) / "reference.png"
@@ -345,15 +352,109 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual(backend.resolve_conversation_image_urls.call_args.kwargs["poll_timeout_secs"], 180)
 
-    def test_progress_event_does_not_block_poll_timeout_retry(self) -> None:
+    def test_poll_timeout_is_not_resubmitted_after_upstream_job_exists(self) -> None:
+        attempts = 0
+
+        def stream_outputs(_backend, _request, index, total):
+            nonlocal attempts
+            attempts += 1
+            yield ImageOutput(kind="progress", model="gpt-image-2", index=index, total=total)
+            error = ImagePollTimeoutError("poll timed out")
+            error.conversation_id = "conversation-poll-timeout"
+            raise error
+
+        with (
+            mock.patch.object(account_service, "get_available_access_token", return_value="token-1"),
+            mock.patch.object(account_service, "get_account", return_value={"email": "test@example.com"}),
+            mock.patch.object(account_service, "mark_image_result"),
+            mock.patch("services.protocol.conversation.record_image_failure"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream_outputs),
+        ):
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
+
+        self.assertEqual(attempts, 1)
+        self.assertEqual(raised.exception.status_code, 504)
+        self.assertEqual(raised.exception.conversation_id, "conversation-poll-timeout")
+
+    def test_partial_stream_timeout_is_not_resubmitted(self) -> None:
+        attempts = 0
+
+        def stream_outputs(_backend, _request, _index, _total):
+            nonlocal attempts
+            attempts += 1
+            error = RuntimeError(
+                "Failed to perform, curl: (28) Operation timed out after 30000 milliseconds "
+                "with 49125 bytes received."
+            )
+            error.conversation_id = "conversation-partial-timeout"
+            raise error
+            yield
+
+        with (
+            mock.patch.object(account_service, "get_available_access_token", return_value="token-1") as get_token,
+            mock.patch.object(account_service, "get_account", return_value={"email": "test@example.com"}),
+            mock.patch("services.protocol.conversation.record_image_failure"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream_outputs),
+            mock.patch("services.protocol.conversation.time.sleep") as retry_sleep,
+        ):
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
+
+        self.assertEqual(attempts, 1)
+        get_token.assert_called_once()
+        retry_sleep.assert_not_called()
+        self.assertEqual(raised.exception.conversation_id, "conversation-partial-timeout")
+
+    def test_partial_stream_timeout_resumes_existing_conversation_poll(self) -> None:
+        backend = FakeBackend()
+        backend.resolve_conversation_image_urls = mock.Mock(return_value=["https://files.test/one.png"])
+        backend.download_image_bytes = mock.Mock(return_value=[b"image-bytes"])
+
+        def partial_events(*_args, **_kwargs):
+            yield {
+                "type": "conversation.event",
+                "conversation_id": "conversation-partial-timeout",
+                "file_ids": [],
+                "sediment_ids": [],
+                "turn_use_case": "image gen",
+                "raw": {"type": "conversation.created"},
+            }
+            raise RuntimeError(
+                "Failed to perform, curl: (28) Operation timed out after 30000 milliseconds "
+                "with 49125 bytes received."
+            )
+
+        with (
+            mock.patch("services.protocol.conversation.conversation_events", side_effect=partial_events),
+            mock.patch("services.protocol.conversation._get_detailed_error_from_tasks", return_value=""),
+        ):
+            outputs = list(stream_image_outputs(
+                backend,
+                ConversationRequest(model="gpt-image-2", prompt="draw a cat", response_format="b64_json"),
+            ))
+
+        backend.resolve_conversation_image_urls.assert_called_once_with(
+            "conversation-partial-timeout",
+            [],
+            [],
+            poll_timeout_secs=mock.ANY,
+        )
+        self.assertTrue(any(output.kind == "result" for output in outputs))
+
+    def test_zero_byte_connection_timeout_retries_once(self) -> None:
         attempts = 0
 
         def stream_outputs(_backend, _request, index, total):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
-                yield ImageOutput(kind="progress", model="gpt-image-2", index=index, total=total)
-                raise ImagePollTimeoutError("poll timed out")
+                raise RuntimeError(
+                    "Failed to perform, curl: (28) Operation timed out after 30000 milliseconds "
+                    "with 0 bytes received."
+                )
             yield ImageOutput(
                 kind="result",
                 model="gpt-image-2",
@@ -369,10 +470,12 @@ class MultiImageResultTests(unittest.TestCase):
             mock.patch("services.protocol.conversation.record_image_failure"),
             mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
             mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream_outputs),
+            mock.patch("services.protocol.conversation.time.sleep") as retry_sleep,
         ):
             outputs = _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
 
         self.assertEqual(attempts, 2)
+        retry_sleep.assert_called_once_with(3.0)
         self.assertTrue(any(output.kind == "result" for output in outputs))
 
     def test_responses_stream_emits_all_image_output_items(self) -> None:
