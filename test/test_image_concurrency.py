@@ -42,6 +42,15 @@ class ImageConcurrencyGateTests(unittest.TestCase):
         for lease in leases:
             lease.release()
 
+    def test_batch_request_consumes_one_slot_per_image(self) -> None:
+        gate = ImageConcurrencyGate()
+        admin = {"id": "admin", "role": "admin"}
+        lease = gate.try_acquire(admin, global_limit=10, units=10)
+        with self.assertRaises(ImageConcurrencyLimitExceeded) as error:
+            gate.try_acquire({"id": "other", "role": "user", "image_concurrency_limit": 2}, global_limit=10)
+        self.assertEqual(error.exception.scope, "global")
+        lease.release()
+
 
 if __name__ == "__main__":
     unittest.main()

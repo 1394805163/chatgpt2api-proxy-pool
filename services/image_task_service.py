@@ -194,12 +194,13 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        n: int = 1,
         base_url: str = "",
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
             "model": model,
-            "n": 1,
+            "n": max(1, min(100, int(n))),
             "size": size,
             "quality": quality,
             "response_format": "url",
@@ -216,6 +217,7 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        n: int = 1,
         base_url: str = "",
         images: list[tuple[bytes | str, str, str]] | None = None,
         masks: list[tuple[bytes | str, str, str]] | None = None,
@@ -228,7 +230,7 @@ class ImageTaskService:
             "images": images or [],
             "mask": masks or [],
             "model": model,
-            "n": 1,
+            "n": max(1, min(100, int(n))),
             "size": size,
             "quality": quality,
             "response_format": "url",
@@ -411,12 +413,15 @@ class ImageTaskService:
                 if cleaned:
                     self._save_locked()
                 return _public_task(task)
+            quota_units = self._validate_requested_units(
+                identity,
+                max(1, int(payload.get("n") or 1)),
+            )
             if self.queue_when_busy:
                 self._ensure_queue_capacity_locked(identity)
                 lease = None
             else:
-                lease = self._acquire_concurrency(identity)
-            quota_units = max(1, int(payload.get("n") or 1))
+                lease = self._acquire_concurrency(identity, units=quota_units)
             try:
                 quota_reserved = auth_service.reserve_daily_request(
                     identity,
@@ -529,14 +534,39 @@ class ImageTaskService:
             return min(self._per_owner_concurrency(), global_limit)
         return image_owner_limit(identity, global_limit)
 
-    def _acquire_concurrency(self, identity: dict[str, object]) -> ImageConcurrencyLease | None:
+    def _acquire_concurrency(
+        self,
+        identity: dict[str, object],
+        *,
+        units: int = 1,
+    ) -> ImageConcurrencyLease | None:
         if not self.reject_when_busy:
             return None
         return self.concurrency_gate.try_acquire(
             identity,
             global_limit=self._global_concurrency(),
             owner_limit=self._owner_concurrency(identity),
+            units=max(1, int(units)),
         )
+
+    def _validate_requested_units(self, identity: dict[str, object], units: int) -> int:
+        """Reject work that can never fit instead of leaving it queued forever."""
+        normalized_units = max(1, int(units))
+        global_limit = self._global_concurrency()
+        if normalized_units > global_limit:
+            raise ImageConcurrencyLimitExceeded("request", global_limit)
+        owner_limit = self._owner_concurrency(identity)
+        if normalized_units > owner_limit:
+            raise ImageConcurrencyLimitExceeded("owner", owner_limit)
+        return normalized_units
+
+    @classmethod
+    def _pending_units(cls, pending: object) -> int:
+        payload = cls._pending_payload(pending)
+        try:
+            return max(1, int(payload.get("n") or 1)) if payload is not None else 1
+        except (TypeError, ValueError):
+            return 1
 
     def _queue_timeout(self) -> float:
         try:
@@ -630,14 +660,9 @@ class ImageTaskService:
             while True:
                 with self._lock:
                     global_limit = self._global_concurrency()
-                    # Timed-out network calls may take a moment to unwind. Keep two
-                    # bypass slots so later work can progress without allowing stale
-                    # threads to double the configured concurrency and memory usage.
-                    hard_thread_limit = global_limit + 2
-                    if (
-                        self._running_count_locked() >= global_limit
-                        or self._physical_thread_count_locked() >= hard_thread_limit
-                    ):
+                    # A timed-out task still owns sockets and memory until its worker
+                    # exits, so do not create bypass threads above the configured limit.
+                    if self._running_count_locked() >= global_limit:
                         return
                     selected = self._take_next_pending_locked()
                 if selected is None:
@@ -646,7 +671,10 @@ class ImageTaskService:
                 running_args = args
                 try:
                     if self.queue_when_busy:
-                        lease = self._acquire_concurrency(identity)
+                        lease = self._acquire_concurrency(
+                            identity,
+                            units=self._pending_units((target, args, identity, name)),
+                        )
                         if lease is None:
                             raise RuntimeError("image concurrency gate is not configured")
                         running_args = (*args[:-1], lease)
@@ -1266,9 +1294,14 @@ class ImageTaskService:
                 raise ValueError("original image task is still shutting down")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
-            lease = self._acquire_concurrency(identity)
+            requested_units = max(1, int(task.get("quota_units") or 1))
+            lease = self._acquire_concurrency(identity, units=requested_units)
             try:
-                quota_reserved = auth_service.reserve_daily_request(identity, reservation_id)
+                quota_reserved = auth_service.reserve_daily_request(
+                    identity,
+                    reservation_id,
+                    units=requested_units,
+                )
             except BaseException:
                 if lease is not None:
                     lease.release()

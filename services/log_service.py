@@ -512,10 +512,16 @@ class LoggedCall:
     def _result_quota_units(self, result: object) -> int | None:
         if not self.quota_is_image:
             return None
-        if isinstance(result, dict):
-            data = result.get("data")
-            if isinstance(data, list):
-                return len(data)
+        if isinstance(result, dict) and isinstance(result.get("data"), list):
+            return len(result["data"])
+        if isinstance(result, dict) and isinstance(result.get("output"), list):
+            return sum(
+                1
+                for item in result["output"]
+                if isinstance(item, dict)
+                and str(item.get("type") or "").strip() == "image_generation_call"
+                and str(item.get("result") or "").strip()
+            )
         return 0
 
     async def run(self, handler, *args, sse: str = "openai"):
@@ -585,10 +591,13 @@ class LoggedCall:
         completed = False
         try:
             for item in items:
-                if self.quota_is_image and isinstance(item, dict):
-                    data = item.get("data")
-                    if isinstance(data, list):
-                        self._stream_image_units += len(data)
+                if self.quota_is_image and isinstance(item, dict) and isinstance(item.get("data"), list):
+                    self._stream_image_units += len(item["data"])
+                elif self.quota_is_image and isinstance(item, dict) and item.get("type") == "response.completed":
+                    response = item.get("response")
+                    completed_units = self._result_quota_units(response)
+                    if completed_units is not None:
+                        self._stream_image_units = max(self._stream_image_units, completed_units)
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))

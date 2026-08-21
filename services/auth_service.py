@@ -434,13 +434,13 @@ class AuthService:
                 except (TypeError, ValueError):
                     charge_units = 0
                 charge_units = min(reserved_units, charge_units)
-            if not success and units is None:
+            if not success:
                 charge_units = 0
-            if not success and units is None:
+            if charge_units == 0:
                 reservations.pop(normalized_reservation_id, None)
                 if not reservations:
                     self._daily_reservations.pop(key_id, None)
-                return charge_units == 0
+                return not success
             found = self._find_item_locked(key_id)
             if found is None:
                 reservations.pop(normalized_reservation_id, None)

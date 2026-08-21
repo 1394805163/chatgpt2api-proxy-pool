@@ -204,6 +204,65 @@ class ApiRequestQuotaTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertNotIn("task_timeout_secs", handler.call_args.args[0])
 
+    def test_responses_image_batch_propagates_n_and_counts_returned_images(self) -> None:
+        result = {
+            "id": "response-batch",
+            "object": "response",
+            "status": "completed",
+            "data": [{"url": "one"}, {"url": "two"}],
+        }
+        with mock.patch.object(ai_api.openai_v1_response, "handle", return_value=result) as handler:
+            response = self.client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer user"},
+                json={
+                    "model": "gpt-image-2",
+                    "input": "two cats",
+                    "tools": [{"type": "image_generation"}],
+                    "n": 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(handler.call_args.args[0]["n"], 2)
+        item = self.auth.list_keys(role="user")[0]
+        self.assertEqual(item["daily_request_used"], 2)
+        self.assertEqual(item["image_total_generated"], 2)
+
+    def test_responses_image_text_model_is_rejected_before_upstream(self) -> None:
+        with mock.patch.object(ai_api.openai_v1_response, "handle") as handler:
+            response = self.client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer user"},
+                json={
+                    "model": "gpt-5.4-mini",
+                    "input": "a red apple",
+                    "tools": [{"type": "image_generation"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["detail"]["model"], "gpt-5.4-mini")
+        handler.assert_not_called()
+
+    def test_responses_image_unsupported_tool_is_rejected_before_upstream(self) -> None:
+        with mock.patch.object(ai_api.openai_v1_response, "handle") as handler:
+            response = self.client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer user"},
+                json={
+                    "model": "gpt-image-2",
+                    "input": "a cat",
+                    "tools": [
+                        {"type": "image_generation"},
+                        {"type": "function", "name": "unsupported"},
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        handler.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

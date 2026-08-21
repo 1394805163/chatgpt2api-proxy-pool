@@ -58,9 +58,9 @@ def enforce_image_request_limit(identity: dict[str, object], count: int) -> None
         ) from exc
 
 
-def acquire_image_concurrency(identity: dict[str, object]):
+def acquire_image_concurrency(identity: dict[str, object], units: int = 1):
     try:
-        return image_concurrency_gate.try_acquire(identity)
+        return image_concurrency_gate.try_acquire(identity, units=units)
     except ImageConcurrencyLimitExceeded as exc:
         raise HTTPException(
             status_code=429,

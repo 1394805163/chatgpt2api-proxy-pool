@@ -24,7 +24,7 @@ from services.protocol import (
     openai_v1_response,
     openai_search,
 )
-from utils.helper import is_image_chat_request
+from utils.helper import is_image_chat_request, is_supported_image_model, parse_image_count
 from utils.log import logger
 
 
@@ -59,6 +59,7 @@ class ResponseCreateRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str | None = None
     input: object | None = None
+    n: int | None = None
     tools: list[dict[str, object]] | None = None
     tool_choice: object | None = None
     stream: bool | None = None
@@ -173,7 +174,7 @@ def create_router() -> APIRouter:
             quota_units=body.n,
             quota_is_image=True,
         )
-        lease = acquire_image_concurrency(identity)
+        lease = acquire_image_concurrency(identity, units=body.n)
         try:
             await filter_or_log(call, body.prompt)
             response = await call.run(openai_v1_image_generations.handle, payload)
@@ -207,7 +208,7 @@ def create_router() -> APIRouter:
             quota_units=int(payload.get("n") or 1),
             quota_is_image=True,
         )
-        lease = acquire_image_concurrency(identity)
+        lease = acquire_image_concurrency(identity, units=int(payload.get("n") or 1))
         images = []
         masks = []
         try:
@@ -251,17 +252,20 @@ def create_router() -> APIRouter:
             apply_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("prompt"), payload.get("messages"))
+        image_units = parse_image_count(payload.get("n")) if is_image_request else 1
+        if is_image_request:
+            enforce_image_request_limit(identity, image_units)
         call = LoggedCall(
             identity,
             "/v1/chat/completions",
             model,
-            "文本生成",
+            "图片生成" if is_image_request else "文本生成",
             request_text=request_preview,
             request_shape=request_shape(payload.get("messages")),
-            quota_units=int(payload.get("n") or 1) if is_image_request else 1,
+            quota_units=image_units if is_image_request else 1,
             quota_is_image=is_image_request,
         )
-        lease = acquire_image_concurrency(identity) if is_image_request else None
+        lease = acquire_image_concurrency(identity, units=image_units) if is_image_request else None
         try:
             await filter_or_log(call, request_preview)
             response = await call.run(openai_v1_chat_complete.handle, payload)
@@ -276,7 +280,37 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         is_image_request = not openai_v1_response.is_text_response_request(payload)
+        image_units = 1
         if is_image_request:
+            image_model = str(payload.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+            if not is_supported_image_model(image_model):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "unsupported image model",
+                        "model": image_model,
+                        "supported_models": [
+                            "gpt-image-2",
+                            "codex-gpt-image-2",
+                            "plus-codex-gpt-image-2",
+                            "pro-codex-gpt-image-2",
+                            "team-codex-gpt-image-2",
+                        ],
+                        "retryable": False,
+                    },
+                )
+            if openai_v1_response.has_unsupported_response_tools(payload):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "Responses image compatibility supports only the image_generation tool",
+                        "retryable": False,
+                    },
+                )
+            tool = openai_v1_response.response_image_tool(payload)
+            image_units = parse_image_count(payload.get("n") or tool.get("n") or 1)
+            payload["n"] = image_units
+            enforce_image_request_limit(identity, image_units)
             apply_image_timeout(identity, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
@@ -287,10 +321,10 @@ def create_router() -> APIRouter:
             "Responses",
             request_text=request_preview,
             request_shape=request_shape(payload.get("input")),
-            quota_units=int(payload.get("n") or 1) if is_image_request else 1,
+            quota_units=image_units if is_image_request else 1,
             quota_is_image=is_image_request,
         )
-        lease = acquire_image_concurrency(identity) if is_image_request else None
+        lease = acquire_image_concurrency(identity, units=image_units) if is_image_request else None
         try:
             await filter_or_log(call, request_preview)
             response = await call.run(openai_v1_response.handle, payload)

@@ -70,6 +70,43 @@ def make_service(path: Path, handler) -> ImageTaskService:
 
 
 class ImageTaskQuotaTests(unittest.TestCase):
+    def test_async_batch_request_uses_n_for_concurrency_and_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            auth, identity = make_identity(root, daily_limit=3, image_limit=3, concurrency_limit=2)
+            release = threading.Event()
+
+            def handler(_payload):
+                release.wait(1)
+                return {"data": [{"url": "one"}, {"url": "two"}]}
+
+            service = make_service(root / "tasks.json", handler)
+            service.reject_when_busy = True
+            with mock.patch("services.image_task_service.auth_service", auth):
+                service.submit_generation(
+                    identity,
+                    client_task_id="batch",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    n=2,
+                )
+                wait_for_status(service, identity, "batch", "running")
+                with self.assertRaises(ImageConcurrencyLimitExceeded):
+                    service.submit_generation(
+                        identity,
+                        client_task_id="blocked",
+                        prompt="cat",
+                        model="gpt-image-2",
+                        size=None,
+                    )
+                release.set()
+                wait_for_status(service, identity, "batch", "success")
+
+            item = auth.list_keys(role="user")[0]
+            self.assertEqual(item["daily_request_used"], 2)
+            self.assertEqual(item["image_total_generated"], 2)
+
     def test_success_counts_once_and_failure_does_not_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

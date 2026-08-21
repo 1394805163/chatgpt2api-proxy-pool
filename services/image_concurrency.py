@@ -68,29 +68,32 @@ class ImageConcurrencyGate:
         *,
         global_limit: int | None = None,
         owner_limit: int | None = None,
+        units: int = 1,
     ) -> ImageConcurrencyLease:
         normalized_global_limit = max(1, int(global_limit or config.image_global_concurrency))
         normalized_owner_limit = max(
             1,
-            min(
-                normalized_global_limit,
-                int(owner_limit or image_owner_limit(identity, normalized_global_limit)),
-            ),
+            int(owner_limit or image_owner_limit(identity, normalized_global_limit)),
         )
+        normalized_units = max(1, int(units))
         owner = self._owner_id(identity)
+        if normalized_units > normalized_owner_limit:
+            raise ImageConcurrencyLimitExceeded("owner", normalized_owner_limit)
+        if normalized_units > normalized_global_limit:
+            raise ImageConcurrencyLimitExceeded("request", normalized_global_limit)
         with self._lock:
-            if self._active_total >= normalized_global_limit:
+            if self._active_total + normalized_units > normalized_global_limit:
                 raise ImageConcurrencyLimitExceeded("global", normalized_global_limit)
             owner_active = self._active_by_owner.get(owner, 0)
-            if owner_active >= normalized_owner_limit:
+            if owner_active + normalized_units > normalized_owner_limit:
                 raise ImageConcurrencyLimitExceeded("owner", normalized_owner_limit)
-            self._active_total += 1
-            self._active_by_owner[owner] = owner_active + 1
+            self._active_total += normalized_units
+            self._active_by_owner[owner] = owner_active + normalized_units
 
         def release() -> None:
             with self._lock:
-                self._active_total = max(0, self._active_total - 1)
-                remaining = self._active_by_owner.get(owner, 0) - 1
+                self._active_total = max(0, self._active_total - normalized_units)
+                remaining = self._active_by_owner.get(owner, 0) - normalized_units
                 if remaining > 0:
                     self._active_by_owner[owner] = remaining
                 else:
