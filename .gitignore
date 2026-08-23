@@ -35,3 +35,5 @@ loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
 data-e2e-*/
+
+.worktrees/
