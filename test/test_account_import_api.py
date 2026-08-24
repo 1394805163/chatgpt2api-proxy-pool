@@ -12,6 +12,39 @@ from api.accounts import create_router
 
 
 class AccountImportAPITests(unittest.TestCase):
+    def test_v183_account_and_key_reads_are_offloaded(self) -> None:
+        service = MagicMock()
+        service.list_accounts.return_value = [{"access_token": "token-1"}]
+        keys = MagicMock()
+        keys.list_keys.return_value = [{"id": "key-1"}]
+        calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+
+        async def fake_run_in_threadpool(func, *args, **kwargs):
+            calls.append((func, args, kwargs))
+            return func(*args, **kwargs)
+
+        app = FastAPI()
+        with (
+            patch("api.accounts.account_service", service),
+            patch("api.accounts.auth_service", keys),
+            patch("api.accounts.require_admin"),
+            patch("api.accounts.run_in_threadpool", side_effect=fake_run_in_threadpool),
+        ):
+            app.include_router(create_router())
+            with TestClient(app) as client:
+                accounts = client.get("/api/accounts", headers={"Authorization": "Bearer test"})
+                user_keys = client.get("/api/auth/users", headers={"Authorization": "Bearer test"})
+
+        self.assertEqual(accounts.status_code, 200, accounts.text)
+        self.assertEqual(user_keys.status_code, 200, user_keys.text)
+        self.assertEqual(accounts.json()["items"], [{"access_token": "token-1"}])
+        self.assertEqual(user_keys.json()["items"], [{"id": "key-1"}])
+        self.assertEqual(len(calls), 2)
+        self.assertIs(calls[0][0], service.list_accounts)
+        self.assertEqual(calls[0][1:], ((), {}))
+        self.assertIs(calls[1][0], keys.list_keys)
+        self.assertEqual(calls[1][2], {"role": "user"})
+
     def test_import_can_skip_background_refresh(self) -> None:
         service = MagicMock()
         service.add_accounts.return_value = {

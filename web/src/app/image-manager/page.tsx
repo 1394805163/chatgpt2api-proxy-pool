@@ -586,6 +586,8 @@ function ImageManagerContent() {
                       src={item.thumbnail_url || item.url}
                       alt={item.name}
                       className="h-full w-full object-cover transition group-hover:scale-[1.02]"
+                      loading="lazy"
+                      decoding="async"
                       onError={(event) => {
                         if (event.currentTarget.src !== item.url) {
                           event.currentTarget.src = item.url;

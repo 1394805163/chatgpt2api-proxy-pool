@@ -35,7 +35,7 @@ class LogsApiTests(unittest.TestCase):
         app.include_router(system_module.create_router("9.9.9-test"))
         self.client = TestClient(app)
 
-    def test_date_filtered_call_logs_request_all_items_and_collapse_failures(self) -> None:
+    def test_v183_date_filtered_call_logs_are_bounded_and_collapse_failures(self) -> None:
         response = self.client.get(
             "/api/logs?type=call&start_date=2026-07-05&end_date=2026-07-05",
             headers=AUTH_HEADERS,
@@ -49,12 +49,56 @@ class LogsApiTests(unittest.TestCase):
                     "type": "call",
                     "start_date": "2026-07-05",
                     "end_date": "2026-07-05",
-                    "limit": None,
+                    "limit": 200,
                     "collapse_image_failures": True,
                     "display_timezone": "Asia/Shanghai",
                 }
             ],
         )
+
+    def test_v183_log_limit_cannot_exceed_page_bound(self) -> None:
+        response = self.client.get("/api/logs?limit=201", headers=AUTH_HEADERS)
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_v183_image_index_read_is_offloaded_from_the_event_loop(self) -> None:
+        calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+
+        def fake_list_images(_base_url: str, *, start_date: str = "", end_date: str = ""):
+            return {"items": [], "groups": [], "range": [start_date, end_date]}
+
+        async def fake_run_in_threadpool(func, *args, **kwargs):
+            calls.append((func, args, kwargs))
+            return func(*args, **kwargs)
+
+        with (
+            mock.patch.object(system_module, "list_images", side_effect=fake_list_images) as image_list,
+            mock.patch.object(system_module, "run_in_threadpool", side_effect=fake_run_in_threadpool),
+        ):
+            response = self.client.get(
+                "/api/images?start_date=2026-08-01&end_date=2026-08-02",
+                headers=AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["range"], ["2026-08-01", "2026-08-02"])
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][0], image_list)
+        self.assertEqual(calls[0][2], {"start_date": "2026-08-01", "end_date": "2026-08-02"})
+
+    def test_log_reads_are_offloaded_from_the_event_loop(self) -> None:
+        calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+
+        async def fake_run_in_threadpool(func, *args, **kwargs):
+            calls.append((func, args, kwargs))
+            return func(*args, **kwargs)
+
+        with mock.patch.object(system_module, "run_in_threadpool", side_effect=fake_run_in_threadpool):
+            response = self.client.get("/api/logs?type=account", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(getattr(calls[0][0], "__name__", ""), "list")
+        self.assertIs(getattr(calls[0][0], "__self__", None), self.fake_log_service)
 
     def test_unfiltered_call_logs_keep_default_limit_and_collapse_failures(self) -> None:
         response = self.client.get("/api/logs?type=call", headers=AUTH_HEADERS)

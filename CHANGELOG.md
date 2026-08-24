@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.8.4 - 2026-08-24
+
+- [修复] 超时任务在物理 worker 退出前继续占用租约和并发名额，避免旧任务未退出时创建旁路请求。
+- [优化] 日志、账号、用户密钥和图片索引读取移出 FastAPI 事件循环；日志接口固定最多返回 200 条，日期筛选不再解除上限。
+- [优化] 图片管理缩略图使用浏览器懒加载和异步解码，降低首屏图片请求压力。
+- [修复] 补齐图片准备、会话、任务轮询、bootstrap 和 chat requirements 响应的 success/failure close，降低 curl 28 后连接堆积。
+- [测试] 增加 worker 租约、日志分页上限、线程池卸载和响应释放回归测试。
+
+## 1.8.3 - 2026-08-24
+
+- Prevent partial image SSE timeouts from submitting a second generation; resume polling the original conversation when possible.
+- Restrict clean image connection-timeout retries to one and return a single timeout response for polling deadlines.
+- Close image upload, download, and SSE responses on success and failure paths.
+
 ## 1.8.2 - 2026-08-22
 
 + [修复] 多图请求按实际返回图片数量结算每日额度和累计生图数，失败图片不计费。
@@ -97,8 +111,3 @@
 + [新增] 前端版本号支持点击查看版本更新弹窗，展示当前版本、最新版本和更新日志。
 + [优化] 优化注册机效率，成功率大幅提高。
 + [优化] 优化生图页面配置选项。
-## 1.8.3 - 2026-08-24
-
-- Prevent partial image SSE timeouts from submitting a second generation; resume polling the original conversation when possible.
-- Restrict clean image connection-timeout retries to one and return a single timeout response for polling deadlines.
-- Close image upload, download, and SSE responses on success and failure paths.

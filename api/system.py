@@ -57,6 +57,8 @@ class LogDeleteRequest(BaseModel):
 class BackupDeleteRequest(BaseModel):
     key: str = ""
 
+LOG_PAGE_LIMIT = 200
+
 
 def create_router(app_version: str) -> APIRouter:
     router = APIRouter()
@@ -113,7 +115,12 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/images")
     async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return list_images(resolve_image_base_url(request), start_date=start_date.strip(), end_date=end_date.strip())
+        return await run_in_threadpool(
+            list_images,
+            resolve_image_base_url(request),
+            start_date=start_date.strip(),
+            end_date=end_date.strip(),
+        )
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
@@ -152,18 +159,24 @@ def create_router(app_version: str) -> APIRouter:
         return get_image_download_response(image_path)
 
     @router.get("/api/logs")
-    async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    async def get_logs(
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        limit: int = Query(default=LOG_PAGE_LIMIT, ge=1, le=LOG_PAGE_LIMIT),
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
         log_type = type.strip()
         start = start_date.strip()
         end = end_date.strip()
-        has_date_filter = bool(start or end)
         return {
-            "items": log_service.list(
+            "items": await run_in_threadpool(
+                log_service.list,
                 type=log_type,
                 start_date=start,
                 end_date=end,
-                limit=None if has_date_filter else 200,
+                limit=limit,
                 collapse_image_failures=log_type == LOG_TYPE_CALL,
                 display_timezone=config.display_timezone,
             )

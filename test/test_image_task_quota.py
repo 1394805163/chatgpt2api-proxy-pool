@@ -133,6 +133,36 @@ class ImageTaskQuotaTests(unittest.TestCase):
             self.assertEqual(item["daily_request_remaining"], 2)
             self.assertEqual(item["image_total_generated"], 1)
 
+    def test_v183_partial_success_charges_actual_image_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            auth, identity = make_identity(root, daily_limit=5, image_limit=5, concurrency_limit=3)
+
+            def handler(_payload):
+                return {
+                    "data": [
+                        {"url": "http://example.test/one.png"},
+                        {"url": "http://example.test/two.png"},
+                    ]
+                }
+
+            service = make_service(root / "tasks.json", handler)
+            with mock.patch("services.image_task_service.auth_service", auth):
+                service.submit_generation(
+                    identity,
+                    client_task_id="partial-batch",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    n=3,
+                )
+                item = wait_for_status(service, identity, "partial-batch", "success")
+
+            self.assertEqual(len(item["data"]), 2)
+            stored = auth.list_keys(role="user")[0]
+            self.assertEqual(stored["daily_request_used"], 2)
+            self.assertEqual(stored["image_total_generated"], 2)
+
     def test_user_tasks_use_configured_limit_and_admin_uses_global_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

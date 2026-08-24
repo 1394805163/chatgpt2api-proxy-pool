@@ -10,6 +10,7 @@ from services.account_service import account_service
 from services.config import config
 from services.openai_backend_api import (
     ImageConnectionTimeoutError,
+    ImageContentPolicyError,
     ImagePartialStreamTimeoutError,
     ImagePollTimeoutError,
     ImageTaskDeadlineError,
@@ -461,6 +462,28 @@ class MultiImageResultTests(unittest.TestCase):
                 _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
 
         self.assertEqual(attempts, 2)
+
+    def test_v183_content_policy_refusal_does_not_switch_account_or_retry(self) -> None:
+        policy_error = ImageContentPolicyError("image rejected by upstream policy")
+
+        with (
+            mock.patch.object(account_service, "get_available_access_token", return_value="token-1") as get_token,
+            mock.patch.object(account_service, "get_account", return_value={"email": "test@example.com"}),
+            mock.patch("services.protocol.conversation.record_image_failure"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=policy_error) as stream_outputs,
+        ):
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="blocked", message_as_error=True),
+                    1,
+                    1,
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.code, "content_policy_violation")
+        get_token.assert_called_once()
+        stream_outputs.assert_called_once()
 
     def test_responses_stream_emits_all_image_output_items(self) -> None:
         first = base64.b64encode(b"first").decode("ascii")

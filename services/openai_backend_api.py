@@ -1005,8 +1005,11 @@ class OpenAIBackendAPI:
             json=payload,
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, path)
-        return response.json().get("conduit_token", "")
+        try:
+            ensure_ok(response, path)
+            return response.json().get("conduit_token", "")
+        finally:
+            _close_response(response, "image_conversation_prepare")
 
     def _decode_image_base64(self, image: str) -> bytes:
         """把 base64 图片字符串或本地路径解码成二进制。"""
@@ -1198,8 +1201,11 @@ class OpenAIBackendAPI:
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=self._image_request_timeout(60))
-        ensure_ok(response, path)
-        return response.json()
+        try:
+            ensure_ok(response, path)
+            return response.json()
+        finally:
+            _close_response(response, "image_conversation")
 
     def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """Hide a conversation from the ChatGPT upstream history."""
@@ -1231,9 +1237,12 @@ class OpenAIBackendAPI:
                 headers=self._headers(path, {"Accept": "application/json"}),
                 timeout=timeout_secs,
             )
-            ensure_ok(response, path)
-            data = response.json()
-            return data.get("items") or data.get("conversations") or []
+            try:
+                ensure_ok(response, path)
+                data = response.json()
+                return data.get("items") or data.get("conversations") or []
+            finally:
+                _close_response(response, "recent_conversations")
         except Exception as exc:
             logger.debug({"event": "list_conversations_failed", "error": str(exc)})
             return []
@@ -2517,8 +2526,11 @@ class OpenAIBackendAPI:
             headers=self._headers(path, {"Accept": "application/json"}),
             timeout=self._image_request_timeout(timeout_secs),
         )
-        ensure_ok(response, path)
-        data = response.json()
+        try:
+            ensure_ok(response, path)
+            data = response.json()
+        finally:
+            _close_response(response, "image_backend_tasks")
         tasks = data.get("tasks", [])
         if not isinstance(tasks, list):
             return []
@@ -2866,8 +2878,11 @@ class OpenAIBackendAPI:
             headers=self._bootstrap_headers(),
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, "bootstrap")
-        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        try:
+            ensure_ok(response, "bootstrap")
+            self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        finally:
+            _close_response(response, "bootstrap")
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
 
@@ -2883,8 +2898,11 @@ class OpenAIBackendAPI:
             json={"p": p_token},
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, "chat_requirements_prepare")
-        prepare_data = response.json()
+        try:
+            ensure_ok(response, "chat_requirements_prepare")
+            prepare_data = response.json()
+        finally:
+            _close_response(response, "chat_requirements_prepare")
 
         if (prepare_data.get("arkose") or {}).get("required"):
             raise RuntimeError("chat requirements requires arkose token, which is not implemented")
@@ -2916,8 +2934,11 @@ class OpenAIBackendAPI:
             },
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, "chat_requirements_finalize")
-        data = response.json()
+        try:
+            ensure_ok(response, "chat_requirements_finalize")
+            data = response.json()
+        finally:
+            _close_response(response, "chat_requirements_finalize")
 
         token = data.get("token", "")
         if not token:
