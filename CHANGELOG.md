@@ -97,3 +97,8 @@
 + [新增] 前端版本号支持点击查看版本更新弹窗，展示当前版本、最新版本和更新日志。
 + [优化] 优化注册机效率，成功率大幅提高。
 + [优化] 优化生图页面配置选项。
+## 1.8.3 - 2026-08-24
+
+- Prevent partial image SSE timeouts from submitting a second generation; resume polling the original conversation when possible.
+- Restrict clean image connection-timeout retries to one and return a single timeout response for polling deadlines.
+- Close image upload, download, and SSE responses on success and failure paths.
