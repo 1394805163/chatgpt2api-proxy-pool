@@ -113,6 +113,32 @@ class AccountExportTests(unittest.TestCase):
         self.assertEqual(account["refresh_token"], "rt_test")
         self.assertEqual(account["account_id"], "acct_123")
 
+    def test_add_account_items_updates_existing_account_by_email_when_access_token_rotates(self) -> None:
+        service = AccountService(MemoryStorage([
+            {
+                "access_token": "old-access-token",
+                "email": "same@example.com",
+                "account_id": "acct_same",
+                "refresh_token": "old-refresh-token",
+            }
+        ]))
+
+        result = service.add_account_items([
+            {
+                "access_token": "new-access-token",
+                "email": "same@example.com",
+                "account_id": "acct_same",
+                "refresh_token": "new-refresh-token",
+                "id_token": "new-id-token",
+            }
+        ])
+
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(len(service.list_accounts()), 1)
+        self.assertEqual(service.get_account("old-access-token")["access_token"], "new-access-token")
+        self.assertEqual(service.get_account("new-access-token")["refresh_token"], "new-refresh-token")
+
 
 if __name__ == "__main__":
     unittest.main()

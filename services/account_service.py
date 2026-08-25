@@ -1301,16 +1301,40 @@ class AccountService:
 
         with self._lock:
             added = 0
+            updated = 0
             skipped = 0
             for access_token, payload in deduped.items():
                 current = self._accounts.get(access_token)
+                current_key = access_token
+                if current is None:
+                    incoming_email = str(payload.get("email") or "").strip().lower()
+                    incoming_account_id = str(
+                        payload.get("account_id") or payload.get("chatgpt_account_id") or ""
+                    ).strip()
+                    if incoming_email or incoming_account_id:
+                        for candidate_key, candidate in self._accounts.items():
+                            candidate_email = str(candidate.get("email") or "").strip().lower()
+                            candidate_account_id = str(
+                                candidate.get("account_id") or candidate.get("chatgpt_account_id") or ""
+                            ).strip()
+                            if (
+                                incoming_email and candidate_email == incoming_email
+                            ) or (
+                                incoming_account_id and candidate_account_id == incoming_account_id
+                            ):
+                                current_key = candidate_key
+                                current = candidate
+                                break
                 if current is None:
                     added += 1
                     self._cumulative_total += 1
                     self._save_cumulative_total()
                     current = {"created_at": self._now()}
                 else:
-                    skipped += 1
+                    if current_key == access_token:
+                        skipped += 1
+                    else:
+                        updated += 1
                 incoming = dict(payload)
                 if not incoming.get("created_at"):
                     incoming.pop("created_at", None)
@@ -1323,12 +1347,18 @@ class AccountService:
                     }
                 )
                 if account is not None:
+                    if current_key != access_token:
+                        self._accounts.pop(current_key, None)
+                        self._token_aliases[current_key] = access_token
+                        inflight = int(self._image_inflight.pop(current_key, 0))
+                        if inflight:
+                            self._image_inflight[access_token] = inflight
                     self._accounts[access_token] = account
             self._save_accounts()
             items = [dict(item) for item in self._accounts.values()]
-            log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
-                            {"added": added, "skipped": skipped})
-        return {"added": added, "skipped": skipped, "items": items}
+            log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，更新 {updated} 个，跳过 {skipped} 个",
+                            {"added": added, "updated": updated, "skipped": skipped})
+        return {"added": added, "updated": updated, "skipped": skipped, "items": items}
 
     def delete_accounts(self, tokens: list[str]) -> dict:
         target_set = set(token for token in tokens if token)
