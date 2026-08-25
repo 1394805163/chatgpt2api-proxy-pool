@@ -49,7 +49,8 @@ class LogsApiTests(unittest.TestCase):
                     "type": "call",
                     "start_date": "2026-07-05",
                     "end_date": "2026-07-05",
-                    "limit": 200,
+                    "limit": 100,
+                    "cursor": "",
                     "collapse_image_failures": True,
                     "display_timezone": "Asia/Shanghai",
                 }
@@ -60,11 +61,15 @@ class LogsApiTests(unittest.TestCase):
         response = self.client.get("/api/logs?limit=201", headers=AUTH_HEADERS)
         self.assertEqual(response.status_code, 422, response.text)
 
+    def test_log_and_image_limits_are_bounded_independently(self) -> None:
+        self.assertEqual(self.client.get("/api/logs?limit=101", headers=AUTH_HEADERS).status_code, 422)
+        self.assertEqual(self.client.get("/api/images?limit=51", headers=AUTH_HEADERS).status_code, 422)
+
     def test_v183_image_index_read_is_offloaded_from_the_event_loop(self) -> None:
         calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
 
-        def fake_list_images(_base_url: str, *, start_date: str = "", end_date: str = ""):
-            return {"items": [], "groups": [], "range": [start_date, end_date]}
+        def fake_list_images(_base_url: str, *, start_date: str = "", end_date: str = "", limit: int = 50, cursor: str = ""):
+            return {"items": [], "groups": [], "range": [start_date, end_date], "limit": limit, "cursor": cursor}
 
         async def fake_run_in_threadpool(func, *args, **kwargs):
             calls.append((func, args, kwargs))
@@ -81,9 +86,10 @@ class LogsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["range"], ["2026-08-01", "2026-08-02"])
+        self.assertEqual(response.json()["limit"], 50)
         self.assertEqual(len(calls), 1)
         self.assertIs(calls[0][0], image_list)
-        self.assertEqual(calls[0][2], {"start_date": "2026-08-01", "end_date": "2026-08-02"})
+        self.assertEqual(calls[0][2], {"start_date": "2026-08-01", "end_date": "2026-08-02", "limit": 50, "cursor": ""})
 
     def test_log_reads_are_offloaded_from_the_event_loop(self) -> None:
         calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
@@ -111,7 +117,8 @@ class LogsApiTests(unittest.TestCase):
                     "type": "call",
                     "start_date": "",
                     "end_date": "",
-                    "limit": 200,
+                    "limit": 100,
+                    "cursor": "",
                     "collapse_image_failures": True,
                     "display_timezone": "Asia/Shanghai",
                 }
@@ -129,7 +136,8 @@ class LogsApiTests(unittest.TestCase):
                     "type": "account",
                     "start_date": "",
                     "end_date": "",
-                    "limit": 200,
+                    "limit": 100,
+                    "cursor": "",
                     "collapse_image_failures": False,
                     "display_timezone": "Asia/Shanghai",
                 }

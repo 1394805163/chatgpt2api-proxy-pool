@@ -29,7 +29,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
                 for data, filename, mime_type in payload.get("images", [])
             ]
             self.calls.append(captured)
-            return {"created": 1, "data": [{"b64_json": "ZmFrZQ=="}]}
+            return {"created": 1, "data": [{"url": "/images/fake.png"}]}
 
         self.handle_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
         self.filter_patcher = mock.patch.object(ai_module, "filter_or_log", mock.AsyncMock())
@@ -80,7 +80,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
                 "prompt": "把图片改成夜景风格",
                 "n": 1,
                 "size": "1024x1536",
-                "response_format": "b64_json",
+                "response_format": "url",
                 "images": [{"image_url": PNG_DATA_URL}],
             },
         )

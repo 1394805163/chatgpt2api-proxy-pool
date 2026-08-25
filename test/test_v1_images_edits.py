@@ -7,7 +7,6 @@ from pathlib import Path
 
 import requests
 
-from test.utils import save_image
 from utils.log import logger
 
 AUTH_KEY = "chatgpt2api"
@@ -32,6 +31,7 @@ def summarize_chunk(chunk: dict[str, object]) -> dict[str, object]:
         "upstream_event_type": chunk.get("upstream_event_type"),
         "data_count": len(data_items),
         "has_b64_json": any(isinstance(item, dict) and bool(item.get("b64_json")) for item in data_items),
+        "has_url": any(isinstance(item, dict) and bool(item.get("url")) for item in data_items),
     }
 
 
@@ -45,25 +45,22 @@ class ImageEditsTests(unittest.TestCase):
                 "model": "gpt-image-2",
                 "prompt": "参考输入图片，保持人物主体和二次元插画风格不变，让女孩怀里抱着一只可爱的小猫，画面自然协调。",
                 "n": "1",
-                "response_format": "b64_json",
+                "response_format": "url",
             },
             files={"image": ("chery_studio.png", load_asset_bytes("chery_studio.png"), "image/png")},
             timeout=300,
         )
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
-        saved_paths = []
-        for index, item in enumerate(payload.get("data") or [], start=1):
-            b64_json = str((item or {}).get("b64_json") or "")
-            if b64_json:
-                saved_paths.append(save_image(b64_json, f"images_edits_non_stream_{index}"))
-        self.assertGreater(len(saved_paths), 0, "非流式接口未输出图片。")
+        items = [item for item in payload.get("data") or [] if isinstance(item, dict)]
+        urls = [str(item.get("url") or "") for item in items]
+        self.assertTrue(items and all(urls) and all(not item.get("b64_json") for item in items), "非流式接口未返回纯 URL 图片结果。")
         logger.info({
             "event": "test_images_edits_non_stream_done",
             "status_code": response.status_code,
             "created": payload.get("created"),
-            "saved_paths": [str(path) for path in saved_paths],
-            "image_count": len(saved_paths),
+            "urls": urls,
+            "image_count": len(urls),
         })
 
     def test_image_edit_stream_http(self):
@@ -75,7 +72,7 @@ class ImageEditsTests(unittest.TestCase):
                 "model": "gpt-image-2",
                 "prompt": "请提取两张输入界面截图中的 6 个任务，并把这 6 个任务整合排版到同一张图里，做成一张清晰的中文任务总览海报，标题明确，六个任务分区展示，版面整洁。",
                 "n": "1",
-                "response_format": "b64_json",
+                "response_format": "url",
                 "stream": "true",
             },
             files=[
@@ -126,17 +123,13 @@ class ImageEditsTests(unittest.TestCase):
         finally:
             response.close()
 
-        saved_paths = []
-        for index, item in enumerate(image_items, start=1):
-            b64_json = str(item.get("b64_json") or "")
-            if b64_json:
-                saved_paths.append(save_image(b64_json, f"images_edits_stream_{index}"))
+        urls = [str(item.get("url") or "") for item in image_items]
         self.assertFalse(stream_errors, f"流式接口返回错误: {stream_errors}")
-        self.assertGreater(len(saved_paths), 0, "流式接口未输出图片。")
+        self.assertTrue(urls and all(urls) and all(not item.get("b64_json") for item in image_items), "流式接口未返回纯 URL 图片结果。")
         logger.info({
             "event": "test_images_edits_stream_done",
-            "saved_paths": [str(path) for path in saved_paths],
-            "image_count": len(saved_paths),
+            "urls": urls,
+            "image_count": len(urls),
         })
 
 

@@ -57,7 +57,8 @@ class LogDeleteRequest(BaseModel):
 class BackupDeleteRequest(BaseModel):
     key: str = ""
 
-LOG_PAGE_LIMIT = 200
+IMAGE_PAGE_LIMIT = 50
+LOG_PAGE_LIMIT = 100
 
 
 def create_router(app_version: str) -> APIRouter:
@@ -113,13 +114,22 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/images")
-    async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    async def get_images(
+        request: Request,
+        start_date: str = "",
+        end_date: str = "",
+        limit: int = Query(default=IMAGE_PAGE_LIMIT, ge=1, le=IMAGE_PAGE_LIMIT),
+        cursor: str = "",
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
         return await run_in_threadpool(
             list_images,
             resolve_image_base_url(request),
             start_date=start_date.strip(),
             end_date=end_date.strip(),
+            limit=limit,
+            cursor=cursor.strip(),
         )
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
@@ -141,7 +151,13 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/images/delete")
     async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return delete_images(body.paths, start_date=body.start_date.strip(), end_date=body.end_date.strip(), all_matching=body.all_matching)
+        return await run_in_threadpool(
+            delete_images,
+            body.paths,
+            start_date=body.start_date.strip(),
+            end_date=body.end_date.strip(),
+            all_matching=body.all_matching,
+        )
 
     @router.post("/api/images/download")
     async def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):
@@ -164,28 +180,32 @@ def create_router(app_version: str) -> APIRouter:
         start_date: str = "",
         end_date: str = "",
         limit: int = Query(default=LOG_PAGE_LIMIT, ge=1, le=LOG_PAGE_LIMIT),
+        cursor: str = "",
         authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
         log_type = type.strip()
         start = start_date.strip()
         end = end_date.strip()
-        return {
-            "items": await run_in_threadpool(
-                log_service.list,
-                type=log_type,
-                start_date=start,
-                end_date=end,
-                limit=limit,
-                collapse_image_failures=log_type == LOG_TYPE_CALL,
-                display_timezone=config.display_timezone,
-            )
-        }
+        list_page = getattr(log_service, "list_page", log_service.list)
+        result = await run_in_threadpool(
+            list_page,
+            type=log_type,
+            start_date=start,
+            end_date=end,
+            limit=limit,
+            cursor=cursor.strip(),
+            collapse_image_failures=log_type == LOG_TYPE_CALL,
+            display_timezone=config.display_timezone,
+        )
+        if isinstance(result, list):
+            return {"items": result, "next_cursor": None, "limit": limit}
+        return result
 
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return log_service.delete(body.ids)
+        return await run_in_threadpool(log_service.delete, body.ids)
 
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):

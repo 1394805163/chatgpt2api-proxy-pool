@@ -41,6 +41,7 @@ FROM python:3.13-slim AS app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    MALLOC_ARENA_MAX=2 \
     PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app

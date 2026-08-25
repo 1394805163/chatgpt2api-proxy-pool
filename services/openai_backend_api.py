@@ -1184,9 +1184,11 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
-            # v1.8.3-stability: only bound connection setup. The unified image
-            # deadline owns the lifetime of an otherwise quiet SSE stream.
-            timeout=(self._image_request_timeout(30), None),
+            # Keep both curl_cffi timeout components numeric. Passing None as
+            # the read timeout makes curl_cffi add a float and NoneType before
+            # the request is sent. The read budget is still bounded by the
+            # unified image deadline through _image_request_timeout.
+            timeout=(self._image_request_timeout(30), self._image_request_timeout(300)),
             stream=True,
         )
         try:

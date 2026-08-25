@@ -210,6 +210,41 @@ class DatabaseStorageBackend(StorageBackend):
         finally:
             session.close()
 
+    def load_logs_page(
+        self,
+        *,
+        limit: int | None = None,
+        type: str = "",
+        before_time: str = "",
+        before_id: str = "",
+    ) -> list[dict[str, Any]]:
+        session = self.Session()
+        try:
+            query = session.query(LogModel)
+            if type:
+                query = query.filter(LogModel.type == type)
+            if before_time:
+                query = query.filter(
+                    or_(
+                        LogModel.time < before_time,
+                        and_(LogModel.time == before_time, LogModel.id < (before_id or "\uffff")),
+                    )
+                )
+            query = query.order_by(LogModel.time.desc(), LogModel.id.desc())
+            if limit is not None:
+                query = query.limit(max(0, int(limit)))
+            items: list[dict[str, Any]] = []
+            for row in query.all():
+                try:
+                    item = json.loads(row.data)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    items.append(item)
+            return items
+        finally:
+            session.close()
+
     def delete_logs(self, ids: list[str]) -> int:
         target_ids = [str(item or "").strip() for item in ids if str(item or "").strip()]
         if not target_ids:

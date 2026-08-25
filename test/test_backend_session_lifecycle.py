@@ -65,7 +65,7 @@ class BackendSessionLifecycleTests(unittest.TestCase):
         completed_response.close.assert_called_once_with()
         upload_response.close.assert_called_once_with()
 
-    def test_v183_image_sse_disables_read_timeout_but_keeps_connect_timeout(self) -> None:
+    def test_image_sse_uses_finite_connect_and_read_timeouts(self) -> None:
         response = mock.Mock(status_code=200, headers={})
         session = mock.Mock()
         session.post.return_value = response
@@ -87,7 +87,7 @@ class BackendSessionLifecycleTests(unittest.TestCase):
         )
 
         self.assertIs(result, response)
-        self.assertEqual(session.post.call_args.kwargs["timeout"], (30.0, None))
+        self.assertEqual(session.post.call_args.kwargs["timeout"], (30.0, 300.0))
 
     def test_v183_image_sse_start_error_closes_response(self) -> None:
         response = mock.Mock(status_code=502, headers={}, text="upstream failed")

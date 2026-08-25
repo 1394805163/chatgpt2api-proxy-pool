@@ -6,8 +6,6 @@ import unittest
 
 import requests
 
-from test.utils import save_image
-
 AUTH_KEY = "chatgpt2api"
 BASE_URL = "http://localhost:8000"
 
@@ -22,23 +20,21 @@ class ImageGenerationsTests(unittest.TestCase):
                 "model": "gpt-image-2",
                 "prompt": "我想做一张南京城市宣传海报图。",
                 "n": 1,
-                "response_format": "b64_json",
+                "response_format": "url",
             },
             timeout=300,
         )
         payload = response.json()
-        saved_paths = []
-        for index, item in enumerate(payload.get("data") or [], start=1):
-            b64_json = str((item or {}).get("b64_json") or "")
-            if b64_json:
-                saved_paths.append(save_image(b64_json, f"images_generations_non_stream_{index}"))
+        items = [item for item in payload.get("data") or [] if isinstance(item, dict)]
+        urls = [str(item.get("url") or "") for item in items]
+        self.assertTrue(items and all(urls) and all(not item.get("b64_json") for item in items), "非流式接口未返回纯 URL 图片结果。")
         print("images generations non-stream status:")
         print(response.status_code)
         print("images generations non-stream created:")
         print(payload.get("created"))
-        print("images generations non-stream saved files:")
-        for path in saved_paths:
-            print(path)
+        print("images generations non-stream urls:")
+        for url in urls:
+            print(url)
 
     def test_image_generation_stream_http(self):
         """测试图片生成的流式 HTTP 调用。"""
@@ -49,7 +45,7 @@ class ImageGenerationsTests(unittest.TestCase):
                 "model": "gpt-image-2",
                 "prompt": "我想做一张南京城市宣传海报图。",
                 "n": 1,
-                "response_format": "b64_json",
+                "response_format": "url",
                 "stream": True,
             },
             stream=True,
@@ -78,14 +74,11 @@ class ImageGenerationsTests(unittest.TestCase):
             if isinstance(data, list):
                 image_items.extend(item for item in data if isinstance(item, dict))
 
-        saved_paths = []
-        for index, item in enumerate(image_items, start=1):
-            b64_json = str(item.get("b64_json") or "")
-            if b64_json:
-                saved_paths.append(save_image(b64_json, f"images_generations_stream_{index}"))
-        print("images generations stream saved files:")
-        for path in saved_paths:
-            print(path)
+        urls = [str(item.get("url") or "") for item in image_items]
+        self.assertTrue(urls and all(urls) and all(not item.get("b64_json") for item in image_items), "流式接口未返回纯 URL 图片结果。")
+        print("images generations stream urls:")
+        for url in urls:
+            print(url)
 
 
 if __name__ == "__main__":

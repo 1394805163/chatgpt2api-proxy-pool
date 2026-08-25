@@ -54,6 +54,19 @@ class JSONStorageBackend(StorageBackend):
             data = data.get("items")
         return data if isinstance(data, list) else []
 
+    def load_logs_page(
+        self,
+        *,
+        limit: int | None = None,
+        type: str = "",
+        before_time: str = "",
+        before_id: str = "",
+    ) -> list[dict[str, Any]]:
+        # JSON storage historically does not persist logs separately; keep the
+        # backend contract explicit and avoid pretending that accounts.json is
+        # a log source.
+        return []
+
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存鉴权密钥数据到 JSON 文件"""
         self.auth_keys_path.parent.mkdir(parents=True, exist_ok=True)

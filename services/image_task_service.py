@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import json
 import shutil
 import threading
@@ -25,6 +24,7 @@ from services.image_concurrency import (
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.time_utils import utc_now_iso, utc_timestamp_iso
 from utils.log import logger
+from utils.memory import release_process_memory
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -338,13 +338,7 @@ class ImageTaskService:
 
     @staticmethod
     def _release_process_memory() -> None:
-        gc.collect()
-        try:
-            import ctypes
-
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+        release_process_memory()
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         self._expire_queued_tasks()

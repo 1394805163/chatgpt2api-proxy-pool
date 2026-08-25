@@ -12,9 +12,9 @@ from services.image_service import delete_to_target, get_image_response
 from services.protocol.conversation import format_image_result
 
 
-def png_bytes() -> bytes:
+def png_bytes(color=(255, 0, 0)) -> bytes:
     path = Path(tempfile.gettempdir()) / "chatgpt2api-test-image.png"
-    Image.new("RGB", (2, 2), color=(255, 0, 0)).save(path, format="PNG")
+    Image.new("RGB", (2, 2), color=color).save(path, format="PNG")
     return path.read_bytes()
 
 
@@ -183,6 +183,60 @@ class ImageStorageServiceTests(unittest.TestCase):
 
         self.assertEqual([item["rel"] for item in items], ["2026/05/07/sample.png"])
         self.assertEqual(items[0]["storage"], "local")
+
+    def test_list_items_page_returns_bounded_cursor_pages(self):
+        service = self.service()
+        for index in range(5):
+            stored = service.save(png_bytes((index * 30, 0, 0)), "http://app.test")
+            # Make the sort key deterministic while retaining unique paths.
+            index_data = service._load_index()
+            item = index_data[stored.rel]
+            item["created_at"] = f"2026-07-05T00:00:0{index}Z"
+            service._save_index(index_data)
+
+        first = service.list_items_page("http://app.test", limit=2)
+        second = service.list_items_page("http://app.test", limit=2, cursor=str(first["next_cursor"]))
+        third = service.list_items_page("http://app.test", limit=2, cursor=str(second["next_cursor"]))
+
+        self.assertEqual(len(first["items"]), 2)
+        self.assertEqual(len(second["items"]), 2)
+        self.assertEqual(len(third["items"]), 1)
+        self.assertEqual(
+            len({item["rel"] for page in (first, second, third) for item in page["items"]}),
+            5,
+        )
+        self.assertIsNone(third["next_cursor"])
+
+    def test_list_items_reads_dimensions_without_reading_full_file_bytes(self):
+        service = self.service()
+        image_path = self.images_dir / "2026" / "05" / "07" / "large.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_bytes(png_bytes())
+
+        with mock.patch("services.image_storage_service.Path.read_bytes", side_effect=AssertionError("full image read")):
+            items = service.list_items("http://app.test")
+
+        self.assertEqual(items[0]["width"], 2)
+        self.assertEqual(items[0]["height"], 2)
+
+    def test_delete_many_saves_index_once(self):
+        service = self.service()
+        stored = [service.save(png_bytes((index * 30, 0, 0)), "http://app.test") for index in range(3)]
+        with mock.patch.object(service, "_save_index", wraps=service._save_index) as save_index:
+            removed = service.delete_many([item.rel for item in stored])
+
+        self.assertEqual(removed, 3)
+        self.assertEqual(save_index.call_count, 1)
+        self.assertFalse(any(self.images_dir.rglob("*.png")))
+
+    def test_matching_paths_is_bounded(self):
+        service = self.service()
+        for index in range(4):
+            service.save(png_bytes((index * 30, 0, 0)), "http://app.test")
+
+        paths = service.matching_paths(start_date="2020-01-01", end_date="2099-12-31", maximum=3)
+
+        self.assertEqual(len(paths), 3)
 
     def test_both_mode_saves_to_local_and_webdav(self):
         self.settings.update({

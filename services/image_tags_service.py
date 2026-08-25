@@ -44,9 +44,18 @@ def set_tags(image_rel: str, tags: list[str]) -> list[str]:
 
 
 def remove_tags(image_rel: str) -> None:
+    remove_tags_many([image_rel])
+
+
+def remove_tags_many(image_rels: list[str]) -> int:
     data = load_tags()
-    if data.pop(image_rel, None) is not None:
+    removed = 0
+    for image_rel in dict.fromkeys(str(item or "") for item in image_rels):
+        if data.pop(image_rel, None) is not None:
+            removed += 1
+    if removed:
         save_tags(data)
+    return removed
 
 
 def delete_tag(tag: str) -> int:

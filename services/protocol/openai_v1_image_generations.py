@@ -18,7 +18,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     n = int(body.get("n") or 1)
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
-    response_format = str(body.get("response_format") or "b64_json")
+    response_format = str(body.get("response_format") or "url")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
     task_deadline_ts = body.get("task_deadline_ts")

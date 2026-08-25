@@ -21,6 +21,46 @@ def append_log(service: LogService, *, log_id: str, time: str, summary: str, det
 
 
 class LogServiceTests(unittest.TestCase):
+    def test_file_log_page_uses_cursor_without_loading_all_results(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = LogService(Path(tmp_dir) / "logs.jsonl")
+            for index in range(7):
+                append_log(
+                    service,
+                    log_id=f"page-{index}",
+                    time=f"2026-07-05T00:00:0{index}Z",
+                    summary="page",
+                    detail={},
+                )
+
+            first = service.list_page(limit=3)
+            second = service.list_page(limit=3, cursor=first["next_cursor"])
+            third = service.list_page(limit=3, cursor=second["next_cursor"])
+
+            self.assertEqual([item["id"] for item in first["items"]], ["page-6", "page-5", "page-4"])
+            self.assertEqual([item["id"] for item in second["items"]], ["page-3", "page-2", "page-1"])
+            self.assertEqual([item["id"] for item in third["items"]], ["page-0"])
+            self.assertIsNotNone(first["next_cursor"])
+            self.assertIsNone(third["next_cursor"])
+
+    def test_log_delete_rewrites_jsonl_streaming(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "logs.jsonl"
+            service = LogService(path)
+            for index in range(100):
+                append_log(
+                    service,
+                    log_id=f"delete-{index}",
+                    time=f"2026-07-05T00:{index // 60:02d}:{index % 60:02d}Z",
+                    summary="delete",
+                    detail={},
+                )
+
+            result = service.delete([f"delete-{index}" for index in range(0, 100, 2)])
+
+            self.assertEqual(result["removed"], 50)
+            self.assertEqual(len(service.list(limit=None)), 50)
+
     def test_local_log_retention_applies_time_and_count_limits(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = LogService(Path(tmp_dir) / "logs.jsonl")

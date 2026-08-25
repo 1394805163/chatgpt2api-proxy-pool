@@ -38,7 +38,7 @@ class ImageGenerationRequest(BaseModel):
     n: int = Field(default=1, ge=1, le=100)
     size: str | None = None
     quality: str = "auto"
-    response_format: str = "b64_json"
+    response_format: str = "url"
     history_disabled: bool = True
     stream: bool | None = None
     timeout_secs: float | None = Field(default=None, ge=IMAGE_TIMEOUT_MIN_SECS, le=IMAGE_TIMEOUT_MAX_SECS)
@@ -103,6 +103,20 @@ def apply_image_timeout(identity: dict[str, object], payload: dict[str, object])
     return timeout_secs
 
 
+def require_url_response_format(payload: dict[str, object]) -> None:
+    """图片生成接口只返回可寻址 URL，拒绝会放大内存的 Base64 响应。"""
+    response_format = str(payload.get("response_format") or "url").strip()
+    if response_format != "url":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "请求格式错误：仅支持 response_format='url'；不支持 b64_json 或其他响应格式",
+                "type": "invalid_request_error",
+            },
+        )
+    payload["response_format"] = "url"
+
+
 def log_image_request(request: Request, identity: dict[str, object], endpoint: str, payload: dict[str, object], timeout_secs: float) -> None:
     try:
         content_length = max(0, int(request.headers.get("content-length") or 0))
@@ -158,8 +172,9 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        enforce_image_request_limit(identity, body.n)
         payload = body.model_dump(mode="python")
+        require_url_response_format(payload)
+        enforce_image_request_limit(identity, body.n)
         timeout_secs = apply_image_timeout(identity, payload)
         payload["base_url"] = resolve_image_base_url(request)
         log_image_request(request, identity, "/v1/images/generations", payload, timeout_secs)
@@ -191,6 +206,7 @@ def create_router() -> APIRouter:
         request_started = time.time()
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
+        require_url_response_format(payload)
         enforce_image_request_limit(identity, int(payload.get("n") or 1))
         prompt = str(payload["prompt"])
         model = str(payload["model"])

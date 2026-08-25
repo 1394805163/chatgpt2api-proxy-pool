@@ -105,12 +105,11 @@ const docs: ApiDoc[] = [
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
-      ["response_format", "string", "可选，默认 b64_json。"],
+      ["response_format", "string", "可选，默认 url；仅支持 url，不支持 b64_json。"],
     ],
     output: [
       ["data", "array", "图片结果列表。"],
-      ["data[].b64_json", "string", "base64 图片内容。"],
-      ["data[].url", "string", "部分配置下返回图片 URL。"],
+      ["data[].url", "string", "图片 URL。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/generations \\
   -H "Content-Type: application/json" \\
@@ -129,11 +128,11 @@ const docs: ApiDoc[] = [
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
+      ["response_format", "string", "可选，默认 url；仅支持 url，不支持 b64_json。"],
     ],
     output: [
       ["data", "array", "编辑后的图片结果列表。"],
-      ["data[].b64_json", "string", "base64 图片内容。"],
-      ["data[].url", "string", "部分配置下返回图片 URL。"],
+      ["data[].url", "string", "图片 URL。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/edits \\
   -H "Authorization: Bearer ${key}" \\

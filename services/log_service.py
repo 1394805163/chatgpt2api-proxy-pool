@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import heapq
 import json
 import itertools
+import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -22,11 +26,54 @@ from services.storage.base import DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_LOG_IT
 from services.time_utils import utc_now_iso, utc_timestamp_iso
 from utils.helper import anthropic_sse_stream, sse_json_stream
 from utils.log import logger
+from utils.memory import release_process_memory
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
 LOG_FILE_PRUNE_INTERVAL = 100
+LOG_PAGE_DEFAULT_LIMIT = 100
+
+
+def _encode_log_cursor(item: dict[str, Any]) -> str:
+    detail = item.get("detail")
+    grouped_ids = detail.get("grouped_log_ids") if isinstance(detail, dict) else None
+    item_id = str(grouped_ids[0] if isinstance(grouped_ids, list) and grouped_ids else item.get("id") or "")
+    payload = {
+        "time": str(item.get("time") or ""),
+        "id": item_id,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_log_cursor(value: str) -> tuple[str, str] | None:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="invalid log cursor")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid log cursor")
+    timestamp = str(payload.get("time") or "")
+    item_id = str(payload.get("id") or "")
+    if not timestamp or not item_id:
+        raise HTTPException(status_code=400, detail="invalid log cursor")
+    return timestamp, item_id
+
+
+def _log_sort_key(item: dict[str, Any]) -> tuple[str, str]:
+    return str(item.get("time") or ""), str(item.get("id") or "")
+
+
+def _is_before_cursor(item: dict[str, Any], cursor: tuple[str, str] | None) -> bool:
+    if cursor is None:
+        return True
+    timestamp, item_id = _log_sort_key(item)
+    return timestamp < cursor[0] or (timestamp == cursor[0] and item_id < cursor[1])
 
 
 class LogService:
@@ -317,29 +364,154 @@ class LogService:
             return self._collapse_failed_image_items(items)
         return items
 
+    def _file_page_items(
+        self,
+        *,
+        type: str,
+        start_date: str,
+        end_date: str,
+        cursor: tuple[str, str] | None,
+        limit: int,
+        display_timezone: str,
+    ) -> list[dict[str, Any]]:
+        """流式扫描 JSONL，只保留当前页附近的最新记录。
+
+        旧实现先 splitlines() 再复制完整列表。这里仍需顺序扫描文本文件，
+        但内存只保留 limit+1 条候选，管理页不会因历史日志总量线性膨胀。
+        """
+        if not self.path.exists():
+            return []
+        keep = max(limit + 1, 2)
+        heap: list[tuple[tuple[str, str, int], dict[str, Any]]] = []
+        with self._lock:
+            with self.path.open("r", encoding="utf-8") as file:
+                for line_number, raw_line in enumerate(file):
+                    item = self._parse_line(raw_line.rstrip("\r\n"), line_number)
+                    if item is None or not _is_before_cursor(item, cursor):
+                        continue
+                    if not self._matches_filters(
+                        item,
+                        type=type,
+                        start_date=start_date,
+                        end_date=end_date,
+                        display_timezone=display_timezone,
+                    ):
+                        continue
+                    key = (*_log_sort_key(item), line_number)
+                    heapq.heappush(heap, (key, item))
+                    if len(heap) > keep:
+                        heapq.heappop(heap)
+        return [item for _, item in sorted(heap, key=lambda entry: entry[0], reverse=True)]
+
+    def list_page(
+        self,
+        *,
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        limit: int = LOG_PAGE_DEFAULT_LIMIT,
+        cursor: str = "",
+        collapse_image_failures: bool = False,
+        display_timezone: str = DEFAULT_DISPLAY_TIMEZONE,
+    ) -> dict[str, Any]:
+        page_limit = max(1, min(int(limit), LOG_PAGE_DEFAULT_LIMIT))
+        decoded_cursor = _decode_log_cursor(cursor)
+        file_items = self._file_page_items(
+            type=type,
+            start_date=start_date,
+            end_date=end_date,
+            cursor=decoded_cursor,
+            limit=page_limit,
+            display_timezone=display_timezone,
+        )
+        storage_items: list[dict[str, Any]] = []
+        storage = self._storage()
+        if storage is not None:
+            try:
+                load_page = getattr(storage, "load_logs_page", None)
+                if callable(load_page):
+                    storage_cursor = decoded_cursor
+                    batch_limit = max(page_limit * 2, 20)
+                    while len(storage_items) < page_limit + 1:
+                        batch = load_page(
+                            limit=batch_limit,
+                            type=type,
+                            before_time=storage_cursor[0] if storage_cursor else "",
+                            before_id=storage_cursor[1] if storage_cursor else "",
+                        )
+                        if not batch:
+                            break
+                        for item in batch:
+                            if self._matches_filters(
+                                item,
+                                type=type,
+                                start_date=start_date,
+                                end_date=end_date,
+                                display_timezone=display_timezone,
+                            ) and _is_before_cursor(item, decoded_cursor):
+                                storage_items.append(item)
+                                if len(storage_items) >= page_limit + 1:
+                                    break
+                        last = batch[-1]
+                        next_storage_cursor = _log_sort_key(last)
+                        if storage_cursor == next_storage_cursor or len(batch) < batch_limit:
+                            break
+                        storage_cursor = next_storage_cursor
+                else:
+                    storage_items = storage.load_logs(limit=page_limit + 1, type=type)
+            except Exception as exc:
+                logger.error(f"Failed to load paged logs from storage backend: {exc}")
+
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in [*file_items, *storage_items]:
+            if not self._matches_filters(
+                item,
+                type=type,
+                start_date=start_date,
+                end_date=end_date,
+                display_timezone=display_timezone,
+            ) or not _is_before_cursor(item, decoded_cursor):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            if item_id and item_id not in deduped:
+                deduped[item_id] = item
+        merged = sorted(deduped.values(), key=_log_sort_key, reverse=True)
+        has_more = len(merged) > page_limit
+        raw_items = merged[:page_limit]
+        items = self._collapse_failed_image_items(raw_items) if collapse_image_failures else raw_items
+        # 游标必须指向未折叠页的最后一条原始记录，否则同一失败组跨页时
+        # 可能重复返回或跳过记录。
+        next_cursor = _encode_log_cursor(raw_items[-1]) if has_more and raw_items else None
+        return {"items": items, "next_cursor": next_cursor, "limit": page_limit}
+
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
         if not target_ids:
             return {"removed": 0}
-        parsed_items = self._all_items()
-        target_ids = self._expand_group_delete_ids(parsed_items, target_ids)
+        if any(target_id.startswith("group:") for target_id in target_ids):
+            # 兼容旧客户端未展开分组 ID 的情况；现代客户端直接携带
+            # grouped_log_ids，不会触发完整历史日志构造。
+            target_ids = self._expand_group_delete_ids(self._all_items(), target_ids)
         file_removed = 0
         with self._lock:
-            lines = self.path.read_text(encoding="utf-8").splitlines() if self.path.exists() else []
-            parsed_lines = [(raw_line, self._parse_line(raw_line, line_number)) for line_number, raw_line in enumerate(lines)]
-            kept_lines: list[str] = []
-            for raw_line, item in parsed_lines:
-                if item is None:
-                    kept_lines.append(raw_line)
-                    continue
-                if str(item.get("id") or "") in target_ids:
-                    file_removed += 1
-                    continue
-                kept_lines.append(self._serialize_item(item))
-            content = "\n".join(kept_lines)
-            if content:
-                content += "\n"
-            self.path.write_text(content, encoding="utf-8")
+            if self.path.exists():
+                temp_path: Path | None = None
+                try:
+                    with self.path.open("r", encoding="utf-8") as source, tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8", dir=self.path.parent, prefix=f".{self.path.name}.", delete=False
+                    ) as target:
+                        temp_path = Path(target.name)
+                        for line_number, raw_line in enumerate(source):
+                            item = self._parse_line(raw_line.rstrip("\r\n"), line_number)
+                            if item is not None and str(item.get("id") or "") in target_ids:
+                                file_removed += 1
+                                continue
+                            target.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+                    os.replace(temp_path, self.path)
+                    temp_path = None
+                finally:
+                    if temp_path is not None:
+                        temp_path.unlink(missing_ok=True)
         database_removed = 0
         storage = self._storage()
         if storage is not None:
@@ -473,6 +645,10 @@ class LoggedCall:
     _quota_reserved: bool = field(default=False, init=False, repr=False)
     _stream_image_units: int = field(default=0, init=False, repr=False)
 
+    def _release_image_memory(self) -> None:
+        if self.quota_is_image:
+            release_process_memory()
+
     def _reserve_quota(self) -> None:
         from services.auth_service import auth_service
 
@@ -541,24 +717,30 @@ class LoggedCall:
             self._finish_quota(False, units=0 if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
+            self._release_image_memory()
             return _image_error_response(exc)
         except HTTPException as exc:
             self._finish_quota(False, units=0 if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc.detail))
+            self._release_image_memory()
             raise
         except Exception as exc:
             self._finish_quota(False, units=0 if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            self._release_image_memory()
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
-            self._finish_quota(True, units=self._result_quota_units(result))
-            self.log("调用完成", result)
-            response = dict(result)
-            response.pop("_account_email", None)
-            return response
+            try:
+                self._finish_quota(True, units=self._result_quota_units(result))
+                self.log("调用完成", result)
+                response = dict(result)
+                response.pop("_account_email", None)
+                return response
+            finally:
+                self._release_image_memory()
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
         try:
@@ -567,20 +749,24 @@ class LoggedCall:
             self._finish_quota(False, units=self._stream_image_units if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
+            self._release_image_memory()
             return _image_error_response(exc)
         except HTTPException as exc:
             self._finish_quota(False, units=self._stream_image_units if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc.detail))
+            self._release_image_memory()
             raise
         except Exception as exc:
             self._finish_quota(False, units=self._stream_image_units if self.quota_is_image else None)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            self._release_image_memory()
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
             self._finish_quota(True, units=0 if self.quota_is_image else None)
             self.log("流式调用结束")
+            self._release_image_memory()
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
 
@@ -624,6 +810,7 @@ class LoggedCall:
                          conversation_id=conversation_ids[0] if conversation_ids else "")
             else:
                 self._finish_quota(False, units=self._stream_image_units if self.quota_is_image else None)
+            self._release_image_memory()
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
