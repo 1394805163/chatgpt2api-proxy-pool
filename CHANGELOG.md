@@ -1,4 +1,28 @@
+## 1.8.5 - 2026-08-25
+
+- [修复] 图片请求的 `curl_cffi` SSE timeout 使用有限数值，避免 `float + NoneType` 在真正请求前失败。
+- [修复] 同步、流式、异常、超时和客户端中断路径统一释放图片请求的上游会话、响应、生成器、并发租约及临时资源。
+- [优化] 图片请求结束后执行受控的 Python GC 与 Linux `malloc_trim(0)`，降低连续生图后的 RSS 高水位。
+- [优化] 日志接口改为服务端游标分页和 JSONL 流式扫描，避免一次性加载全部历史日志。
+- [优化] 图片管理改为服务端游标分页、仅读取图片头部尺寸，并对缩略图使用懒加载/异步解码。
+- [调整] `/v1/images/generations` 与 `/v1/images/edits` 默认并强制使用 URL 响应；请求 `b64_json` 或其他 `response_format` 时返回 400，并明确提示请求格式错误。
+- [修复] 图片批量删除设置单次 500 张硬上限，并采用单次索引保存，避免巨量索引操作冲击 CPU 与内存。
+- [测试] 增加 SSE/响应生命周期、图片索引分页、日志分页、批量删除和内存释放回归测试；完成本地模拟上游与低频 soak 验证。
 # Changelog
+
+## 1.8.4 - 2026-08-24
+
+- [修复] 超时任务在物理 worker 退出前继续占用租约和并发名额，避免旧任务未退出时创建旁路请求。
+- [优化] 日志、账号、用户密钥和图片索引读取移出 FastAPI 事件循环；日志接口固定最多返回 200 条，日期筛选不再解除上限。
+- [优化] 图片管理缩略图使用浏览器懒加载和异步解码，降低首屏图片请求压力。
+- [修复] 补齐图片准备、会话、任务轮询、bootstrap 和 chat requirements 响应的 success/failure close，降低 curl 28 后连接堆积。
+- [测试] 增加 worker 租约、日志分页上限、线程池卸载和响应释放回归测试。
+
+## 1.8.3 - 2026-08-24
+
+- Prevent partial image SSE timeouts from submitting a second generation; resume polling the original conversation when possible.
+- Restrict clean image connection-timeout retries to one and return a single timeout response for polling deadlines.
+- Close image upload, download, and SSE responses on success and failure paths.
 
 ## 1.8.2 - 2026-08-22
 

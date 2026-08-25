@@ -14,5 +14,6 @@ services:
     environment:
       STORAGE_BACKEND: ${STORAGE_BACKEND:-sqlite}
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/accounts.db}
+      MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:?set CHATGPT2API_AUTH_KEY in .env}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}

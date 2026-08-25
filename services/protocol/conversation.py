@@ -16,7 +16,9 @@ from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import (
+    ImageConnectionTimeoutError,
     ImageContentPolicyError,
+    ImagePartialStreamTimeoutError,
     ImagePollTimeoutError,
     ImageTaskDeadlineError,
     OpenAIBackendAPI,
@@ -107,6 +109,19 @@ def is_connection_timeout_error(message: str) -> bool:
         or "connection timed out" in text
         or "read timed out" in text
         or "connect timeout" in text
+    )
+
+
+def is_pre_request_connection_timeout_error(error: object) -> bool:
+    """v1.8.3-stability: true only before SSE accepted any generation."""
+    if isinstance(error, ImagePartialStreamTimeoutError):
+        return False
+    if isinstance(error, ImageConnectionTimeoutError):
+        return True
+    return (
+        is_connection_timeout_error(str(error))
+        and not int(getattr(error, "received_bytes", 0) or 0)
+        and not str(getattr(error, "conversation_id", "") or "")
     )
 
 
@@ -995,39 +1010,60 @@ def stream_image_outputs(
         total: int = 1,
 ) -> Iterator[ImageOutput]:
     last: dict[str, Any] = {}
-    for event in conversation_events(
-            backend,
-            prompt=request.prompt,
-            model=request.model,
-            images=request.images or [],
-            size=request.size,
-            quality=request.quality,
-            task_deadline_ts=request.task_deadline_ts,
-            cancel_event=request.cancel_event,
-    ):
-        last = event
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
+    partial_stream_timeout: ImagePartialStreamTimeoutError | None = None
+    try:
+        for event in conversation_events(
+                backend,
+                prompt=request.prompt,
                 model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
-            )
-            continue
-        if event.get("type") == "conversation.event":
-            raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-            )
+                images=request.images or [],
+                size=request.size,
+                quality=request.quality,
+                task_deadline_ts=request.task_deadline_ts,
+                cancel_event=request.cancel_event,
+        ):
+            last = event
+            if event.get("type") == "conversation.delta":
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    text=str(event.get("delta") or ""),
+                    upstream_event_type="conversation.delta",
+                )
+                continue
+            if event.get("type") == "conversation.event":
+                raw = event.get("raw")
+                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    upstream_event_type=raw_type,
+                )
+    except ImagePartialStreamTimeoutError as exc:
+        # v1.8.3-stability: the upstream accepted this generation. Continue
+        # polling its original conversation; never submit a second generation.
+        partial_stream_timeout = exc
+        logger.warning({
+            "event": "image_partial_sse_timeout_resume_poll",
+            "conversation_id": getattr(exc, "conversation_id", ""),
+            "received_bytes": getattr(exc, "received_bytes", 0),
+        })
+    except ImageConnectionTimeoutError:
+        # Only a clean connection-establishment timeout may reach the bounded
+        # retry path in _generate_single_image.
+        raise
 
-    conversation_id = str(last.get("conversation_id") or "")
+    conversation_id = str(
+        last.get("conversation_id")
+        or (getattr(partial_stream_timeout, "conversation_id", "") if partial_stream_timeout else "")
+        or ""
+    )
+    if partial_stream_timeout and not conversation_id:
+        raise partial_stream_timeout
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
     message = str(last.get("text") or "").strip()
@@ -1041,13 +1077,13 @@ def stream_image_outputs(
     })
     if request.progress_callback:
         request.progress_callback("image_stream_resolve_start")
-    if message and not file_ids and not sediment_ids and last.get("blocked"):
+    if message and not file_ids and not sediment_ids and last.get("blocked") and not partial_stream_timeout:
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
         error_text = detailed_error or message or "Image generation was rejected by upstream policy."
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
-    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
+    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen" or partial_stream_timeout is not None
     if message and not file_ids and not sediment_ids and not should_poll_for_image:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
@@ -1460,15 +1496,11 @@ def _generate_single_image(
     MAX_TEXT_REPLY_RETRIES = 3
     # TLS 连接错误最大重试次数
     MAX_TLS_RETRIES = 3
-    # 连接超时错误最大重试次数（同账号短等待重试）
-    MAX_CONN_TIMEOUT_RETRIES = 3
-    # 轮询超时错误最大重试次数（换账号重试）
-    MAX_POLL_TIMEOUT_RETRIES = 4
-
+    # v1.8.3-stability: a clean connection timeout may be retried once only.
+    MAX_CONN_TIMEOUT_RETRIES = 1
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
-    poll_timeout_retry_count = 0
     account_email = ""
 
     while True:
@@ -1568,33 +1600,52 @@ def _generate_single_image(
                 code="image_task_timeout",
                 account_email=account_email,
             ) from exc
-        except ImagePollTimeoutError as exc:
+        except ImagePartialStreamTimeoutError as exc:
             last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
-            record_image_failure(token, str(exc), "image_poll_timeout")
-            if account_email:
-                setattr(exc, "account_email", account_email)
-            # 轮询超时：换账号重试
-            if not emitted_for_token:
-                poll_timeout_retry_count += 1
-                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
-                    logger.warning({
-                        "event": "image_poll_timeout_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": poll_timeout_retry_count,
-                        "index": index,
-                        "error": str(exc)[:200],
-                    })
-                    continue
+            record_image_failure(token, str(exc), "image_stream_partial_timeout", verify_free_account=False)
+            raise ImageGenerationError(
+                "upstream image stream timed out after generation started; the original conversation was not resubmitted",
+                status_code=504,
+                error_type="server_error",
+                code="image_task_timeout",
+                account_email=account_email,
+                conversation_id=last_conversation_id,
+            ) from exc
+        except ImageConnectionTimeoutError as exc:
+            last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
+            record_image_failure(token, str(exc), "image_stream_connection_timeout", verify_free_account=False)
+            conn_timeout_retry_count += 1
+            if conn_timeout_retry_count <= 1:
                 logger.warning({
-                    "event": "image_poll_timeout_exhausted_retries",
+                    "event": "image_stream_pre_request_timeout_retry",
                     "request_token": token,
                     "account_email": account_email,
-                    "retry_count": poll_timeout_retry_count,
+                    "retry_count": conn_timeout_retry_count,
                     "index": index,
                 })
-                raise
-            raise
+                time.sleep(1.0)
+                continue
+            raise ImageGenerationError(
+                "upstream image connection timed out before generation started",
+                status_code=504,
+                error_type="server_error",
+                code="image_connection_timeout",
+                account_email=account_email,
+                conversation_id=last_conversation_id,
+            ) from exc
+        except ImagePollTimeoutError as exc:
+            last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
+            record_image_failure(token, str(exc), "image_poll_timeout", verify_free_account=False)
+            if account_email:
+                setattr(exc, "account_email", account_email)
+            raise ImageGenerationError(
+                str(exc),
+                status_code=504,
+                error_type="server_error",
+                code="image_task_timeout",
+                account_email=account_email,
+                conversation_id=last_conversation_id,
+            ) from exc
         except ImageContentPolicyError as exc:
             last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
             record_image_failure(token, str(exc), "image_content_policy", verify_free_account=False)
@@ -1701,23 +1752,21 @@ def _generate_single_image(
                     })
                     time.sleep(min(2.0 * tls_retry_count, 10.0))
                     continue
-            # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
-            if not emitted_for_token and is_connection_timeout_error(last_error):
-                record_image_failure(token, last_error, "image_stream_timeout", verify_free_account=False)
-                conn_timeout_retry_count += 1
-                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
-                    wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
-                    logger.warning({
-                        "event": "image_stream_conn_timeout_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": conn_timeout_retry_count,
-                        "index": index,
-                        "wait_secs": wait_secs,
-                        "error": last_error[:200],
-                    })
-                    time.sleep(wait_secs)
-                    continue
+                # v1.8.3-stability: keep a compatibility fallback for callers
+                # that surface a raw curl 28 error instead of the typed error.
+                if not emitted_for_token and is_pre_request_connection_timeout_error(exc):
+                    conn_timeout_retry_count += 1
+                    if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
+                        logger.warning({
+                            "event": "image_stream_pre_request_timeout_retry_raw",
+                            "request_token": token,
+                            "account_email": account_email,
+                            "retry_count": conn_timeout_retry_count,
+                            "index": index,
+                            "error": last_error[:200],
+                        })
+                        time.sleep(1.0)
+                        continue
             if not is_tls_connection_error(last_error) and not is_connection_timeout_error(last_error):
                 record_image_failure(token, last_error, "image_stream")
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc

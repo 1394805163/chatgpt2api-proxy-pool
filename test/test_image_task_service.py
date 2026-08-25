@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from services.config import config
+from services.image_concurrency import ImageConcurrencyGate
 from services.image_task_service import ImageTaskService
 
 
@@ -112,7 +113,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["status"], "error")
             self.assertEqual(task["data"], [])
 
-    def test_timed_out_unresponsive_handler_does_not_permanently_block_the_queue(self):
+    def test_v183_timed_out_worker_keeps_physical_slot_until_exit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             release_stuck = threading.Event()
             second_started = threading.Event()
@@ -133,19 +134,33 @@ class ImageTaskServiceTests(unittest.TestCase):
                 max_task_duration_getter=lambda: 0.05,
                 global_concurrency_getter=lambda: 1,
                 per_owner_concurrency_getter=lambda: 1,
+                concurrency_gate=ImageConcurrencyGate(),
+                reject_when_busy=True,
+                queue_when_busy=True,
             )
             service.submit_generation(OWNER, client_task_id="stuck", prompt="cat", model="gpt-image-2", size=None)
             wait_for_task(service, OWNER, "stuck", "error")
 
             service.submit_generation(OWNER, client_task_id="after-stuck", prompt="cat", model="gpt-image-2", size=None)
-            self.assertTrue(second_started.wait(0.5))
-            wait_for_task(service, OWNER, "after-stuck", "success")
+            self.assertFalse(second_started.wait(0.1))
 
             with service._lock:
                 stuck_thread = service._threads.get("owner-1:stuck")
                 self.assertIsNotNone(stuck_thread)
                 self.assertTrue(stuck_thread.is_alive())
             release_stuck.set()
+            self.assertTrue(second_started.wait(0.5))
+            wait_for_task(service, OWNER, "after-stuck", "success")
+
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                with service._lock:
+                    if not service._threads and service.concurrency_gate.snapshot()["active_total"] == 0:
+                        break
+                time.sleep(0.01)
+            with service._lock:
+                self.assertFalse(service._threads)
+            self.assertEqual(service.concurrency_gate.snapshot()["active_total"], 0)
 
     def test_list_tasks_marks_orphaned_running_task_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

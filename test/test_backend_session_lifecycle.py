@@ -43,7 +43,8 @@ class BackendSessionLifecycleTests(unittest.TestCase):
             self.assertEqual(options[CurlOpt.INFILESIZE_LARGE], len(png))
             return mock.Mock(status_code=201, headers={})
 
-        session.put.side_effect = receive_upload
+        upload_response = mock.Mock(status_code=201, headers={})
+        session.put.side_effect = lambda _url, **kwargs: (receive_upload(_url, **kwargs), upload_response)[1]
         backend = object.__new__(openai_backend_api.OpenAIBackendAPI)
         backend.session = session
         backend.base_url = "https://chatgpt.com"
@@ -60,6 +61,105 @@ class BackendSessionLifecycleTests(unittest.TestCase):
         self.assertEqual(result["file_name"], "reference.png")
         self.assertEqual(result["file_size"], len(png))
         self.assertEqual(result["mime_type"], "image/png")
+        metadata_response.close.assert_called_once_with()
+        completed_response.close.assert_called_once_with()
+        upload_response.close.assert_called_once_with()
+
+    def test_image_sse_uses_finite_connect_and_read_timeouts(self) -> None:
+        response = mock.Mock(status_code=200, headers={})
+        session = mock.Mock()
+        session.post.return_value = response
+        backend = object.__new__(openai_backend_api.OpenAIBackendAPI)
+        backend.session = session
+        backend.base_url = "https://chatgpt.com"
+        backend.image_deadline_ts = None
+        backend.image_cancel_event = None
+        backend.image_task_timeout_secs = 180
+        backend._image_model_settings = mock.Mock(return_value=("gpt-image-2", ""))
+        backend._image_headers = mock.Mock(return_value={})
+        backend._image_request_timeout = mock.Mock(side_effect=lambda default: default)
+
+        result = backend._start_image_generation(
+            "cat",
+            mock.Mock(),
+            "conduit",
+            "gpt-image-2",
+        )
+
+        self.assertIs(result, response)
+        self.assertEqual(session.post.call_args.kwargs["timeout"], (30.0, 300.0))
+
+    def test_v183_image_sse_start_error_closes_response(self) -> None:
+        response = mock.Mock(status_code=502, headers={}, text="upstream failed")
+        response.json.side_effect = ValueError("not json")
+        session = mock.Mock()
+        session.post.return_value = response
+        backend = object.__new__(openai_backend_api.OpenAIBackendAPI)
+        backend.session = session
+        backend.base_url = "https://chatgpt.com"
+        backend.image_deadline_ts = None
+        backend.image_cancel_event = None
+        backend.image_task_timeout_secs = 180
+        backend._image_model_settings = mock.Mock(return_value=("gpt-image-2", ""))
+        backend._image_headers = mock.Mock(return_value={})
+        backend._image_request_timeout = mock.Mock(side_effect=lambda default: default)
+
+        with self.assertRaises(Exception):
+            backend._start_image_generation("cat", mock.Mock(), "conduit", "gpt-image-2")
+
+        response.close.assert_called_once_with()
+
+    def test_v183_image_upload_error_closes_response(self) -> None:
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        response = mock.Mock(status_code=502, headers={}, text="upstream failed")
+        response.json.side_effect = ValueError("not json")
+        session = mock.Mock(headers={}, curl_options={})
+        session.post.return_value = response
+        backend = object.__new__(openai_backend_api.OpenAIBackendAPI)
+        backend.session = session
+        backend.base_url = "https://chatgpt.com"
+        backend.user_agent = "test"
+        backend.image_deadline_ts = None
+        backend.image_cancel_event = None
+        backend.image_task_timeout_secs = 180
+
+        with self.assertRaises(Exception):
+            backend._upload_image(f"data:image/png;base64,{base64.b64encode(png).decode('ascii')}")
+
+        response.close.assert_called_once_with()
+
+    def test_v183_download_response_is_closed_on_success(self) -> None:
+        response = mock.Mock(status_code=200, headers={}, content=b"image")
+        session = mock.Mock()
+        session.get.return_value = response
+        backend = object.__new__(openai_backend_api.OpenAIBackendAPI)
+        backend.session = session
+        backend.image_deadline_ts = None
+        backend.image_cancel_event = None
+        backend.image_task_timeout_secs = 180
+        backend._image_request_timeout = mock.Mock(return_value=120.0)
+
+        self.assertEqual(backend.download_image_bytes(["https://files.test/image.png"]), [b"image"])
+        response.close.assert_called_once_with()
+
+    def test_v183_download_error_closes_response(self) -> None:
+        response = mock.Mock(status_code=503, headers={}, text="upstream failed")
+        response.json.side_effect = ValueError("not json")
+        session = mock.Mock()
+        session.get.return_value = response
+        backend = object.__new__(openai_backend_api.OpenAIBackendAPI)
+        backend.session = session
+        backend.image_deadline_ts = None
+        backend.image_cancel_event = None
+        backend.image_task_timeout_secs = 180
+        backend._image_request_timeout = mock.Mock(return_value=120.0)
+
+        with self.assertRaises(Exception):
+            backend.download_image_bytes(["https://files.test/image.png"])
+
+        response.close.assert_called_once_with()
 
     def test_backend_close_is_idempotent_and_context_managed(self) -> None:
         session = RecordingSession()

@@ -90,6 +90,8 @@ function LogsContent() {
   const [lightboxIndex, setLightboxIndex] = useState(0);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [page, setPage] = useState(1);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [cursorHistory, setCursorHistory] = useState<string[]>([""]);
   const [isLoading, setIsLoading] = useState(true);
   const [isDeleting, setIsDeleting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -98,25 +100,26 @@ function LogsContent() {
   const detailUrls = getUrls(detailLog, cachedImageUrls);
   const detailImages = detailUrls.map((url, index) => ({ id: `${index}`, src: url }));
   const isCallLog = type === LogType.Call;
-  const pageSize = 10;
-  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
-  const safePage = Math.min(page, pageCount);
-  const currentRows = items.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const pageSize = 50;
+  const safePage = page;
+  const currentRows = items;
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(item.id));
   const allSelected = items.length > 0 && items.every((item) => selectedSet.has(item.id));
 
-  const loadLogs = async () => {
+  const loadLogs = async (cursor = "", targetPage = 1, resetHistory = false) => {
     setIsLoading(true);
     try {
       const [data, browserCache] = await Promise.all([
-        fetchSystemLogs({ type, start_date: startDate, end_date: endDate }),
+        fetchSystemLogs({ type, start_date: startDate, end_date: endDate, limit: pageSize, cursor }),
         getBrowserCachedImageUrlMap(),
       ]);
       setItems(data.items);
+      setNextCursor(data.next_cursor || null);
       setCachedImageUrls(browserCache);
       setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
-      setPage(1);
+      setPage(targetPage);
+      if (resetHistory || targetPage === 1) setCursorHistory([""]);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "加载日志失败");
     } finally {
@@ -158,7 +161,7 @@ function LogsContent() {
         setDetailOpen(false);
         setDetailLog(null);
       }
-      await loadLogs();
+      await loadLogs(cursorHistory[page - 1] || "", page);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "删除日志失败");
     } finally {
@@ -167,8 +170,22 @@ function LogsContent() {
   };
 
   useEffect(() => {
-    void loadLogs();
+    void loadLogs("", 1, true);
   }, [type, startDate, endDate]);
+
+  const goToPreviousPage = () => {
+    if (page <= 1 || isLoading) return;
+    const targetPage = page - 1;
+    void loadLogs(cursorHistory[targetPage - 1] || "", targetPage);
+    setCursorHistory((current) => current.slice(0, targetPage));
+  };
+
+  const goToNextPage = () => {
+    if (!nextCursor || isLoading) return;
+    const targetPage = page + 1;
+    setCursorHistory((current) => [...current.slice(0, page), nextCursor]);
+    void loadLogs(nextCursor, targetPage);
+  };
 
   return (
     <section className="space-y-5">
@@ -200,19 +217,19 @@ function LogsContent() {
         <CardContent className="p-0">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
             <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">
-              <span>共 {items.length} 条</span>
+              <span>当前加载 {items.length} 条</span>
               <label className="flex items-center gap-2">
                 <Checkbox checked={currentPageSelected} onCheckedChange={(checked) => toggleIds(currentRows.map((item) => item.id), Boolean(checked))} />
                 本页全选
               </label>
               <label className="flex items-center gap-2">
                 <Checkbox checked={allSelected} onCheckedChange={(checked) => toggleIds(items.map((item) => item.id), Boolean(checked))} />
-                全选结果
+                全选本页
               </label>
               {selectedIds.length > 0 ? <span>已选 {selectedIds.length} 条</span> : null}
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadLogs()} disabled={isLoading}>
+              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadLogs(cursorHistory[page - 1] || "", page)} disabled={isLoading}>
                 <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
                 刷新
               </Button>
@@ -303,11 +320,11 @@ function LogsContent() {
             </Table>
           </div>
           <div className="flex items-center justify-end gap-2 border-t border-stone-100 px-4 py-3 text-sm text-stone-500">
-            <span>第 {safePage} / {pageCount} 页，共 {items.length} 条</span>
-            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
+            <span>第 {safePage} 页，本页 {items.length} 条{nextCursor ? "，还有下一页" : "，已到末页"}</span>
+            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage <= 1 || isLoading} onClick={goToPreviousPage}>
               <ChevronLeft className="size-4" />
             </Button>
-            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage >= pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>
+            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={!nextCursor || isLoading} onClick={goToNextPage}>
               <ChevronRight className="size-4" />
             </Button>
           </div>

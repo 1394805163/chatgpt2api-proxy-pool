@@ -13,7 +13,7 @@ from PIL import Image, ImageOps
 
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.image_tags_service import load_tags, remove_tags
+from services.image_tags_service import load_tags, remove_tags, remove_tags_many
 from utils.log import logger
 
 THUMBNAIL_SIZE = (320, 320)
@@ -173,9 +173,21 @@ def cleanup_expired_images() -> int:
     cleanup_image_thumbnails()
     return removed
 
-def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict[str, object]:
-    cleanup_expired_images()
+def list_images(
+    base_url: str,
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 50,
+    cursor: str = "",
+) -> dict[str, object]:
     all_tags = load_tags()
+    page = image_storage_service.list_items_page(
+        base_url,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+        cursor=cursor,
+    )
     items = [
         {
             **item,
@@ -183,33 +195,52 @@ def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict
             "thumbnail_url": thumbnail_url(base_url, str(item["path"])),
             "tags": all_tags.get(str(item["path"]), []),
         }
-        for item in image_storage_service.list_items(base_url, start_date, end_date)
+        for item in page["items"]
     ]
     groups: dict[str, list[dict[str, object]]] = {}
     for item in items:
         groups.setdefault(str(item["date"]), []).append(item)
-    return {"items": items, "groups": [{"date": key, "items": value} for key, value in groups.items()]}
+    return {
+        "items": items,
+        "groups": [{"date": key, "items": value} for key, value in groups.items()],
+        "next_cursor": page.get("next_cursor"),
+        "limit": max(1, min(int(limit), 100)),
+    }
+
+
+MAX_IMAGE_DELETE_ITEMS = 500
 
 
 def delete_images(paths: list[str] | None = None, start_date: str = "", end_date: str = "", all_matching: bool = False) -> dict[str, int]:
     root = config.images_dir.resolve()
-    targets = [
-        str(item["path"])
-        for item in image_storage_service.list_items("", start_date=start_date, end_date=end_date)
-    ] if all_matching else (paths or [])
-    removed = 0
+    targets = (
+        image_storage_service.matching_paths(
+            start_date=start_date,
+            end_date=end_date,
+            maximum=MAX_IMAGE_DELETE_ITEMS + 1,
+        )
+        if all_matching
+        else list(paths or [])
+    )
+    if len(targets) > MAX_IMAGE_DELETE_ITEMS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"too many images in one delete request; maximum is {MAX_IMAGE_DELETE_ITEMS}",
+        )
+    safe_targets: list[str] = []
     for item in targets:
         path = (root / item).resolve()
         try:
             path.relative_to(root)
         except ValueError:
             continue
-        if image_storage_service.delete(item):
-            removed += 1
+        safe_targets.append(item)
+    removed = image_storage_service.delete_many(safe_targets)
+    for item in safe_targets:
         for thumbnail in (_thumbnail_path(item), config.image_thumbnails_dir / _safe_relative_path(item)):
             if thumbnail.is_file():
                 thumbnail.unlink()
-        remove_tags(item)
+    remove_tags_many(safe_targets)
     _cleanup_empty_dirs(root)
     _cleanup_empty_dirs(config.image_thumbnails_dir)
     return {"removed": removed}

@@ -34,7 +34,27 @@ class InvalidAccessTokenError(RuntimeError):
 
 
 class ImagePollTimeoutError(RuntimeError):
-    pass
+    def __init__(self, message: str, conversation_id: str = "") -> None:
+        super().__init__(message)
+        self.conversation_id = conversation_id
+
+
+class ImageConnectionTimeoutError(RuntimeError):
+    """A zero-byte image SSE connection timeout that is safe to retry once."""
+
+    def __init__(self, message: str, received_bytes: int = 0, conversation_id: str = "") -> None:
+        super().__init__(message)
+        self.received_bytes = max(0, int(received_bytes or 0))
+        self.conversation_id = conversation_id
+
+
+class ImagePartialStreamTimeoutError(RuntimeError):
+    """An image SSE timeout after upstream already accepted the generation."""
+
+    def __init__(self, message: str, received_bytes: int = 0, conversation_id: str = "") -> None:
+        super().__init__(message)
+        self.received_bytes = max(0, int(received_bytes or 0))
+        self.conversation_id = conversation_id
 
 
 class ImageTaskDeadlineError(RuntimeError):
@@ -51,6 +71,17 @@ def _is_curl_stream_write_error(error: object) -> bool:
     return "curl: (23)" in text and "error on write" in text
 
 
+def _is_curl_stream_timeout_error(error: object) -> bool:
+    text = str(error or "").lower()
+    return "curl: (28)" in text
+
+
+def _received_bytes_from_timeout(error: object) -> int:
+    text = str(error or "")
+    matches = re.findall(r"(?:with|,|received)\s+(\d+)\s+bytes?", text, flags=re.IGNORECASE)
+    return max((int(item) for item in matches), default=0)
+
+
 def _close_stream_response(response: requests.Response, context: str) -> None:
     """Close a curl_cffi stream without surfacing its intentional abort error."""
     try:
@@ -60,6 +91,18 @@ def _close_stream_response(response: requests.Response, context: str) -> None:
             raise
         logger.debug({
             "event": "stream_close_write_error_suppressed",
+            "context": context,
+            "error": str(exc)[:300],
+        })
+
+
+def _close_response(response: Any, context: str) -> None:
+    """Release a completed HTTP response without masking the request result."""
+    try:
+        response.close()
+    except Exception as exc:
+        logger.debug({
+            "event": "response_close_failed",
             "context": context,
             "error": str(exc)[:300],
         })
@@ -962,8 +1005,11 @@ class OpenAIBackendAPI:
             json=payload,
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, path)
-        return response.json().get("conduit_token", "")
+        try:
+            ensure_ok(response, path)
+            return response.json().get("conduit_token", "")
+        finally:
+            _close_response(response, "image_conversation_prepare")
 
     def _decode_image_base64(self, image: str) -> bytes:
         """把 base64 图片字符串或本地路径解码成二进制。"""
@@ -1008,8 +1054,11 @@ class OpenAIBackendAPI:
                   "height": height},
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, path)
-        upload_meta = response.json()
+        try:
+            ensure_ok(response, path)
+            upload_meta = response.json()
+        finally:
+            _close_response(response, "image_upload_metadata")
         source_file = None
         original_curl_options = None
         if file_path is not None:
@@ -1037,12 +1086,14 @@ class OpenAIBackendAPI:
                 **({"data": data} if file_path is None else {}),
                 timeout=self._image_request_timeout(45),
             )
+            ensure_ok(response, "image_upload")
         finally:
             if original_curl_options is not None:
                 self.session.curl_options = original_curl_options
             if source_file is not None:
                 source_file.close()
-        ensure_ok(response, "image_upload")
+            if "response" in locals():
+                _close_response(response, "image_upload")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
         response = self.session.post(
             self.base_url + path,
@@ -1050,7 +1101,10 @@ class OpenAIBackendAPI:
             data="{}",
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, path)
+        try:
+            ensure_ok(response, path)
+        finally:
+            _close_response(response, "image_upload_complete")
         return {
             "file_id": upload_meta["file_id"],
             "file_name": file_name,
@@ -1130,10 +1184,18 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
-            timeout=self._image_request_timeout(300),
+            # Keep both curl_cffi timeout components numeric. Passing None as
+            # the read timeout makes curl_cffi add a float and NoneType before
+            # the request is sent. The read budget is still bounded by the
+            # unified image deadline through _image_request_timeout.
+            timeout=(self._image_request_timeout(30), self._image_request_timeout(300)),
             stream=True,
         )
-        ensure_ok(response, path)
+        try:
+            ensure_ok(response, path)
+        except Exception:
+            _close_response(response, "image_generation_start_error")
+            raise
         return response
 
     def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
@@ -1141,8 +1203,11 @@ class OpenAIBackendAPI:
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=self._image_request_timeout(60))
-        ensure_ok(response, path)
-        return response.json()
+        try:
+            ensure_ok(response, path)
+            return response.json()
+        finally:
+            _close_response(response, "image_conversation")
 
     def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """Hide a conversation from the ChatGPT upstream history."""
@@ -1174,9 +1239,12 @@ class OpenAIBackendAPI:
                 headers=self._headers(path, {"Accept": "application/json"}),
                 timeout=timeout_secs,
             )
-            ensure_ok(response, path)
-            data = response.json()
-            return data.get("items") or data.get("conversations") or []
+            try:
+                ensure_ok(response, path)
+                data = response.json()
+                return data.get("items") or data.get("conversations") or []
+            finally:
+                _close_response(response, "recent_conversations")
         except Exception as exc:
             logger.debug({"event": "list_conversations_failed", "error": str(exc)})
             return []
@@ -2419,8 +2487,11 @@ class OpenAIBackendAPI:
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=self._image_request_timeout(60))
-        ensure_ok(response, path)
-        data = response.json()
+        try:
+            ensure_ok(response, path)
+            data = response.json()
+        finally:
+            _close_response(response, "image_download_metadata")
         return data.get("download_url") or data.get("url") or ""
 
     def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
@@ -2428,8 +2499,11 @@ class OpenAIBackendAPI:
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=self._image_request_timeout(60))
-        ensure_ok(response, path)
-        data = response.json()
+        try:
+            ensure_ok(response, path)
+            data = response.json()
+        finally:
+            _close_response(response, "image_attachment_metadata")
         return data.get("download_url") or data.get("url") or ""
 
     def _query_backend_tasks(
@@ -2454,8 +2528,11 @@ class OpenAIBackendAPI:
             headers=self._headers(path, {"Accept": "application/json"}),
             timeout=self._image_request_timeout(timeout_secs),
         )
-        ensure_ok(response, path)
-        data = response.json()
+        try:
+            ensure_ok(response, path)
+            data = response.json()
+        finally:
+            _close_response(response, "image_backend_tasks")
         tasks = data.get("tasks", [])
         if not isinstance(tasks, list):
             return []
@@ -2655,9 +2732,13 @@ class OpenAIBackendAPI:
         images = []
         for url in urls:
             response = self.session.get(url, timeout=self._image_request_timeout(120))
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            try:
+                ensure_ok(response, "image_download")
+                content = response.content
+                if content not in images:
+                    images.append(content)
+            finally:
+                _close_response(response, "image_download")
         return images
 
     def stream_conversation(
@@ -2748,10 +2829,40 @@ class OpenAIBackendAPI:
 
         closer = threading.Thread(target=close_on_deadline, name="image-stream-deadline", daemon=True)
         closer.start()
+        received_bytes = 0
+        stream_conversation_id = ""
+
+        def record_sse_bytes(value: int) -> None:
+            nonlocal received_bytes
+            received_bytes += max(0, int(value or 0))
+
+        def record_sse_payload(payload: str) -> None:
+            nonlocal stream_conversation_id
+            match = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', payload)
+            if match and not stream_conversation_id:
+                stream_conversation_id = match.group(1)
+
         try:
-            yield from iter_sse_payloads(response, abort_check=self._ensure_image_task_active)
+            # v1.8.3-stability: retain enough stream evidence to distinguish a
+            # safe one-time connect retry from an accepted generation.
+            yield from iter_sse_payloads(
+                response,
+                abort_check=self._ensure_image_task_active,
+                on_payload=record_sse_payload,
+                on_bytes=record_sse_bytes,
+            )
             self._ensure_image_task_active()
         except Exception as exc:
+            if isinstance(exc, ImageTaskDeadlineError):
+                raise
+            if _is_curl_stream_timeout_error(exc):
+                received_bytes = max(received_bytes, _received_bytes_from_timeout(exc))
+                error_type = ImagePartialStreamTimeoutError if received_bytes or stream_conversation_id else ImageConnectionTimeoutError
+                raise error_type(
+                    str(exc),
+                    received_bytes=received_bytes,
+                    conversation_id=stream_conversation_id,
+                ) from exc
             if _is_curl_stream_write_error(exc):
                 # Closing curl_cffi from the deadline thread interrupts iter_lines()
                 # with CURLE_WRITE_ERROR. Re-check the task state so callers receive
@@ -2769,8 +2880,11 @@ class OpenAIBackendAPI:
             headers=self._bootstrap_headers(),
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, "bootstrap")
-        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        try:
+            ensure_ok(response, "bootstrap")
+            self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        finally:
+            _close_response(response, "bootstrap")
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
 
@@ -2786,8 +2900,11 @@ class OpenAIBackendAPI:
             json={"p": p_token},
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, "chat_requirements_prepare")
-        prepare_data = response.json()
+        try:
+            ensure_ok(response, "chat_requirements_prepare")
+            prepare_data = response.json()
+        finally:
+            _close_response(response, "chat_requirements_prepare")
 
         if (prepare_data.get("arkose") or {}).get("required"):
             raise RuntimeError("chat requirements requires arkose token, which is not implemented")
@@ -2819,8 +2936,11 @@ class OpenAIBackendAPI:
             },
             timeout=self._image_request_timeout(30),
         )
-        ensure_ok(response, "chat_requirements_finalize")
-        data = response.json()
+        try:
+            ensure_ok(response, "chat_requirements_finalize")
+            data = response.json()
+        finally:
+            _close_response(response, "chat_requirements_finalize")
 
         token = data.get("token", "")
         if not token:

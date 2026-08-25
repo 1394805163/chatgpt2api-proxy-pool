@@ -229,8 +229,13 @@ def anthropic_sse_stream(items) -> Iterator[str]:
 def iter_sse_payloads(
     response: requests.Response,
     abort_check: Callable[[], None] | None = None,
+    on_payload: Callable[[str], None] | None = None,
+    on_bytes: Callable[[int], None] | None = None,
 ) -> Iterator[str]:
     for raw_line in response.iter_lines():
+        if on_bytes is not None:
+            raw_size = len(raw_line) if isinstance(raw_line, (bytes, bytearray)) else len(str(raw_line).encode("utf-8"))
+            on_bytes(raw_size)
         if abort_check is not None:
             abort_check()
         if not raw_line:
@@ -240,6 +245,8 @@ def iter_sse_payloads(
             continue
         payload = line[5:].strip()
         if payload:
+            if on_payload is not None:
+                on_payload(payload)
             yield payload
 
 

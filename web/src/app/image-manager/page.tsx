@@ -126,6 +126,8 @@ function ImageManagerContent() {
   const [lightboxIndex, setLightboxIndex] = useState(0);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [page, setPage] = useState(1);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [cursorHistory, setCursorHistory] = useState<string[]>([""]);
   const [isLoading, setIsLoading] = useState(true);
   const [deleteStartDate, setDeleteStartDate] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<ManagedImage | null>(null);
@@ -165,27 +167,28 @@ function ImageManagerContent() {
     sizeLabel: formatSize(item.size),
     dimensions: item.width && item.height ? `${item.width} x ${item.height}` : undefined,
   }));
-  const pageSize = 12;
-  const pageCount = Math.max(1, Math.ceil(filteredItems.length / pageSize));
-  const safePage = Math.min(page, pageCount);
-  const currentRows = filteredItems.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const pageSize = 50;
+  const safePage = page;
+  const currentRows = filteredItems;
   const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
   const selectedCount = deleteMode === "filtered" ? items.length : deleteMode === "byDate" ? 0 : selectedPaths.length;
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(imageKey(item)));
   const allSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedSet.has(imageKey(item)));
 
-  const loadImages = async () => {
+  const loadImages = async (cursor = "", targetPage = 1, resetHistory = false) => {
     setIsLoading(true);
     try {
       const [data, tagsData] = await Promise.all([
-        fetchManagedImages({ start_date: startDate, end_date: endDate }),
+        fetchManagedImages({ start_date: startDate, end_date: endDate, limit: pageSize, cursor }),
         fetchImageTags(),
       ]);
       const mergedItems = await mergeBrowserCachedImages(data.items, startDate, endDate);
       setItems(mergedItems);
+      setNextCursor(data.next_cursor || null);
       setAllTags(tagsData.tags);
       setSelectedPaths((current) => current.filter((path) => mergedItems.some((item) => imageKey(item) === path)));
-      setPage(1);
+      setPage(targetPage);
+      if (resetHistory || targetPage === 1) setCursorHistory([""]);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "加载图片失败");
     } finally {
@@ -323,7 +326,7 @@ function ImageManagerContent() {
       toast.success(`已删除 ${data.removed} 张图片`);
       setDeleteMode(null);
       setSelectedPaths([]);
-      await loadImages();
+      await loadImages(cursorHistory[page - 1] || "", page);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "删除图片失败");
     } finally {
@@ -361,8 +364,22 @@ function ImageManagerContent() {
   };
 
   useEffect(() => {
-    void loadImages();
+    void loadImages("", 1, true);
   }, [startDate, endDate]);
+
+  const goToPreviousPage = () => {
+    if (page <= 1 || isLoading) return;
+    const targetPage = page - 1;
+    void loadImages(cursorHistory[targetPage - 1] || "", targetPage);
+    setCursorHistory((current) => current.slice(0, targetPage));
+  };
+
+  const goToNextPage = () => {
+    if (!nextCursor || isLoading) return;
+    const targetPage = page + 1;
+    setCursorHistory((current) => [...current.slice(0, page), nextCursor]);
+    void loadImages(nextCursor, targetPage);
+  };
 
   return (
     <section className="space-y-5">
@@ -376,7 +393,7 @@ function ImageManagerContent() {
           <Button variant="outline" onClick={clearFilters} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
             清除筛选条件
           </Button>
-          <Button onClick={() => void loadImages()} disabled={isLoading} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
+          <Button onClick={() => void loadImages("", 1, true)} disabled={isLoading} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
             {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
             查询
           </Button>
@@ -538,7 +555,7 @@ function ImageManagerContent() {
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
             <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">
               <ImageIcon className="size-4" />
-              共 {filteredItems.length} 张
+              当前加载 {filteredItems.length} 张
               {selectedTags.length > 0 ? <span className="text-stone-400">（筛选自 {items.length} 张）</span> : null}
               <label className="flex items-center gap-2">
                 <Checkbox className={IMAGE_MANAGER_CHECKBOX_CLASS} checked={currentPageSelected} onCheckedChange={(checked) => togglePaths(currentRows.map(imageKey), Boolean(checked))} />
@@ -546,12 +563,12 @@ function ImageManagerContent() {
               </label>
               <label className="flex items-center gap-2">
                 <Checkbox className={IMAGE_MANAGER_CHECKBOX_CLASS} checked={allSelected} onCheckedChange={(checked) => togglePaths(filteredItems.map(imageKey), Boolean(checked))} />
-                全选结果
+                全选本页
               </label>
               {selectedPaths.length > 0 ? <span>已选 {selectedPaths.length} 张</span> : null}
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadImages()} disabled={isLoading}>
+              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadImages(cursorHistory[page - 1] || "", page)} disabled={isLoading}>
                 <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
                 刷新
               </Button>
@@ -586,6 +603,8 @@ function ImageManagerContent() {
                       src={item.thumbnail_url || item.url}
                       alt={item.name}
                       className="h-full w-full object-cover transition group-hover:scale-[1.02]"
+                      loading="lazy"
+                      decoding="async"
                       onError={(event) => {
                         if (event.currentTarget.src !== item.url) {
                           event.currentTarget.src = item.url;
@@ -719,11 +738,11 @@ function ImageManagerContent() {
             )})}
           </div>
           <div className="flex items-center justify-end gap-2 border-t border-stone-100 px-4 py-3 text-sm text-stone-500">
-            <span>第 {safePage} / {pageCount} 页，共 {filteredItems.length} 张</span>
-            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
+            <span>第 {safePage} 页，本页 {filteredItems.length} 张{nextCursor ? "，还有下一页" : "，已到末页"}</span>
+            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage <= 1 || isLoading} onClick={goToPreviousPage}>
               <ChevronLeft className="size-4" />
             </Button>
-            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage >= pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>
+            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={!nextCursor || isLoading} onClick={goToNextPage}>
               <ChevronRight className="size-4" />
             </Button>
           </div>

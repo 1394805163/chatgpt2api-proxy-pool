@@ -173,7 +173,7 @@ def create_router() -> APIRouter:
     @router.get("/api/auth/users")
     async def list_user_keys(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": auth_service.list_keys(role="user")}
+        return {"items": await run_in_threadpool(auth_service.list_keys, role="user")}
 
     @router.post("/api/auth/users")
     async def create_user_key(body: UserKeyCreateRequest, authorization: str | None = Header(default=None)):
@@ -189,7 +189,11 @@ def create_router() -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {"item": item, "key": raw_key, "items": auth_service.list_keys(role="user")}
+        return {
+            "item": item,
+            "key": raw_key,
+            "items": await run_in_threadpool(auth_service.list_keys, role="user"),
+        }
 
     @router.post("/api/auth/users/{key_id}")
     async def update_user_key(
@@ -220,19 +224,22 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         if item is None:
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"item": item, "items": auth_service.list_keys(role="user")}
+        return {
+            "item": item,
+            "items": await run_in_threadpool(auth_service.list_keys, role="user"),
+        }
 
     @router.delete("/api/auth/users/{key_id}")
     async def delete_user_key(key_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         if not auth_service.delete_key(key_id, role="user"):
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"items": auth_service.list_keys(role="user")}
+        return {"items": await run_in_threadpool(auth_service.list_keys, role="user")}
 
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        return {"items": await run_in_threadpool(account_service.list_accounts)}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
@@ -389,7 +396,10 @@ def create_router() -> APIRouter:
         account = account_service.update_account(access_token, updates)
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return {"item": account, "items": account_service.list_accounts()}
+        return {
+            "item": account,
+            "items": await run_in_threadpool(account_service.list_accounts),
+        }
 
     @router.post("/api/accounts/oauth/start")
     async def start_oauth_login(

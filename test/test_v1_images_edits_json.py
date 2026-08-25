@@ -29,10 +29,15 @@ class ImageEditsJsonApiTests(unittest.TestCase):
                 for data, filename, mime_type in payload.get("images", [])
             ]
             self.calls.append(captured)
-            return {"created": 1, "data": [{"b64_json": "ZmFrZQ=="}]}
+            return {"created": 1, "data": [{"url": "/images/fake.png"}]}
 
         self.handle_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
         self.filter_patcher = mock.patch.object(ai_module, "filter_or_log", mock.AsyncMock())
+        self.identity_patcher = mock.patch.object(
+            ai_module,
+            "require_identity",
+            return_value={"id": "admin", "role": "admin"},
+        )
         remote_response = mock.Mock(
             status_code=200,
             headers={"content-type": "image/png"},
@@ -41,9 +46,11 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         self.url_patcher = mock.patch("api.image_inputs.requests.get", return_value=remote_response)
         self.handle_patcher.start()
         self.filter_patcher.start()
+        self.identity_patcher.start()
         self.url_patcher.start()
         self.addCleanup(self.handle_patcher.stop)
         self.addCleanup(self.filter_patcher.stop)
+        self.addCleanup(self.identity_patcher.stop)
         self.addCleanup(self.url_patcher.stop)
 
         app = FastAPI()
@@ -73,7 +80,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
                 "prompt": "把图片改成夜景风格",
                 "n": 1,
                 "size": "1024x1536",
-                "response_format": "b64_json",
+                "response_format": "url",
                 "images": [{"image_url": PNG_DATA_URL}],
             },
         )

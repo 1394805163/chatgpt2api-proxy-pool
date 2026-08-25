@@ -58,5 +58,20 @@ class StorageBackend(ABC):
     def load_logs(self, limit: int | None = None, type: str = "") -> list[dict[str, Any]]:
         return []
 
+    def load_logs_page(
+        self,
+        *,
+        limit: int | None = None,
+        type: str = "",
+        before_time: str = "",
+        before_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """加载游标之前的一页日志。
+
+        非数据库后端默认回退到旧接口；数据库后端可用索引直接截取，避免
+        为管理页分页请求加载完整日志集合。
+        """
+        return self.load_logs(limit=limit, type=type)
+
     def delete_logs(self, ids: list[str]) -> int:
         return 0

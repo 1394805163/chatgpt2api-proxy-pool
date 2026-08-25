@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import json
 import shutil
 import threading
@@ -25,6 +24,7 @@ from services.image_concurrency import (
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.time_utils import utc_now_iso, utc_timestamp_iso
 from utils.log import logger
+from utils.memory import release_process_memory
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -338,13 +338,7 @@ class ImageTaskService:
 
     @staticmethod
     def _release_process_memory() -> None:
-        gc.collect()
-        try:
-            import ctypes
-
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+        release_process_memory()
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         self._expire_queued_tasks()
@@ -514,6 +508,22 @@ class ImageTaskService:
     def _physical_thread_count_locked(self) -> int:
         return sum(1 for thread in self._threads.values() if thread.is_alive())
 
+    def _physical_thread_count_by_owner_locked(self, owner: str) -> int:
+        """Count live workers even after their public task has timed out.
+
+        v1.8.3-stability: a timeout marks the task finished for the client, but
+        the worker can still own an upstream socket and its concurrency lease.
+        Scheduling must therefore use physical workers, not only task status.
+        """
+        count = 0
+        for key, thread in self._threads.items():
+            if not thread.is_alive():
+                continue
+            task = self._tasks.get(key)
+            if task and task.get("owner_id") == owner:
+                count += 1
+        return count
+
     def _global_concurrency(self) -> int:
         try:
             return max(1, int(self.global_concurrency_getter()))
@@ -615,7 +625,6 @@ class ImageTaskService:
         self,
     ) -> tuple[str, tuple[Callable[..., None], tuple[Any, ...], dict[str, object], str]] | None:
         owner_attempts = len(self._ready_owners)
-        per_owner_limit = self._per_owner_concurrency()
         for _ in range(owner_attempts):
             owner = self._ready_owners.popleft()
             owner_queue = self._pending_by_owner.get(owner)
@@ -632,7 +641,9 @@ class ImageTaskService:
                 continue
             identity = pending[2]
             owner_limit = self._owner_concurrency(identity)
-            if self._running_count_locked(owner) >= owner_limit:
+            # v1.8.3-stability: a timed-out worker remains physically active
+            # until its finally block releases the socket and lease.
+            if self._physical_thread_count_by_owner_locked(owner) >= owner_limit:
                 self._ready_owners.append(owner)
                 continue
             key = owner_queue.popleft()
@@ -662,7 +673,9 @@ class ImageTaskService:
                     global_limit = self._global_concurrency()
                     # A timed-out task still owns sockets and memory until its worker
                     # exits, so do not create bypass threads above the configured limit.
-                    if self._running_count_locked() >= global_limit:
+                    # v1.8.3-stability: do not start a bypass worker while a
+                    # timed-out worker is still alive but already marked error.
+                    if self._physical_thread_count_locked() >= global_limit:
                         return
                     selected = self._take_next_pending_locked()
                 if selected is None:

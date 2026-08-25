@@ -29,7 +29,7 @@ class ImagesEditsApiTests(unittest.TestCase):
                 for data, filename, mime_type in payload.get("images", [])
             ]
             self.handle_calls.append(captured)
-            return {"created": 1, "data": [{"b64_json": base64.b64encode(b"out").decode("ascii")}]}
+            return {"created": 1, "data": [{"url": "/images/out.png"}]}
 
         self.handler_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
         self.handler_patcher.start()
@@ -55,7 +55,7 @@ class ImagesEditsApiTests(unittest.TestCase):
                 "prompt": "edit",
                 "images": [{"image_url": DATA_IMAGE_URL}],
                 "n": 1,
-                "response_format": "b64_json",
+                "response_format": "url",
             },
         )
 

@@ -476,7 +476,7 @@ export async function generateImage(prompt: string, model?: ImageModel, size?: s
         ...(size ? { size } : {}),
         quality,
         n: 1,
-        response_format: "b64_json",
+        response_format: "url",
       },
     },
   );
@@ -498,6 +498,7 @@ export async function editImage(files: File | File[], prompt: string, model?: Im
   }
   formData.append("quality", quality);
   formData.append("n", "1");
+  formData.append("response_format", "url");
 
   return httpRequest<ImageResponse>(
     "/v1/images/edits",
@@ -637,11 +638,13 @@ export function getBackupDownloadUrl(key: string) {
   return `/api/backups/download?${params.toString()}`;
 }
 
-export async function fetchManagedImages(filters: { start_date?: string; end_date?: string }) {
+export async function fetchManagedImages(filters: { start_date?: string; end_date?: string; limit?: number; cursor?: string }) {
   const params = new URLSearchParams();
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: ManagedImage[]; groups: Array<{ date: string; items: ManagedImage[] }> }>(
+  if (filters.limit) params.set("limit", String(filters.limit));
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  return httpRequest<{ items: ManagedImage[]; groups: Array<{ date: string; items: ManagedImage[] }>; next_cursor?: string | null; limit?: number }>(
     `/api/images${params.toString() ? `?${params.toString()}` : ""}`,
   );
 }
@@ -713,12 +716,14 @@ export async function deleteToTarget(targetFreeMb: number) {
   );
 }
 
-export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
+export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string; limit?: number; cursor?: string }) {
   const params = new URLSearchParams();
   if (filters.type) params.set("type", filters.type);
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  return httpRequest<{ items: SystemLog[]; next_cursor?: string | null; limit?: number }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
 }
 
 export async function deleteSystemLogs(ids: string[]) {
